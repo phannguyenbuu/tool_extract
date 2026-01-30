@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Polygonize Offset Tool</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #0f172a;
+            color: #e5e7eb;
+        }
+        .page {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 32px 16px;
+        }
+        .card {
+            width: 100%;
+            max-width: 720px;
+            background: #020617;
+            border-radius: 16px;
+            box-shadow: 0 20px 40px rgba(0,0,0,.6);
+            border: 1px solid #1e293b;
+            overflow: hidden;
+        }
+        .card-header {
+            padding: 20px 24px 16px;
+            border-bottom: 1px solid #1f2937;
+        }
+        .title {
+            margin: 0;
+            font-size: 1.25rem;
+            font-weight: 600;
+            letter-spacing: .01em;
+        }
+        .subtitle {
+            margin: 4px 0 0;
+            font-size: .875rem;
+            color: #9ca3af;
+        }
+        .card-body {
+            padding: 20px 24px 24px;
+        }
+        form {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 16px;
+        }
+        .field {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        label {
+            font-size: .875rem;
+            font-weight: 500;
+            color: #d1d5db;
+        }
+        .file-input {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 12px;
+            border-radius: 999px;
+            border: 1px dashed #374151;
+            background: #020617;
+            cursor: pointer;
+            font-size: .875rem;
+            color: #9ca3af;
+        }
+        .file-input span {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 260px;
+        }
+        .file-input input[type="file"] {
+            display: none;
+        }
+        .button-row {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 4px;
+        }
+        button[type="submit"] {
+            border: none;
+            border-radius: 999px;
+            padding: 10px 20px;
+            font-size: .9rem;
+            font-weight: 500;
+            cursor: pointer;
+            color: #f9fafb;
+            background: linear-gradient(135deg, #22c55e, #14b8a6);
+            box-shadow: 0 10px 25px rgba(16,185,129,.35);
+            transition: transform .08s ease, box-shadow .08s ease, filter .08s ease;
+        }
+        button[type="submit"]:hover {
+            filter: brightness(1.05);
+            box-shadow: 0 14px 30px rgba(16,185,129,.5);
+            transform: translateY(-1px);
+        }
+        button[type="submit"]:active {
+            transform: translateY(0);
+            box-shadow: 0 8px 18px rgba(16,185,129,.35);
+        }
+        .result {
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px solid #1f2937;
+        }
+        .result-title {
+            margin: 0 0 10px;
+            font-size: 0.95rem;
+            font-weight: 600;
+        }
+        .download-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .download-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 14px;
+            border-radius: 999px;
+            border: 1px solid #374151;
+            text-decoration: none;
+            font-size: .85rem;
+            color: #e5e7eb;
+            background: #020617;
+            transition: background .08s ease, border-color .08s ease;
+        }
+        .download-link:hover {
+            background: #111827;
+            border-color: #4b5563;
+        }
+        .download-pill {
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: .7rem;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+            background: #1f2937;
+            color: #9ca3af;
+        }
+        @media (max-width: 640px) {
+            .card {
+                border-radius: 12px;
+            }
+            .card-header, .card-body {
+                padding: 16px 16px 18px;
+            }
+        }
+    </style>
+
+    <script>
+        function bindFileLabel(inputId, labelSpanId) {
+            const input = document.getElementById(inputId);
+            const span  = document.getElementById(labelSpanId);
+            if (!input || !span) return;
+            input.addEventListener('change', () => {
+                if (input.files && input.files[0]) {
+                    span.textContent = input.files[0].name;
+                } else {
+                    span.textContent = span.dataset.placeholder;
+                }
+            });
+        }
+        window.addEventListener('DOMContentLoaded', () => {
+            bindFileLabel('json_file', 'json_label');
+            bindFileLabel('img_file',  'img_label');
+        });
+    </script>
+</head>
+<body>
+<div class="page">
+    <div class="card">
+        <div class="card-header">
+            <h1 class="title">Polygonize Offset</h1>
+            <p class="subtitle">
+                Upload a polyline JSON and source image, then generate lowpoly layouts for download.
+            </p>
+        </div>
+        <div class="card-body">
+            <form id="poly-form" action="/" method="post" enctype="multipart/form-data">
+               
+
+                <div class="field">
+                    <label for="img_file">Source image</label>
+                    <label class="file-input">
+                        <span id="img_label" data-placeholder="Choose image file...">Choose image file...</span>
+                        <input id="img_file" type="file" name="img_file" accept="image/*" required>
+                    </label>
+                </div>
+
+                <div class="field">
+                    <label for="json_file">Polyline JSON</label>
+                    <label class="file-input">
+                        <span id="json_label" data-placeholder="Choose JSON file...">Choose JSON file...</span>
+                        <input id="json_file" type="file" name="json_file" accept=".json" required>
+                    </label>
+                </div>
+
+                <div class="button-row">
+                    <button id="submit-btn" type="submit">Process</button>
+                    <div id="loading" style="display:none; margin-left:12px; font-size:.85rem; color:#9ca3af;">
+                        Processing... please wait
+                    </div>
+                </div>
+            </form>
+
+            {% if result %}
+            <div class="result">
+                <h2 class="result-title">Download results</h2>
+                <div class="download-list">
+                    <a class="download-link"
+                       href="{{ url_for('download_file', filename=result.fill) }}"
+                       download>
+                        <span class="download-pill">Filled</span>
+                        <span>Fill (SVG)</span>
+                    </a>
+                    <a class="download-link"
+                       href="{{ url_for('download_file', filename=result.line) }}"
+                       download>
+                        <span class="download-pill">Lines</span>
+                        <span>Line (SVG)</span>
+                    </a>
+                    <a class="download-link"
+                    href="{{ url_for('download_file', filename=result.orig) }}"
+                    download>
+                        <span class="download-pill">Original</span>
+                        <span>Playboard (SVG)</span>
+                    </a>
+
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+
+<script>
+    function bindFileLabel(inputId, labelSpanId) {
+        const input = document.getElementById(inputId);
+        const span  = document.getElementById(labelSpanId);
+        if (!input || !span) return;
+        span.dataset.placeholder = span.textContent;
+        input.addEventListener('change', () => {
+            if (input.files && input.files[0]) {
+                span.textContent = input.files[0].name;
+            } else {
+                span.textContent = span.dataset.placeholder;
+            }
+        });
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+        bindFileLabel('json_file', 'json_label');
+        bindFileLabel('img_file',  'img_label');
+
+        const form = document.getElementById('poly-form');
+        const submitBtn = document.getElementById('submit-btn');
+        const loading = document.getElementById('loading');
+
+        if (form && submitBtn && loading) {
+            form.addEventListener('submit', () => {
+                // khoa nut + show loading
+                submitBtn.disabled = true;
+                submitBtn.textContent = 'Processing...';
+                loading.style.display = 'inline-block';
+            });
+        }
+    });
+</script>
+
+</body>
+</html>
