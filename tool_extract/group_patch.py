@@ -8,8 +8,7 @@ from shapely.geometry import Polygon, Point
 
 def find_text_position(poly: Polygon, bbox: tuple) -> Tuple[float, float]:
     """
-    Quet grid 10px x 10px trong bbox, tim iem au tien KHONG nam trong polygon 
-    (outside/edge cho label ro). Neu toan bo trong  middle_x, top-5px.
+    Quet grid 10px x 10px trong bbox, tim iem au tien NAM TRONG polygon.
     """
     xmin, ymin, xmax, ymax = bbox
     step = 10.0  # Grid 10px
@@ -20,8 +19,8 @@ def find_text_position(poly: Polygon, bbox: tuple) -> Tuple[float, float]:
         for grid_x in range(int(xmin), int(xmax+1), int(step)):
             gx = float(grid_x)
             pt = Point(gx, gy)
-            # Outside hoac boundary  dung ngay (label ro)
-            if not poly.contains(pt) and not poly.interiors:  # Skip hole interiors
+            # Tim diem nam trong polygon
+            if poly.contains(pt):
                 return gx, gy
     
     # 2) Fallback: middle_x, top-5px (vua tren bbox)

@@ -1,0 +1,5 @@
+{
+  "name": "SVG Nesting Optimizer",
+  "description": "An intelligent layout tool that optimizes the arrangement of specific SVG shapes on a 420x594mm sheet using bin-packing algorithms with rotation support to maximize material efficiency.",
+  "requestFramePermissions": []
+}

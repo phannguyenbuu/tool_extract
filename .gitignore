@@ -1,0 +1,5 @@
+/webscrap/backup
+*.deb
+*.dump
+/.venv
+/venv

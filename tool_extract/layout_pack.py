@@ -2,8 +2,7 @@ from rectpack import newPacker
 import numpy as np
 import cv2
 from typing import Dict, List, Any
-from group_patch import extract_group_patch, rotate_regions_once
-from export_svg import find_text_position
+from group_patch import extract_group_patch, rotate_regions_once, find_text_position
 from shapely.ops import unary_union
 from shapely.geometry import Polygon
 from shapely.validation import make_valid

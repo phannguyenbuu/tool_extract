@@ -1,0 +1,14 @@
+﻿node_modules/
+frontend/node_modules/
+Lib/
+# Python cache
+__pycache__/
+*.pyc
+
+# Local outputs
+packed*.svg
+packed_log.txt
+packed_missing.txt
+scene_cache.json
+zone_labels.json
+zones_cache.json
