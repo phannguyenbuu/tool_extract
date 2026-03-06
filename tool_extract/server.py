@@ -5,6 +5,7 @@ import os
 import subprocess
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -23,12 +24,17 @@ STATE_SVG = ROOT / "ui_state.svg"
 PACKED_LABELS_JSON = ROOT / "packed_labels.json"
 ZONE_LABELS_JSON = ROOT / "zone_labels.json"
 SCENE_JSON = ROOT / "scene_cache.json"
-SOURCE_ZONE_CLICK_JSON = ROOT / "soure_zone_click.json"
+SOURCE_ZONE_CLICK_JSON = ROOT / "source_zone_click.json"
+SOURCE_ZONE_CLICK_JSON_LEGACY = ROOT / "soure_zone_click.json"
 PACKED_ZONE_SCENE_SVG = ROOT / "packed_zone_scene.svg"
 PACKED_ZONE_SCENE_SVG_PAGE2 = ROOT / "packed_zone_scene_page2.svg"
+RASTER_PACK_TMP_JSON = ROOT / "tmp_raster_pack.json"
+RASTER_PACK_TMP_PNG = ROOT / "tmp_raster_pack.png"
 SVG_PATH = ROOT / "convoi.svg"
 SVG_BACKUP = ROOT / "convoi_backup.svg"
 EXPORT_DIR = ROOT / "export"
+# Show bleed layer in packed output.
+PACKED_INCLUDE_BLEED = True
 
 app = Flask(__name__, static_folder=None)
 
@@ -44,6 +50,7 @@ def ensure_outputs() -> None:
 @app.get("/api/scene")
 def api_scene():
     snap = request.args.get("snap", type=float) or new_toy.INTERSECT_SNAP
+    force_compute = request.args.get("force_compute", type=int) == 1
     for key, env_key in (
         ("pack_padding", "PACK_PADDING"),
         ("pack_margin_x", "PACK_MARGIN_X"),
@@ -57,31 +64,26 @@ def api_scene():
         val = request.args.get(key)
         if val is not None:
             os.environ[env_key] = str(val)
+
+    if not force_compute and SCENE_JSON.exists():
+        try:
+            cached = json.loads(SCENE_JSON.read_text(encoding="utf-8"))
+            return jsonify(cached)
+        except Exception:
+            pass
+
     data = new_toy.compute_scene(new_toy.SVG_PATH, snap, render_packed_png=False)
-    SCENE_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    zone_labels = data.get("zone_labels")
-    if isinstance(zone_labels, dict):
-        ZONE_LABELS_JSON.write_text(
-            json.dumps(zone_labels, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    # keep packed.svg in sync for Konva vector preview
     try:
-        canvas = data.get("canvas") or {}
-        w = int(canvas.get("w", 0))
-        h = int(canvas.get("h", 0))
-        if w > 0 and h > 0:
-            new_toy.write_pack_svg(
-                data.get("regions", []),
-                data.get("zone_id", []),
-                data.get("zone_order", []),
-                [],
-                data.get("placements", []),
-                (w, h),
-                data.get("colors_bgr", []),
-                data.get("rot_info", []),
+        SCENE_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        zone_labels = data.get("zone_labels")
+        if isinstance(zone_labels, dict):
+            ZONE_LABELS_JSON.write_text(
+                json.dumps(zone_labels, ensure_ascii=False, indent=2), encoding="utf-8"
             )
     except Exception:
         pass
+    # Do not generate packed preview during /api/scene reload.
+    # Packed output is generated only via /api/pack_from_scene (Compute/Repack).
     return jsonify(data)
 
 
@@ -218,7 +220,29 @@ def _color_to_bgr(val: Any) -> tuple[int, int, int]:
 
 @app.post("/api/pack_from_scene")
 def api_pack_from_scene():
+    t_total_start = time.perf_counter()
+    timings_ms: Dict[str, float] = {}
+    _t = t_total_start
+    def _mark(name: str) -> None:
+        nonlocal _t
+        now = time.perf_counter()
+        timings_ms[name] = round((now - _t) * 1000.0, 2)
+        _t = now
+
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    raster_only = bool(payload.get("raster_only", False))
+    for key, env_key in (
+        ("pack_padding", "PACK_PADDING"),
+        ("pack_margin_x", "PACK_MARGIN_X"),
+        ("pack_margin_y", "PACK_MARGIN_Y"),
+        ("pack_bleed", "PACK_BLEED"),
+        ("draw_scale", "DRAW_SCALE"),
+        ("pack_grid", "PACK_GRID_STEP"),
+        ("pack_angle", "PACK_ANGLE_STEP"),
+        ("pack_mode", "PACK_MODE"),
+    ):
+        if key in payload and payload.get(key) is not None:
+            os.environ[env_key] = str(payload.get(key))
     canvas = payload.get("canvas") or {}
     w = int(canvas.get("w", 0) or 0)
     h = int(canvas.get("h", 0) or 0)
@@ -229,6 +253,12 @@ def api_pack_from_scene():
     if not regions or not zone_id:
         return jsonify({"ok": False, "error": "regions/zone_id missing"}), 400
     config._apply_pack_env()
+    _mark("init_validate")
+    grid_step = max(1.0, float(getattr(config, "PACK_GRID_STEP", 5.0) or 5.0))
+    # Fixed margin as requested.
+    config.PACK_MARGIN_X = 10
+    config.PACK_MARGIN_Y = 10
+    # Always compute fresh (no cache), using TS-style raster-first packing.
     polys = []
     for poly in regions:
         pts = []
@@ -239,56 +269,205 @@ def api_pack_from_scene():
                 pts.append((float(p[0]), float(p[1])))
             except Exception:
                 continue
-        if pts:
-            polys.append(pts)
-        else:
-            polys.append([])
+        polys.append(pts if pts else [])
+    _mark("normalize_regions")
     zone_polys, zone_order, _zone_poly_debug = zones.build_zone_polys(polys, zone_id)
+    _mark("build_zone_polys")
+    # Bleed is applied before raster nest via inflated zone polygons.
     zone_pack_polys = packing._build_zone_pack_polys(
         zone_polys, float(config.PACK_BLEED), bevel_angle=60.0
     )
+    _mark("build_bleed_polys")
+    # TS-style raster pack (ultra-fast): large-first, then fill holes with small pieces.
+    margin_x = max(0.0, float(getattr(config, "PACK_MARGIN_X", 0.0) or 0.0))
+    margin_y = max(0.0, float(getattr(config, "PACK_MARGIN_Y", 0.0) or 0.0))
+    pack_gap = max(0.0, float(getattr(config, "PADDING", 0.0) or 0.0))
+    n = len(zone_pack_polys)
+    placements: list[tuple[float, float, int, int, bool]] = [(-1.0, -1.0, 0, 0, False)] * n
+    rot_info: list[dict[str, float]] = [
+        {"angle": 0.0, "cx": 0.0, "cy": 0.0, "minx": 0.0, "miny": 0.0, "bin": -1}
+        for _ in range(n)
+    ]
+    raster_report: Dict[str, Any] = {"count": 0, "pairs": []}
+    raster_scale_factor = 4.0  # 1/4 resolution
+    # Denser setting to avoid sparse layout and overflow artifacts.
+    grid_for_raster = 6.0
+    raster_cell = max(4, int(round(min(12.0, grid_for_raster))))
+    search_stride = 2
+    safety_for_raster = max(0.25, min(1.0, pack_gap * 0.15))
+    # 5-degree step full half-turn for better local orientation near dense rows.
+    rotations_5 = [float(a) for a in range(0, 180, 5)]
+
     zone_pack_centers = []
-    for p in zone_pack_polys:
+    area_map: Dict[int, float] = {}
+    for idx, p in enumerate(zone_pack_polys):
         if p:
             pg = packing.Polygon(p)
             if pg.is_empty:
                 zone_pack_centers.append((0.0, 0.0))
+                area_map[idx] = 0.0
             else:
                 c = pg.centroid
                 zone_pack_centers.append((float(c.x), float(c.y)))
+                area_map[idx] = abs(float(pg.area))
         else:
             zone_pack_centers.append((0.0, 0.0))
-    placements, _order, rot_info = packing.pack_regions(
-        zone_pack_polys,
-        (w, h),
-        allow_rotate=True,
-        angle_step=5.0,
-        grid_step=config.PACK_GRID_STEP,
-        fixed_angles=None,
-        fixed_centers=zone_pack_centers,
-        max_bins=2,
-        try_heuristics=True,
-        two_pass=True,
-        preferred_indices=None,
-        use_gap_only=False,
+            area_map[idx] = 0.0
+    _mark("prep_centers_area")
+
+    sorted_desc = sorted(range(n), key=lambda i: area_map.get(i, 0.0), reverse=True)
+    split_large = max(1, int(round(len(sorted_desc) * 0.55))) if sorted_desc else 0
+    large_ids = sorted_desc[:split_large]
+    small_ids = sorted_desc[split_large:]
+    small_asc = sorted(small_ids, key=lambda i: area_map.get(i, 0.0))
+    # TS-like queue: place large first, then let small pieces fill holes.
+    queue = large_ids + small_asc
+
+    # TS-like page loop: try to insert in current page, carry unplaced to next page.
+    for page_idx in range(2):
+        if not queue:
+            break
+        pp, o, rr = packing.pack_regions_raster_fast(
+            zone_pack_polys,
+            (w, h),
+            fixed_centers=zone_pack_centers,
+            grid_step=grid_for_raster,
+            rotations=rotations_5,
+            search_stride=search_stride,
+            safety_padding=safety_for_raster,
+            place_ids=queue,
+        )
+        pp = packing._fit_placements_into_canvas(pp, rr, (w, h))
+        placed_now: set[int] = set()
+        # preserve queue order when committing placements for deterministic behavior
+        for idx in queue:
+            if idx >= len(pp) or idx >= len(rr):
+                continue
+            dx, dy, bw, bh, rf = pp[idx]
+            if bw <= 0 or bh <= 0:
+                continue
+            placements[idx] = (dx, dy, bw, bh, rf)
+            ri = dict(rr[idx])
+            ri["bin"] = page_idx
+            rot_info[idx] = ri
+            placed_now.add(idx)
+        queue = [idx for idx in queue if idx not in placed_now]
+        _mark(f"pack_page{page_idx+1}")
+
+    raster_report = packing.raster_overlap_report(
+        zone_pack_polys, placements, rot_info, (w, h), cell=raster_cell
     )
-    placement_bin = [int(info.get("bin", -1)) for info in rot_info]
-    placement_bin_by_zid = {
-        zid: placement_bin[idx]
-        for idx, zid in enumerate(zone_order)
-        if idx < len(placement_bin)
+    _mark("raster_overlap")
+
+    tmp_payload = {
+        "canvas": {"w": w, "h": h},
+        "pages": 2,
+        "raster_scale_factor": raster_scale_factor,
+        "strict_gap": pack_gap,
+        "timings_ms": timings_ms,
+        "raster_check": raster_report,
+        "placements": [[float(a), float(b), int(c), int(d), bool(e)] for (a, b, c, d, e) in placements],
+        "rot_info": rot_info,
     }
+    try:
+        RASTER_PACK_TMP_JSON.write_text(
+            json.dumps(tmp_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"[pack_from_scene] raster temp: {RASTER_PACK_TMP_JSON}")
+    except Exception:
+        pass
+    _mark("write_tmp_json")
+    try:
+        gap = 40
+        img = Image.new("RGB", (max(1, int(w * 2 + gap)), max(1, int(h))), (6, 14, 46))
+        draw = ImageDraw.Draw(img, "RGBA")
+        overlap_ids = set()
+        for pair in raster_report.get("pairs", []) or []:
+            try:
+                overlap_ids.add(int(pair[0]))
+                overlap_ids.add(int(pair[1]))
+            except Exception:
+                continue
+        for rid, pts in enumerate(zone_pack_polys):
+            if rid >= len(placements) or rid >= len(rot_info) or not pts:
+                continue
+            dx, dy, bw, bh, _ = placements[rid]
+            if bw <= 0 or bh <= 0:
+                continue
+            info = rot_info[rid]
+            bin_idx = int(info.get("bin", 0))
+            if bin_idx not in (0, 1):
+                continue
+            try:
+                ang = float(info.get("angle", 0.0))
+                cx = float(info.get("cx", 0.0))
+                cy = float(info.get("cy", 0.0))
+            except Exception:
+                continue
+            tpts = []
+            for p in packing._rotate_pts(pts, ang, cx, cy):
+                x_off = float(w + gap) if bin_idx == 1 else 0.0
+                x = float(p[0]) + float(dx) + x_off
+                y = float(p[1]) + float(dy)
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    tpts = []
+                    break
+                tpts.append((x, y))
+            if len(tpts) < 3:
+                continue
+            r = (rid * 67) % 180 + 60
+            g = (rid * 41) % 180 + 60
+            b = (rid * 23) % 180 + 60
+            try:
+                draw.polygon(tpts, fill=(r, g, b, 130))
+                if rid in overlap_ids:
+                    draw.line(tpts + [tpts[0]], fill=(255, 64, 64, 255), width=3)
+                else:
+                    draw.line(tpts + [tpts[0]], fill=(255, 255, 255, 220), width=1)
+            except Exception:
+                continue
+        img.save(RASTER_PACK_TMP_PNG)
+        print(f"[pack_from_scene] raster temp png: {RASTER_PACK_TMP_PNG}")
+    except Exception:
+        pass
+    _mark("write_tmp_png")
+    placement_bin = [int(info.get("bin", -1)) for info in rot_info]
+    placement_bin_by_zid = {}
+    for idx, zid in enumerate(zone_order):
+        if idx >= len(placement_bin) or idx >= len(placements):
+            continue
+        if placements[idx][2] <= 0 or placements[idx][3] <= 0:
+            continue
+        placement_bin_by_zid[zid] = placement_bin[idx]
     zone_shift: Dict[int, tuple[float, float]] = {}
     zone_rot: Dict[int, float] = {}
     zone_center: Dict[int, tuple[float, float]] = {}
     for idx, zid in enumerate(zone_order):
         if idx >= len(placements):
             continue
-        dx, dy, _, _, _ = placements[idx]
+        dx, dy, bw, bh, _ = placements[idx]
+        if bw <= 0 or bh <= 0:
+            continue
         zone_shift[zid] = (float(dx), float(dy))
         info = rot_info[idx] if idx < len(rot_info) else {"angle": 0.0, "cx": 0.0, "cy": 0.0}
         zone_rot[zid] = float(info.get("angle", 0.0))
         zone_center[zid] = (float(info.get("cx", 0.0)), float(info.get("cy", 0.0)))
+    if raster_only:
+        timings_ms["total"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
+        print(f"[pack_from_scene] timings_ms={timings_ms}")
+        return jsonify(
+            {
+                "ok": True,
+                "raster_only": True,
+                "raster_tmp_path": str(RASTER_PACK_TMP_PNG),
+                "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG),
+                "raster_tmp_png_url": "/out/tmp_raster_pack.png",
+                "raster_tmp_json_path": str(RASTER_PACK_TMP_JSON),
+                "raster_overlap_count": int(raster_report.get("count", 0)),
+                "raster_pages": 2,
+                "timings_ms": timings_ms,
+            }
+        )
     colors_raw = payload.get("region_colors") or []
     colors = []
     for i in range(len(polys)):
@@ -307,7 +486,9 @@ def api_pack_from_scene():
         placement_bin_by_zid=placement_bin_by_zid,
         page_idx=0,
         out_path=PACKED_ZONE_SCENE_SVG,
+        include_bleed=PACKED_INCLUDE_BLEED,
     )
+    _mark("write_svg_page1")
     packing.write_pack_svg(
         polys,
         zone_id,
@@ -321,25 +502,36 @@ def api_pack_from_scene():
         placement_bin_by_zid=placement_bin_by_zid,
         page_idx=1,
         out_path=PACKED_ZONE_SCENE_SVG_PAGE2,
+        include_bleed=PACKED_INCLUDE_BLEED,
     )
-    return jsonify(
-        {
-            "ok": True,
-            "packed_svg": PACKED_ZONE_SCENE_SVG.read_text(encoding="utf-8"),
-            "packed_svg_page2": PACKED_ZONE_SCENE_SVG_PAGE2.read_text(encoding="utf-8"),
-            "zone_shift": zone_shift,
-            "zone_rot": zone_rot,
-            "zone_center": zone_center,
-            "placement_bin": placement_bin_by_zid,
-        }
-    )
+    _mark("write_svg_page2")
+    timings_ms["total"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
+    print(f"[pack_from_scene] timings_ms={timings_ms}")
+    result = {
+        "ok": True,
+        "packed_svg": PACKED_ZONE_SCENE_SVG.read_text(encoding="utf-8"),
+        "packed_svg_page2": PACKED_ZONE_SCENE_SVG_PAGE2.read_text(encoding="utf-8"),
+        "zone_shift": zone_shift,
+        "zone_rot": zone_rot,
+        "zone_center": zone_center,
+        "placement_bin": placement_bin_by_zid,
+        "raster_tmp_path": str(RASTER_PACK_TMP_PNG),
+        "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG),
+        "raster_tmp_png_url": "/out/tmp_raster_pack.png",
+        "raster_tmp_json_path": str(RASTER_PACK_TMP_JSON),
+        "raster_overlap_count": int(raster_report.get("count", 0)),
+        "raster_pages": 2,
+        "timings_ms": timings_ms,
+    }
+    return jsonify(result)
 
 
 @app.get("/api/source_zone_click")
 def api_get_source_zone_click():
-    if SOURCE_ZONE_CLICK_JSON.exists():
+    src = SOURCE_ZONE_CLICK_JSON if SOURCE_ZONE_CLICK_JSON.exists() else SOURCE_ZONE_CLICK_JSON_LEGACY
+    if src.exists():
         try:
-            data = json.loads(SOURCE_ZONE_CLICK_JSON.read_text(encoding="utf-8"))
+            data = json.loads(src.read_text(encoding="utf-8"))
             if isinstance(data, list):
                 return jsonify({"clicks": data})
             if isinstance(data, dict):
@@ -359,12 +551,25 @@ def api_save_source_zone_click():
             continue
         x = item.get("x")
         y = item.get("y")
+        rid = item.get("rid")
+        attach_to = item.get("attach_to")
+        row: Dict[str, Any] = {}
         if isinstance(x, (int, float)) and isinstance(y, (int, float)):
             if math.isfinite(x) and math.isfinite(y):
-                cleaned.append({"x": float(x), "y": float(y)})
-    SOURCE_ZONE_CLICK_JSON.write_text(
-        json.dumps({"clicks": cleaned}, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+                row["x"] = float(x)
+                row["y"] = float(y)
+        if isinstance(rid, (int, float)) and math.isfinite(float(rid)):
+            row["rid"] = int(rid)
+        if isinstance(attach_to, (int, float)) and math.isfinite(float(attach_to)):
+            row["attach_to"] = int(attach_to)
+        if row:
+            cleaned.append(row)
+    payload_text = json.dumps({"clicks": cleaned}, ensure_ascii=False, indent=2)
+    SOURCE_ZONE_CLICK_JSON.write_text(payload_text, encoding="utf-8")
+    try:
+        SOURCE_ZONE_CLICK_JSON_LEGACY.write_text(payload_text, encoding="utf-8")
+    except Exception:
+        pass
     return jsonify({"ok": True, "count": len(cleaned)})
 
 

@@ -4,15 +4,19 @@ import { Stage, Layer, Line, Text, Circle, Rect, Path, Group, Image, Transformer
 
 const toPoints = (pts) => pts.flatMap((p) => [p[0], p[1]]);
 
+const toFinite = (v, fallback = 0) => (Number.isFinite(v) ? v : fallback);
+
 const measureText = (text, fontSize, fontFamily) => {
-  const size = Number.isFinite(fontSize) ? fontSize : 12;
+  const size = toFinite(fontSize, 12);
   const family = fontFamily || "Arial";
+  const safeText = String(text ?? "");
   if (Konva?.Util?.getTextWidth) {
-    const width = Konva.Util.getTextWidth(text || "", size, family);
-    return { width, height: size };
+    const widthRaw = Konva.Util.getTextWidth(safeText, size, family);
+    const widthFallback = safeText.length * size * 0.6;
+    return { width: toFinite(widthRaw, widthFallback), height: toFinite(size, 12) };
   }
-  const width = (text ? text.length : 0) * size * 0.6;
-  return { width, height: size };
+  const width = safeText.length * size * 0.6;
+  return { width: toFinite(width, 0), height: toFinite(size, 12) };
 };
 const rotatePt = (pt, angleDeg, cx, cy) => {
   if (!angleDeg) return pt;
@@ -212,57 +216,7 @@ const scaleSceneData = (scene, ratio) => {
   };
 };
 
-const logPackedPreview = (data) => {
-  if (!data) return;
-  const placements = data.placements || [];
-  const binW = data.canvas?.w || 0;
-  const binH = data.canvas?.h || 0;
-  let placed = 0;
-  let unplaced = 0;
-  let placedArea = 0;
-  const unplacedIds = [];
-  const pageCounts = {};
-  placements.forEach((p, idx) => {
-    const dx = p?.[0] ?? -1;
-    const dy = p?.[1] ?? -1;
-    const bw = p?.[2] ?? 0;
-    const bh = p?.[3] ?? 0;
-    if (dx < 0 || dy < 0 || bw <= 0 || bh <= 0) {
-      unplaced += 1;
-      unplacedIds.push(idx);
-    } else {
-      placed += 1;
-      placedArea += bw * bh;
-    }
-    const bin = data.placement_bin?.[idx];
-    if (bin != null) {
-      pageCounts[bin] = (pageCounts[bin] || 0) + 1;
-    }
-  });
-  const binArea = binW * binH;
-  const fillRatio = binArea ? placedArea / binArea : 0;
-  const debug = data.debug || {};
-  console.groupCollapsed(
-    `[packed preview] placed=${placed} unplaced=${unplaced} area=${placedArea}/${binArea} (${(fillRatio * 100).toFixed(
-      2
-    )}%)`
-  );
-  console.log("canvas", data.canvas);
-  console.log("placed/unplaced", { placed, unplaced, placedArea, binArea, fillRatio });
-  console.log("unplaced_ids", unplacedIds);
-  console.log("page_counts", pageCounts);
-  console.log("debug", debug);
-  console.log("pack_settings", {
-    packPadding: data.pack_padding,
-    packMarginX: data.pack_margin_x,
-    packMarginY: data.pack_margin_y,
-    packGrid: data.pack_grid,
-    packAngle: data.pack_angle,
-    packMode: data.pack_mode,
-    drawScale: data.draw_scale,
-  });
-  console.groupEnd();
-};
+const logPackedPreview = () => {};
 
 // packed zone boundaries are transformed on backend
 
@@ -842,6 +796,12 @@ const polyAreaAndCentroid = (poly) => {
   return { area, cx: cx / (6 * area), cy: cy / (6 * area) };
 };
 
+const PACK_PRESETS = {
+  fast: { label: "Fast", grid: 10, angle: 15, mode: "fast" },
+  balanced: { label: "Balanced", grid: 5, angle: 5, mode: "balanced" },
+  tight: { label: "Tight", grid: 2, angle: 2, mode: "tight" },
+};
+
 export default function App() {
   const [snap, setSnap] = useState(1);
   const [sourceScale, setSourceScale] = useState(1);
@@ -896,7 +856,7 @@ export default function App() {
   const [zoneStageSize, setZoneStageSize] = useState({ w: 300, h: 200 });
   const zoneClickCacheRef = useRef([]);
   const [leftTab, setLeftTab] = useState("zone");
-  const [rightTab, setRightTab] = useState("packed");
+  const rightTab = "packed";
   const neighborSnap = 0.5;
   const regionAdj = useMemo(
     () => buildRegionAdjacencyMulti((zoneScene || scene)?.regions || [], [neighborSnap, 2]),
@@ -908,8 +868,8 @@ export default function App() {
   const [showLabels, setShowLabels] = useState(true);
   const [labelFontFamily, setLabelFontFamily] = useState("Arial");
   const [labelFontSize, setLabelFontSize] = useState(12);
-  const [packedImageSrc, setPackedImageSrc] = useState("/out/packed.svg");
-  const [packedImageSrc2, setPackedImageSrc2] = useState("/out/packed_page2.svg");
+  const [packedImageSrc, setPackedImageSrc] = useState("");
+  const [packedImageSrc2, setPackedImageSrc2] = useState("");
   const [packedFillPaths, setPackedFillPaths] = useState([]);
   const [packedBleedPaths, setPackedBleedPaths] = useState([]);
   const [packedBleedError, setPackedBleedError] = useState("");
@@ -923,19 +883,35 @@ export default function App() {
   const [edgeCandidate, setEdgeCandidate] = useState(null);
   const [deleteEdgeCandidate, setDeleteEdgeCandidate] = useState(null);
   const [sceneLoading, setSceneLoading] = useState(true);
-  const [packPadding, setPackPadding] = useState(4);
+  const [packPadding, setPackPadding] = useState(5);
   const [packMarginX, setPackMarginX] = useState(30);
   const [packMarginY, setPackMarginY] = useState(30);
-  const [packBleed, setPackBleed] = useState(10);
+  const [packBleed, setPackBleed] = useState(3);
+  const [enableBleed, setEnableBleed] = useState(true);
+  const [showRasterTemp, setShowRasterTemp] = useState(false);
+  const [rasterTempSrc, setRasterTempSrc] = useState("");
   const [drawScale, setDrawScale] = useState(0.5);
-  const [packGrid, setPackGrid] = useState(5);
-  const [packAngle, setPackAngle] = useState(5);
+  const [packGrid, setPackGrid] = useState(10);
+  const [packAngle, setPackAngle] = useState(15);
   const [packMode, setPackMode] = useState("fast");
+  const [packPreset, setPackPreset] = useState("fast");
   const [autoPack, setAutoPack] = useState(false);
   const [overlayItems, setOverlayItems] = useState([]);
   const [selectedOverlayId, setSelectedOverlayId] = useState(null);
   const [overlayFill, setOverlayFill] = useState("#000000");
   const [zoneClickLogs, setZoneClickLogs] = useState([]);
+  const [packedEditMode, setPackedEditMode] = useState("none"); // none | move | rotate
+  const [manualPackedEdits, setManualPackedEdits] = useState({});
+  const packedEditSessionRef = useRef(null);
+  const manualPackedSaveTimerRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (manualPackedSaveTimerRef.current) {
+        clearTimeout(manualPackedSaveTimerRef.current);
+      }
+    };
+  }, []);
 
   const handleSourceScaleChange = (value) => {
     const next = parseFloat(value);
@@ -990,6 +966,20 @@ export default function App() {
       const packedPolyData = buildPackedPolyData(packedSource);
       setPackedEmptyCells(buildPackedEmptyCells(packedSource, packedPolyData));
       refreshPackedFromZoneScene(packedSource);
+    }
+  };
+
+  const applyPackPreset = (name, rerender = false) => {
+    const key = String(name || "").toLowerCase();
+    const preset = PACK_PRESETS[key];
+    if (!preset) return;
+    clearManualPackedEdits();
+    setPackPreset(key);
+    setPackGrid(preset.grid);
+    setPackAngle(preset.angle);
+    setPackMode(preset.mode);
+    if (rerender) {
+      requestAnimationFrame(() => loadScene(false, true, true));
     }
   };
 
@@ -1446,20 +1436,28 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [selectedOverlayId, nodes, segs, overlayItems]);
 
-  const loadScene = async (fit = true, updatePacked = true, updateZone = true) => {
+  const loadScene = async (
+    fit = true,
+    updatePacked = true,
+    updateZone = true,
+    forceCompute = false
+  ) => {
     try {
       setError("");
       setAutoFit(fit);
       setSceneLoading(true);
       let savedView = null;
+      let savedManualPacked = null;
       try {
         const stateRes = await fetch("/api/state");
         if (stateRes.ok) {
           const stateJson = await stateRes.json();
           savedView = stateJson?.view || null;
+          savedManualPacked = stateJson?.manual_packed || null;
         }
       } catch {
         savedView = null;
+        savedManualPacked = null;
       }
       const svgRes = await fetch("/out/convoi.svg");
       if (!svgRes.ok) throw new Error(`svg fetch failed: ${svgRes.status}`);
@@ -1529,7 +1527,9 @@ export default function App() {
       setSegs(snapped.segs);
 
       const res = await fetch(
-        `/api/scene?snap=${snap}&pack_padding=${packPadding}&pack_margin_x=${packMarginX}&pack_margin_y=${packMarginY}&draw_scale=${drawScale}&pack_grid=${packGrid}&pack_angle=${packAngle}&pack_mode=${packMode}`
+        `/api/scene?snap=${snap}&pack_padding=${packPadding}&pack_margin_x=${packMarginX}&pack_margin_y=${packMarginY}&pack_bleed=${packBleed}&draw_scale=${drawScale}&pack_grid=${packGrid}&pack_angle=${packAngle}&pack_mode=${packMode}&force_compute=${
+          forceCompute ? 1 : 0
+        }`
       );
       if (!res.ok) {
         throw new Error(`scene fetch failed: ${res.status}`);
@@ -1539,6 +1539,7 @@ export default function App() {
       setScene(scaledData);
       if (updateZone) {
         let zoneData = scaledData;
+        let appliedManualPacked = false;
         try {
           const clickRes = await fetch("/api/source_zone_click");
           if (clickRes.ok) {
@@ -1556,8 +1557,21 @@ export default function App() {
         } catch {
           zoneClickCacheRef.current = [];
         }
+        if (
+          savedManualPacked?.edits &&
+          savedManualPacked?.signature &&
+          savedManualPacked.signature === computePackedSignature(zoneData)
+        ) {
+          zoneData = applyManualPackedEdits(zoneData, savedManualPacked.edits);
+          setManualPackedEdits(savedManualPacked.edits || {});
+          appliedManualPacked = true;
+        } else {
+          setManualPackedEdits({});
+        }
         setZoneScene(zoneData);
-        await refreshPackedFromZoneScene(zoneData);
+        if (!appliedManualPacked) {
+          refreshPackedFromZoneScene(zoneData, enableBleed).catch(() => {});
+        }
       }
       logPackedPreview(scaledData);
       if (typeof scaledData.draw_scale === "number") {
@@ -1571,8 +1585,6 @@ export default function App() {
         }));
         setLabels(initLabels);
         if (updatePacked) {
-          setPackedImageSrc(`/out/packed.svg?t=${Date.now()}`);
-          setPackedImageSrc2(`/out/packed_page2.svg?t=${Date.now()}`);
           const packedPolyData = buildPackedPolyData(scaledData);
           const emptyCells = buildPackedEmptyCells(scaledData, packedPolyData);
           setPackedEmptyCells(emptyCells);
@@ -2277,6 +2289,96 @@ export default function App() {
   }, [scene]);
 
   const packedSource = zoneScene || scene;
+  const hasManualPackedEdits = useMemo(
+    () => Object.keys(manualPackedEdits || {}).length > 0,
+    [manualPackedEdits]
+  );
+
+  const packedLiveFillItems = useMemo(() => {
+    if (!hasManualPackedEdits || !packedSource?.regions || !packedSource?.zone_id) return [];
+    const out = [];
+    packedSource.regions.forEach((poly, idx) => {
+      if (!poly || poly.length < 3) return;
+      const zidRaw = packedSource.zone_id?.[idx];
+      if (zidRaw == null) return;
+      const zid = String(zidRaw);
+      const shift =
+        packedSource.zone_shift?.[zid] ||
+        packedSource.zone_shift?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const rot =
+        packedSource.zone_rot?.[zid] ??
+        packedSource.zone_rot?.[parseInt(zid, 10)] ??
+        0;
+      const center =
+        packedSource.zone_center?.[zid] ||
+        packedSource.zone_center?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const moved = transformPath(poly, shift, rot, center);
+      if (!moved || moved.length < 3) return;
+      const bin =
+        packedSource?.placement_bin?.[zid] ??
+        packedSource?.placement_bin?.[parseInt(zid, 10)];
+      const page = bin === 1 ? 1 : 0;
+      const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
+      const fill = packedSource.region_colors?.[idx] || "#808080";
+      out.push({
+        key: `pflive-${idx}`,
+        points: toPoints(offsetPoints(moved, xOffset, 0)),
+        fill,
+      });
+    });
+    return out;
+  }, [hasManualPackedEdits, packedSource]);
+
+  const packedZoneColorByZid = useMemo(() => {
+    const source = packedSource || scene;
+    const out = {};
+    if (!source?.zone_id || !source?.region_colors) return out;
+    for (let i = 0; i < source.zone_id.length; i++) {
+      const zid = String(source.zone_id[i]);
+      if (out[zid]) continue;
+      out[zid] = source.region_colors[i] || "#808080";
+    }
+    return out;
+  }, [packedSource, scene]);
+
+  const packedLiveBleedItems = useMemo(() => {
+    if (!enableBleed) return [];
+    if (!hasManualPackedEdits || !packedSource?.zone_pack_polys || !packedSource?.zone_order) return [];
+    const out = [];
+    const zoneOrder = packedSource.zone_order || [];
+    zoneOrder.forEach((zidRaw, idx) => {
+      const zid = String(zidRaw);
+      const poly = packedSource.zone_pack_polys?.[idx];
+      if (!poly || poly.length < 3) return;
+      const shift =
+        packedSource.zone_shift?.[zid] ||
+        packedSource.zone_shift?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const rot =
+        packedSource.zone_rot?.[zid] ??
+        packedSource.zone_rot?.[parseInt(zid, 10)] ??
+        0;
+      const center =
+        packedSource.zone_center?.[zid] ||
+        packedSource.zone_center?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const moved = transformPath(poly, shift, rot, center);
+      if (!moved || moved.length < 3) return;
+      const bin =
+        packedSource?.placement_bin?.[zid] ??
+        packedSource?.placement_bin?.[parseInt(zid, 10)];
+      const page = bin === 1 ? 1 : 0;
+      const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
+      out.push({
+        key: `pblive-${zid}-${idx}`,
+        points: toPoints(offsetPoints(moved, xOffset, 0)),
+        fill: packedZoneColorByZid[zid] || "#808080",
+      });
+    });
+    return out;
+  }, [enableBleed, hasManualPackedEdits, packedSource, packedZoneColorByZid]);
 
   const packedEmptyCellsDerived = useMemo(() => {
     if (!packedSource) return [];
@@ -2364,6 +2466,40 @@ export default function App() {
     return out;
   }, [packedCellsByBin, packedSource]);
 
+  const packedIndexItems = useMemo(() => {
+    if (!packedSource) return [];
+    if (packedLabelSnappedAll.length) return packedLabelSnappedAll;
+    const out = [];
+    Object.entries(packedSource.zone_labels || {}).forEach(([zid, lbl]) => {
+      if (!lbl || !Number.isFinite(lbl.x) || !Number.isFinite(lbl.y)) return;
+      const shift =
+        packedSource.zone_shift?.[zid] ?? packedSource.zone_shift?.[parseInt(zid, 10)];
+      if (!shift) return;
+      const rot =
+        packedSource.zone_rot?.[zid] ??
+        packedSource.zone_rot?.[parseInt(zid, 10)] ??
+        0;
+      const center =
+        packedSource.zone_center?.[zid] ??
+        packedSource.zone_center?.[parseInt(zid, 10)] ??
+        [0, 0];
+      const [pt] = transformPath([[lbl.x, lbl.y]], shift, rot, center);
+      if (!pt) return;
+      const bin =
+        packedSource?.placement_bin?.[zid] ??
+        packedSource?.placement_bin?.[parseInt(zid, 10)];
+      const page = bin === 1 ? 1 : 0;
+      const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
+      out.push({
+        zid: String(zid),
+        label: `${getZoneAlias(zid, packedSource)}`,
+        x: pt[0] + xOffset,
+        y: pt[1],
+      });
+    });
+    return out;
+  }, [packedSource, packedLabelSnappedAll]);
+
   const packedLowAreaWarnings = useMemo(() => {
     if (!packedSource?.zone_boundaries) return [];
     const zoneCandidates = [];
@@ -2426,6 +2562,7 @@ export default function App() {
         zid: String(zid),
         label: getZoneAlias(zid, packedSource),
         ratio: avgArea > 0 ? zoneArea / avgArea : 0,
+        page,
         minx,
         miny,
         maxx,
@@ -2450,7 +2587,89 @@ export default function App() {
     return [];
   };
 
-  const refreshPackedFromZoneScene = async (source) => {
+  const computePackedSignature = (source) => {
+    if (!source) return "none";
+    let h = 2166136261;
+    const mix = (n) => {
+      let x = Number.isFinite(n) ? Math.floor(n * 1000) : 0;
+      h ^= x >>> 0;
+      h = Math.imul(h, 16777619) >>> 0;
+    };
+    mix(source?.canvas?.w || 0);
+    mix(source?.canvas?.h || 0);
+    const regions = source?.regions || [];
+    const zid = source?.zone_id || [];
+    mix(regions.length);
+    mix(zid.length);
+    for (let i = 0; i < Math.min(64, zid.length); i++) mix(zid[i]);
+    for (let i = 0; i < Math.min(24, regions.length); i++) {
+      const r = regions[i] || [];
+      mix(r.length);
+      for (let j = 0; j < Math.min(3, r.length); j++) {
+        mix(r[j]?.[0]);
+        mix(r[j]?.[1]);
+      }
+    }
+    return `p${h.toString(16)}`;
+  };
+
+  const applyManualPackedEdits = (source, edits) => {
+    if (!source || !edits || !Object.keys(edits).length) return source;
+    const next = { ...source };
+    next.zone_shift = { ...(source.zone_shift || {}) };
+    next.zone_rot = { ...(source.zone_rot || {}) };
+    Object.entries(edits).forEach(([zid, v]) => {
+      if (!v) return;
+      if (Number.isFinite(v.dx) && Number.isFinite(v.dy)) {
+        next.zone_shift[zid] = [v.dx, v.dy];
+      }
+      if (Number.isFinite(v.rot)) {
+        next.zone_rot[zid] = v.rot;
+      }
+    });
+    return next;
+  };
+
+  const patchStateJson = async (patch) => {
+    try {
+      let state = {};
+      try {
+        const r = await fetch("/api/state");
+        if (r.ok) state = (await r.json()) || {};
+      } catch {}
+      const next = { ...(state || {}), ...(patch || {}) };
+      await fetch("/api/state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next),
+      });
+    } catch {}
+  };
+
+  const scheduleSaveManualPackedEdits = (edits, source) => {
+    if (manualPackedSaveTimerRef.current) {
+      clearTimeout(manualPackedSaveTimerRef.current);
+    }
+    manualPackedSaveTimerRef.current = setTimeout(() => {
+      const payload = {
+        manual_packed: {
+          signature: computePackedSignature(source),
+          edits,
+        },
+      };
+      patchStateJson(payload);
+    }, 180);
+  };
+
+  const clearManualPackedEdits = () => {
+    setManualPackedEdits({});
+    patchStateJson({ manual_packed: null });
+  };
+
+  const refreshPackedFromZoneScene = async (
+    source,
+    bleedEnabled = enableBleed
+  ) => {
     if (!source?.regions || !source?.zone_id || !source?.canvas) return;
     try {
       const res = await fetch("/api/pack_from_scene", {
@@ -2461,12 +2680,21 @@ export default function App() {
           regions: source.regions,
           zone_id: source.zone_id,
           region_colors: source.region_colors || [],
+          pack_padding: packPadding,
+          pack_margin_x: packMarginX,
+          pack_margin_y: packMarginY,
+          pack_bleed: packBleed,
+          draw_scale: drawScale,
+          pack_grid: packGrid,
+          pack_angle: packAngle,
+          pack_mode: packMode,
         }),
       });
       if (!res.ok) {
         throw new Error(`pack_from_scene failed: ${res.status}`);
       }
       const data = await res.json();
+      setShowRasterTemp(false);
       if (data?.packed_svg) {
         const parsed = parsePackedSvg(data.packed_svg);
         setPackedFillPaths(parsed.fillPaths);
@@ -2497,6 +2725,56 @@ export default function App() {
     }
   };
 
+  const repackCurrentPacked = async (bleedEnabled = enableBleed) => {
+    const source = zoneScene || scene;
+    if (!source?.regions || !source?.zone_id || !source?.canvas) return;
+    try {
+      setError("");
+      setSceneLoading(true);
+      setShowRasterTemp(false);
+      clearManualPackedEdits();
+      await refreshPackedFromZoneScene(source, bleedEnabled);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setSceneLoading(false);
+    }
+  };
+
+  const computePackedFromCurrentZone = async () => {
+    const source = zoneScene || scene;
+    if (!source?.regions || !source?.zone_id || !source?.canvas) return;
+    try {
+      setError("");
+      const res = await fetch("/api/pack_from_scene", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          canvas: source.canvas,
+          regions: source.regions,
+          zone_id: source.zone_id,
+          region_colors: source.region_colors || [],
+          pack_padding: packPadding,
+          pack_margin_x: packMarginX,
+          pack_margin_y: packMarginY,
+          pack_bleed: packBleed,
+          draw_scale: drawScale,
+          pack_grid: packGrid,
+          pack_angle: packAngle,
+          pack_mode: packMode,
+          raster_only: true,
+        }),
+      });
+      if (!res.ok) throw new Error(`raster compute failed: ${res.status}`);
+      const data = await res.json();
+      const url = data?.raster_tmp_png_url || "/out/tmp_raster_pack.png";
+      setRasterTempSrc(`${url}?t=${Date.now()}`);
+      setShowRasterTemp(true);
+    } catch (err) {
+      setError(err.message || String(err));
+    }
+  };
+
   const getZoneStageWorldPoint = (evt) => {
     const stage = evt?.target?.getStage?.() || zoneRef.current;
     if (!stage) return null;
@@ -2508,9 +2786,17 @@ export default function App() {
     return { x, y };
   };
 
-  const saveZoneClickCache = async (pt) => {
-    if (!pt || !Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
-    const next = [...zoneClickCacheRef.current, { x: pt.x, y: pt.y }];
+  const saveZoneClickCache = async (entry) => {
+    if (!entry || typeof entry !== "object") return;
+    const row = {};
+    if (Number.isFinite(entry.x) && Number.isFinite(entry.y)) {
+      row.x = entry.x;
+      row.y = entry.y;
+    }
+    if (Number.isFinite(entry.rid)) row.rid = Math.trunc(entry.rid);
+    if (Number.isFinite(entry.attach_to)) row.attach_to = Math.trunc(entry.attach_to);
+    if (!Object.keys(row).length) return;
+    const next = [...zoneClickCacheRef.current, row];
     zoneClickCacheRef.current = next;
     try {
       await fetch("/api/source_zone_click", {
@@ -2564,25 +2850,27 @@ export default function App() {
     let nextSource = base;
     let lastTarget = null;
     clicks.forEach((pt, idx) => {
-      if (!pt || !Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
-      const rid = findRegionAtPoint(nextSource.regions, pt);
-      if (rid < 0) {
-        console.log(`[zone] replay ${idx} miss x=${pt.x} y=${pt.y}`);
-        return;
+      if (!pt) return;
+      if (Number.isFinite(pt.rid) && Number.isFinite(pt.attach_to)) {
+        const rid = Math.trunc(pt.rid);
+        const target = Math.trunc(pt.attach_to);
+        if (rid >= 0 && rid < (nextSource.zone_id || []).length) {
+          const cur = nextSource.zone_id[rid];
+          if (String(cur) !== String(target)) {
+            const nextZoneId = (nextSource.zone_id || []).slice();
+            nextZoneId[rid] = target;
+            const nextBoundaries = buildZoneBoundaries(nextSource.regions, nextZoneId, 0);
+            nextSource = { ...nextSource, zone_id: nextZoneId, zone_boundaries: nextBoundaries };
+            lastTarget = target;
+            return;
+          }
+        }
       }
+      if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
+      const rid = findRegionAtPoint(nextSource.regions, pt);
+      if (rid < 0) return;
       const res = applyZoneDetachAttach(nextSource, rid, adj, cursorMap);
       if (!res.changed) return;
-      const currentAlias = getZoneAlias(res.currentZid, nextSource);
-      const neighborAliases = (res.neighborZids || []).map((zid) =>
-        getZoneAlias(zid, nextSource)
-      );
-      console.log(
-        `[zone] replay ${idx} region=${rid} current=${currentAlias} neighbors=${neighborAliases.join(
-          ", "
-        )}`
-      );
-      const targetAlias = getZoneAlias(res.targetZid, nextSource);
-      console.log(`[zone] replay ${idx} region=${rid} attach=${targetAlias}`);
       nextSource = res.source;
       lastTarget = res.targetZid;
     });
@@ -2619,7 +2907,6 @@ export default function App() {
     const source = zoneScene || scene;
     if (!source) return;
     const clickPt = getZoneStageWorldPoint(evt);
-    if (clickPt) saveZoneClickCache(clickPt);
     const adjAll = buildRegionAdjacencyMulti(source.regions || [], [neighborSnap, 2]);
     const res = applyZoneDetachAttach(
       source,
@@ -2632,13 +2919,14 @@ export default function App() {
     const neighborAliases = (res.neighborZids || []).map((zid) => getZoneAlias(zid, source));
     const clickLine = `Click: ${currentAlias} -> [${neighborAliases.join(", ")}]`;
     setZoneClickLogs((logs) => [...logs.slice(-20), clickLine]);
-    console.log(
-      `[zone] region=${rid} current=${currentAlias} neighbors=${neighborAliases.join(", ")}`
-    );
-    const targetAlias = getZoneAlias(res.targetZid, source);
-    console.log(`[zone] region=${rid} attach=${targetAlias}`);
     setZoneScene(res.source);
     setSelectedZoneId(String(res.targetZid));
+    saveZoneClickCache({
+      x: clickPt?.x,
+      y: clickPt?.y,
+      rid,
+      attach_to: res.targetZid,
+    });
     refreshPackedFromZoneScene(res.source);
   };
 
@@ -2677,6 +2965,135 @@ export default function App() {
     const next = String(zid);
     setSelectedZoneId(next);
     centerZoneViewById(next);
+  };
+
+  const getPackedStageWorldPoint = (evt) => {
+    const stage = evt?.target?.getStage?.() || regionRef.current;
+    if (!stage) return null;
+    const pointer = stage.getPointerPosition?.();
+    if (!pointer) return null;
+    const scale = stage.scaleX?.() || regionScale || 1;
+    return {
+      x: (pointer.x - stage.x()) / scale,
+      y: (pointer.y - stage.y()) / scale,
+    };
+  };
+
+  const updateManualZoneTransform = (zid, nextDx, nextDy, nextRot, persist = false) => {
+    const key = String(zid);
+    setZoneScene((prev) => {
+      if (!prev) return prev;
+      const zone_shift = { ...(prev.zone_shift || {}) };
+      const zone_rot = { ...(prev.zone_rot || {}) };
+      if (Number.isFinite(nextDx) && Number.isFinite(nextDy)) zone_shift[key] = [nextDx, nextDy];
+      if (Number.isFinite(nextRot)) zone_rot[key] = nextRot;
+      return { ...prev, zone_shift, zone_rot };
+    });
+    setManualPackedEdits((prev) => {
+      const next = { ...(prev || {}) };
+      next[key] = {
+        dx: Number.isFinite(nextDx) ? nextDx : prev?.[key]?.dx ?? 0,
+        dy: Number.isFinite(nextDy) ? nextDy : prev?.[key]?.dy ?? 0,
+        rot: Number.isFinite(nextRot) ? nextRot : prev?.[key]?.rot ?? 0,
+      };
+      if (persist) {
+        const source = zoneScene || scene;
+        if (source) scheduleSaveManualPackedEdits(next, source);
+      }
+      return next;
+    });
+  };
+
+  const beginPackedEdit = (zid, evt) => {
+    if (packedEditMode === "none") return;
+    const source = packedSource || scene;
+    if (!source) return;
+    const key = String(zid);
+    const shift =
+      source.zone_shift?.[key] ||
+      source.zone_shift?.[parseInt(key, 10)] ||
+      [0, 0];
+    const baseDx = Number.isFinite(shift?.[0]) ? shift[0] : 0;
+    const baseDy = Number.isFinite(shift?.[1]) ? shift[1] : 0;
+    const baseRot =
+      source.zone_rot?.[key] ??
+      source.zone_rot?.[parseInt(key, 10)] ??
+      0;
+    const center =
+      source.zone_center?.[key] ||
+      source.zone_center?.[parseInt(key, 10)] ||
+      [0, 0];
+    const pt = getPackedStageWorldPoint(evt);
+    if (!pt) return;
+    setSelectedZoneId(key);
+    centerZoneViewById(key);
+    if (packedEditMode === "move") {
+      packedEditSessionRef.current = {
+        type: "move",
+        zid: key,
+        startX: pt.x,
+        startY: pt.y,
+        baseDx,
+        baseDy,
+        baseRot,
+      };
+    } else if (packedEditMode === "rotate") {
+      const cx = (center?.[0] || 0) + baseDx;
+      const cy = (center?.[1] || 0) + baseDy;
+      packedEditSessionRef.current = {
+        type: "rotate",
+        zid: key,
+        cx,
+        cy,
+        startA: Math.atan2(pt.y - cy, pt.x - cx),
+        baseDx,
+        baseDy,
+        baseRot,
+      };
+    }
+    evt?.cancelBubble && (evt.cancelBubble = true);
+  };
+
+  const handlePackedStageMouseMove = (evt) => {
+    const s = packedEditSessionRef.current;
+    if (!s) return;
+    const pt = getPackedStageWorldPoint(evt);
+    if (!pt) return;
+    if (s.type === "move") {
+      const ndx = s.baseDx + (pt.x - s.startX);
+      const ndy = s.baseDy + (pt.y - s.startY);
+      updateManualZoneTransform(s.zid, ndx, ndy, s.baseRot, false);
+    } else if (s.type === "rotate") {
+      const a = Math.atan2(pt.y - s.cy, pt.x - s.cx);
+      let d = ((a - s.startA) * 180) / Math.PI;
+      while (d > 180) d -= 360;
+      while (d < -180) d += 360;
+      updateManualZoneTransform(s.zid, s.baseDx, s.baseDy, s.baseRot + d, false);
+    }
+  };
+
+  const handlePackedStageMouseUp = () => {
+    const s = packedEditSessionRef.current;
+    if (!s) return;
+    packedEditSessionRef.current = null;
+    const source = zoneScene || scene;
+    if (source) {
+      const currentShift =
+        source.zone_shift?.[s.zid] ||
+        source.zone_shift?.[parseInt(s.zid, 10)] ||
+        [s.baseDx, s.baseDy];
+      const currentRot =
+        source.zone_rot?.[s.zid] ??
+        source.zone_rot?.[parseInt(s.zid, 10)] ??
+        s.baseRot;
+      updateManualZoneTransform(
+        s.zid,
+        Number.isFinite(currentShift?.[0]) ? currentShift[0] : s.baseDx,
+        Number.isFinite(currentShift?.[1]) ? currentShift[1] : s.baseDy,
+        Number.isFinite(currentRot) ? currentRot : s.baseRot,
+        true
+      );
+    }
   };
 
   const transformOverlayToPacked = (item) => {
@@ -2844,10 +3261,22 @@ export default function App() {
   useEffect(() => {
     if (!autoPack) return;
     const id = setTimeout(() => {
-      loadScene(false);
+      repackCurrentPacked();
     }, 500);
     return () => clearTimeout(id);
-  }, [packPadding, packMarginX, packMarginY, packBleed, packGrid, packAngle, packMode, autoPack]);
+  }, [
+    packPadding,
+    packMarginX,
+    packMarginY,
+    packBleed,
+    enableBleed,
+    packGrid,
+    packAngle,
+    packMode,
+    autoPack,
+    zoneScene,
+    scene,
+  ]);
 
   const parsePackedSvg = (text) => {
     const doc = new DOMParser().parseFromString(text, "image/svg+xml");
@@ -3246,8 +3675,8 @@ export default function App() {
     <div className="app">
       <div className="content">
         <div className="column-left">
-          <div className="panel toolbar">
-            <button onClick={loadScene}>Load</button>
+          <div className="panel toolbar pack-toolbar-right">
+            <button onClick={() => loadScene(true, true, true, true)}>Load</button>
             <button onClick={exportPdf}>Export PDF</button>
             <button
               onClick={() => {
@@ -3685,8 +4114,8 @@ export default function App() {
               <div className="preview-controls">
                 <button
                   className="btn"
-                  onClick={() => loadScene(false, true, false)}
-                >
+                  onClick={() => computePackedFromCurrentZone()}
+                  >
                   Compute
                 </button>
                 <button
@@ -3825,24 +4254,59 @@ export default function App() {
           )}
         </div>
         <div className="right">
-          <div className="panel view-tabs">
-            <button
-              className={rightTab === "packed" ? "active" : ""}
-              onClick={() => setRightTab("packed")}
-            >
-              Packed
-            </button>
-            <button
-              className={rightTab === "box" ? "active" : ""}
-              onClick={() => setRightTab("box")}
-            >
-              Box
-            </button>
+          <div className="panel toolbar">
+            <div className="toolbar-segmented">
+              {Object.entries(PACK_PRESETS).map(([key, cfg]) => (
+                <button
+                  key={key}
+                  className={packPreset === key ? "active" : ""}
+                  title={`Grid ${cfg.grid} | Angle ${cfg.angle}°`}
+                  onClick={() => applyPackPreset(key, true)}
+                >
+                  {cfg.label}
+                </button>
+              ))}
+            </div>
+            <label className="toolbar-mini-input">
+              Margin X
+              <input
+                type="number"
+                min="0"
+                step="1"
+                value={packMarginX}
+                onChange={(e) => setPackMarginX(Math.max(0, parseInt(e.target.value || "0", 10) || 0))}
+              />
+            </label>
+            <label className="toolbar-mini-input">
+              Margin Y
+              <input
+                type="number"
+                min="0"
+                step="1"
+                value={packMarginY}
+                onChange={(e) => setPackMarginY(Math.max(0, parseInt(e.target.value || "0", 10) || 0))}
+              />
+            </label>
+            <button onClick={() => repackCurrentPacked(enableBleed)}>Repack</button>
           </div>
           <div className={`preview region-stage ${sceneLoading ? "is-loading" : ""}`} ref={regionWrapRef} style={{ height: '100%'}}>
             <div className="preview-header">
-              <div className="preview-title">
-                {rightTab === "packed" ? "Packed (Konva)" : "Packed (Box)"}
+              <div className="preview-title packed-title-row">
+                <span>Packed (Konva)</span>
+                <button
+                  className={`icon-button ${packedEditMode === "move" ? "active" : ""}`}
+                  onClick={() => setPackedEditMode((m) => (m === "move" ? "none" : "move"))}
+                  title="Move zone"
+                >
+                  Move
+                </button>
+                <button
+                  className={`icon-button ${packedEditMode === "rotate" ? "active" : ""}`}
+                  onClick={() => setPackedEditMode((m) => (m === "rotate" ? "none" : "rotate"))}
+                  title="Rotate zone"
+                >
+                  Rotate
+                </button>
               </div>
               <div className="preview-controls">
                 <label className="checkbox">
@@ -3875,6 +4339,18 @@ export default function App() {
                   />
                   Label
                 </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={enableBleed}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setEnableBleed(checked);
+                      repackCurrentPacked(checked);
+                    }}
+                  />
+                  Bleed
+                </label>
                 <label className="mini-input">
                   Font
                   <select
@@ -3896,8 +4372,11 @@ export default function App() {
                     type="number"
                     min="4"
                     max="64"
-                    value={labelFontSize}
-                    onChange={(e) => setLabelFontSize(parseFloat(e.target.value || "12"))}
+                    value={toFinite(labelFontSize, 12)}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      setLabelFontSize(toFinite(v, 12));
+                    }}
                   />
                 </label>
                 <button
@@ -3906,7 +4385,7 @@ export default function App() {
                   onClick={() =>
                     downloadStage(
                       regionRef,
-                      rightTab === "box" ? "packed-bbox-konva.svg" : "packed-konva.svg",
+                      "packed-konva.svg",
                       scene?.canvas ? { w: scene.canvas.w, h: scene.canvas.h } : null
                     )
                   }
@@ -3915,16 +4394,37 @@ export default function App() {
                 </button>
               </div>
             </div>
-            {packedSource ? (
+            {showRasterTemp ? (
+              <div
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  overflow: "hidden",
+                }}
+              >
+                <img
+                  src={rasterTempSrc || "/out/tmp_raster_pack.png"}
+                  alt="Raster temp"
+                  style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+                />
+              </div>
+            ) : packedSource ? (
               <Stage
                 width={regionStageSize.w}
                 height={regionStageSize.h}
-                  draggable
+                  draggable={packedEditMode === "none"}
                   scaleX={regionScale}
                   scaleY={regionScale}
                   x={regionPos.x}
                   y={regionPos.y}
                   onWheel={handleRegionWheel}
+                  onMouseMove={handlePackedStageMouseMove}
+                  onMouseUp={handlePackedStageMouseUp}
+                  onTouchMove={handlePackedStageMouseMove}
+                  onTouchEnd={handlePackedStageMouseUp}
                 ref={regionRef}
               >
                 <Layer>
@@ -3944,63 +4444,92 @@ export default function App() {
                 </Layer>
                 {rightTab === "packed" ? (
                 <Layer name="packed-image" visible={showImages}>
-                  <>
-                    <Group
-                      x={(packedSource?.canvas?.w || 0) / 2}
-                      y={(packedSource?.canvas?.h || 0) / 2}
-                      offsetX={(packedSource?.canvas?.w || 0) / 2}
-                      offsetY={(packedSource?.canvas?.h || 0) / 2}
-                    >
-                      {packedFillPaths.map((p, idx) => (
-                        <Path
-                          key={`fill-path-${idx}`}
-                          data={p.d}
-                          fill={p.fill}
+                  {hasManualPackedEdits ? (
+                    <>
+                      {enableBleed &&
+                        packedLiveBleedItems.map((it) => (
+                        <Line
+                          key={it.key}
+                          points={it.points}
+                          closed
+                          fill={it.fill}
+                          opacity={0.42}
                           strokeWidth={0}
                           listening={false}
                         />
                       ))}
-                      {packedBleedPaths.map((p, idx) => (
-                        <Path
-                          key={`bleed-path-${idx}`}
-                          data={p.d}
-                          fill={p.fill}
+                      {packedLiveFillItems.map((it) => (
+                        <Line
+                          key={it.key}
+                          points={it.points}
+                          closed
+                          fill={it.fill}
                           strokeWidth={0}
                           listening={false}
                         />
                       ))}
-                    </Group>
-                    <Group
-                      x={(packedSource?.canvas?.w || 0) / 2 + (packedSource?.canvas?.w || 0) + 40}
-                      y={(packedSource?.canvas?.h || 0) / 2}
-                      offsetX={(packedSource?.canvas?.w || 0) / 2}
-                      offsetY={(packedSource?.canvas?.h || 0) / 2}
-                    >
-                      {packedFillPaths2.map((p, idx) => (
-                        <Path
-                          key={`fill-path-2-${idx}`}
-                          data={p.d}
-                          fill={p.fill}
-                          strokeWidth={0}
-                          listening={false}
-                        />
-                      ))}
-                      {packedBleedPaths2.map((p, idx) => (
-                        <Path
-                          key={`bleed-path-2-${idx}`}
-                          data={p.d}
-                          fill={p.fill}
-                          strokeWidth={0}
-                          listening={false}
-                        />
-                      ))}
-                    </Group>
-                  </>
+                    </>
+                  ) : (
+                    <>
+                      <Group
+                        x={(packedSource?.canvas?.w || 0) / 2}
+                        y={(packedSource?.canvas?.h || 0) / 2}
+                        offsetX={(packedSource?.canvas?.w || 0) / 2}
+                        offsetY={(packedSource?.canvas?.h || 0) / 2}
+                      >
+                        {packedFillPaths.map((p, idx) => (
+                          <Path
+                            key={`fill-path-${idx}`}
+                            data={p.d}
+                            fill={p.fill}
+                            strokeWidth={0}
+                            listening={false}
+                          />
+                        ))}
+                        {enableBleed &&
+                          packedBleedPaths.map((p, idx) => (
+                          <Path
+                            key={`bleed-path-${idx}`}
+                            data={p.d}
+                            fill={p.fill}
+                            strokeWidth={0}
+                            listening={false}
+                          />
+                        ))}
+                      </Group>
+                      <Group
+                        x={(packedSource?.canvas?.w || 0) / 2 + (packedSource?.canvas?.w || 0) + 40}
+                        y={(packedSource?.canvas?.h || 0) / 2}
+                        offsetX={(packedSource?.canvas?.w || 0) / 2}
+                        offsetY={(packedSource?.canvas?.h || 0) / 2}
+                      >
+                        {packedFillPaths2.map((p, idx) => (
+                          <Path
+                            key={`fill-path2-${idx}`}
+                            data={p.d}
+                            fill={p.fill}
+                            strokeWidth={0}
+                            listening={false}
+                          />
+                        ))}
+                        {enableBleed &&
+                          packedBleedPaths2.map((p, idx) => (
+                          <Path
+                            key={`bleed-path2-${idx}`}
+                            data={p.d}
+                            fill={p.fill}
+                            strokeWidth={0}
+                            listening={false}
+                          />
+                        ))}
+                      </Group>
+                    </>
+                  )}
                 </Layer>
                 ) : null}
-                {rightTab === "packed" && packedLabelSnappedAll.length ? (
-                <Layer name="packed-label-snapped">
-                  {packedLabelSnappedAll.map((lbl) => {
+                {rightTab === "packed" && packedIndexItems.length ? (
+                <Layer name="packed-label-snapped" visible={showLabels}>
+                  {packedIndexItems.map((lbl) => {
                     const size = Math.max(labelFontSize / regionScale, 6 / regionScale);
                     const metrics = measureText(lbl.label, size, labelFontFamily);
                     return (
@@ -4162,6 +4691,8 @@ export default function App() {
                           strokeScaleEnabled={false}
                           onClick={() => handlePackedZoneSelect(zid)}
                           onTap={() => handlePackedZoneSelect(zid)}
+                          onMouseDown={(e) => beginPackedEdit(zid, e)}
+                          onTouchStart={(e) => beginPackedEdit(zid, e)}
                         />
                       );
                       });
@@ -4258,8 +4789,8 @@ export default function App() {
               </Stage>
             ) : null}
             {sceneLoading ? <div className="loading-overlay">Loading...</div> : null}
-            {packedBleedError ? <div className="error">{packedBleedError}</div> : null}
-            {packedBleedError2 ? <div className="error">{packedBleedError2}</div> : null}
+            {enableBleed && packedBleedError ? <div className="error">{packedBleedError}</div> : null}
+            {enableBleed && packedBleedError2 ? <div className="error">{packedBleedError2}</div> : null}
           </div>
         </div>
       </div>
@@ -4352,4 +4883,5 @@ export default function App() {
     </div>
   );
 }
+
 
