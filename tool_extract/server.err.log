@@ -2,11 +2,18 @@ WARNING: This is a development server. Do not use it in a production deployment.
  * Running on http://127.0.0.1:5000
 Press CTRL+C to quit
  * Restarting with stat
-Traceback (most recent call last):
-  File "D:\Dropbox\_Documents\_Vlance_2026\rtoy\tool_extract\new_toy.py", line 16, in <module>
-    from scripts.packing import (
-  File "D:\Dropbox\_Documents\_Vlance_2026\rtoy\tool_extract\scripts\packing.py", line 15, in <module>
-    from rectpack import newPacker
-ModuleNotFoundError: No module named 'rectpack'
  * Debugger is active!
- * Debugger PIN: 177-859-190
+ * Debugger PIN: 717-454-250
+127.0.0.1 - - [06/Mar/2026 10:40:33] "POST /api/export_pdf HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:47:04] "GET /api/state HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:47:04] "GET /out/convoi.svg HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:47:05] "GET /api/scene?snap=1&pack_padding=5&pack_margin_x=30&pack_margin_y=30&pack_bleed=3&draw_scale=0.5&pack_grid=10&pack_angle=15&pack_mode=fast&force_compute=0 HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:47:05] "GET /api/source_zone_click HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:47:06] "GET /api/packed_labels HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:48:45] "POST /api/pack_from_scene HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:48:54] "POST /api/export_pdf HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:48:54] "POST /api/save_html HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:51:26] "GET /api/download_pdf?name=convoi_konva.pdf HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:52:13] "POST /api/export_pdf HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:52:13] "POST /api/save_html HTTP/1.1" 200 -
+127.0.0.1 - - [06/Mar/2026 10:52:22] "GET /api/download_pdf?name=convoi_konva.pdf HTTP/1.1" 200 -

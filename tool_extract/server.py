@@ -323,36 +323,68 @@ def api_pack_from_scene():
     # TS-like queue: place large first, then let small pieces fill holes.
     queue = large_ids + small_asc
 
-    # TS-like page loop: try to insert in current page, carry unplaced to next page.
-    for page_idx in range(2):
-        if not queue:
-            break
-        pp, o, rr = packing.pack_regions_raster_fast(
-            zone_pack_polys,
-            (w, h),
-            fixed_centers=zone_pack_centers,
-            grid_step=grid_for_raster,
-            rotations=rotations_5,
-            search_stride=search_stride,
-            safety_padding=safety_for_raster,
-            place_ids=queue,
-        )
-        pp = packing._fit_placements_into_canvas(pp, rr, (w, h))
-        placed_now: set[int] = set()
-        # preserve queue order when committing placements for deterministic behavior
-        for idx in queue:
-            if idx >= len(pp) or idx >= len(rr):
+    # One-page TS-like queue pass.
+    pp, _o, rr = packing.pack_regions_raster_fast(
+        zone_pack_polys,
+        (w, h),
+        fixed_centers=zone_pack_centers,
+        grid_step=grid_for_raster,
+        rotations=rotations_5,
+        search_stride=search_stride,
+        safety_padding=safety_for_raster,
+        place_ids=queue,
+    )
+    placed_now: set[int] = set()
+    for idx in queue:
+        if idx >= len(pp) or idx >= len(rr):
+            continue
+        dx, dy, bw, bh, rf = pp[idx]
+        if bw <= 0 or bh <= 0:
+            continue
+        placements[idx] = (dx, dy, bw, bh, rf)
+        ri = dict(rr[idx])
+        ri["bin"] = 0
+        rot_info[idx] = ri
+        placed_now.add(idx)
+    queue = [idx for idx in queue if idx not in placed_now]
+    _mark("pack_page1")
+
+    # Center packed bbox in canvas for cleaner margins.
+    placed_ids = [i for i in range(n) if placements[i][2] > 0 and placements[i][3] > 0]
+    if placed_ids:
+        minx = miny = float("inf")
+        maxx = maxy = float("-inf")
+        for rid in placed_ids:
+            pts = zone_pack_polys[rid]
+            if not pts:
                 continue
-            dx, dy, bw, bh, rf = pp[idx]
-            if bw <= 0 or bh <= 0:
-                continue
-            placements[idx] = (dx, dy, bw, bh, rf)
-            ri = dict(rr[idx])
-            ri["bin"] = page_idx
-            rot_info[idx] = ri
-            placed_now.add(idx)
-        queue = [idx for idx in queue if idx not in placed_now]
-        _mark(f"pack_page{page_idx+1}")
+            info = rot_info[rid]
+            dx, dy, _, _, _ = placements[rid]
+            ang = float(info.get("angle", 0.0))
+            cx = float(info.get("cx", 0.0))
+            cy = float(info.get("cy", 0.0))
+            for p in packing._rotate_pts(pts, ang, cx, cy):
+                x = float(p[0]) + float(dx)
+                y = float(p[1]) + float(dy)
+                minx = min(minx, x)
+                miny = min(miny, y)
+                maxx = max(maxx, x)
+                maxy = max(maxy, y)
+        if minx < maxx and miny < maxy and math.isfinite(minx) and math.isfinite(maxx):
+            cx_box = 0.5 * (minx + maxx)
+            cy_box = 0.5 * (miny + maxy)
+            shift_x = (float(w) * 0.5) - cx_box
+            shift_y = (float(h) * 0.5) - cy_box
+            for rid in placed_ids:
+                dx, dy, bw, bh, rf = placements[rid]
+                placements[rid] = (float(dx) + shift_x, float(dy) + shift_y, bw, bh, rf)
+    _mark("center_bbox")
+
+    unplaced_count = len(queue)
+    if unplaced_count > 0:
+        print(f"[pack_from_scene] WARNING: one page overflow, unplaced={unplaced_count}")
+    else:
+        print("[pack_from_scene] One page OK")
 
     raster_report = packing.raster_overlap_report(
         zone_pack_polys, placements, rot_info, (w, h), cell=raster_cell
@@ -361,9 +393,11 @@ def api_pack_from_scene():
 
     tmp_payload = {
         "canvas": {"w": w, "h": h},
-        "pages": 2,
+        "pages": 1,
         "raster_scale_factor": raster_scale_factor,
         "strict_gap": pack_gap,
+        "one_page_ok": unplaced_count == 0,
+        "unplaced_count": unplaced_count,
         "timings_ms": timings_ms,
         "raster_check": raster_report,
         "placements": [[float(a), float(b), int(c), int(d), bool(e)] for (a, b, c, d, e) in placements],
@@ -378,8 +412,7 @@ def api_pack_from_scene():
         pass
     _mark("write_tmp_json")
     try:
-        gap = 40
-        img = Image.new("RGB", (max(1, int(w * 2 + gap)), max(1, int(h))), (6, 14, 46))
+        img = Image.new("RGB", (max(1, int(w)), max(1, int(h))), (6, 14, 46))
         draw = ImageDraw.Draw(img, "RGBA")
         overlap_ids = set()
         for pair in raster_report.get("pairs", []) or []:
@@ -396,7 +429,7 @@ def api_pack_from_scene():
                 continue
             info = rot_info[rid]
             bin_idx = int(info.get("bin", 0))
-            if bin_idx not in (0, 1):
+            if bin_idx != 0:
                 continue
             try:
                 ang = float(info.get("angle", 0.0))
@@ -406,8 +439,7 @@ def api_pack_from_scene():
                 continue
             tpts = []
             for p in packing._rotate_pts(pts, ang, cx, cy):
-                x_off = float(w + gap) if bin_idx == 1 else 0.0
-                x = float(p[0]) + float(dx) + x_off
+                x = float(p[0]) + float(dx)
                 y = float(p[1]) + float(dy)
                 if not (math.isfinite(x) and math.isfinite(y)):
                     tpts = []
@@ -464,7 +496,9 @@ def api_pack_from_scene():
                 "raster_tmp_png_url": "/out/tmp_raster_pack.png",
                 "raster_tmp_json_path": str(RASTER_PACK_TMP_JSON),
                 "raster_overlap_count": int(raster_report.get("count", 0)),
-                "raster_pages": 2,
+                "raster_pages": 1,
+                "one_page_ok": unplaced_count == 0,
+                "unplaced_count": unplaced_count,
                 "timings_ms": timings_ms,
             }
         )
@@ -489,28 +523,12 @@ def api_pack_from_scene():
         include_bleed=PACKED_INCLUDE_BLEED,
     )
     _mark("write_svg_page1")
-    packing.write_pack_svg(
-        polys,
-        zone_id,
-        zone_order,
-        zone_polys,
-        placements,
-        (w, h),
-        colors,
-        rot_info,
-        placement_bin=placement_bin,
-        placement_bin_by_zid=placement_bin_by_zid,
-        page_idx=1,
-        out_path=PACKED_ZONE_SCENE_SVG_PAGE2,
-        include_bleed=PACKED_INCLUDE_BLEED,
-    )
-    _mark("write_svg_page2")
     timings_ms["total"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
     print(f"[pack_from_scene] timings_ms={timings_ms}")
     result = {
         "ok": True,
         "packed_svg": PACKED_ZONE_SCENE_SVG.read_text(encoding="utf-8"),
-        "packed_svg_page2": PACKED_ZONE_SCENE_SVG_PAGE2.read_text(encoding="utf-8"),
+        "packed_svg_page2": "",
         "zone_shift": zone_shift,
         "zone_rot": zone_rot,
         "zone_center": zone_center,
@@ -520,7 +538,9 @@ def api_pack_from_scene():
         "raster_tmp_png_url": "/out/tmp_raster_pack.png",
         "raster_tmp_json_path": str(RASTER_PACK_TMP_JSON),
         "raster_overlap_count": int(raster_report.get("count", 0)),
-        "raster_pages": 2,
+        "raster_pages": 1,
+        "one_page_ok": unplaced_count == 0,
+        "unplaced_count": unplaced_count,
         "timings_ms": timings_ms,
     }
     return jsonify(result)
@@ -942,11 +962,11 @@ def api_export_pdf():
         from reportlab.pdfgen import canvas as pdf_canvas
         from reportlab.graphics import renderPDF
         from svglib.svglib import svg2rlg
-    except Exception:
+    except Exception as e:
         return jsonify(
             {
                 "ok": False,
-                "error": "Missing reportlab/svglib. Install: pip install reportlab svglib",
+                "error": f"Missing reportlab/svglib: {repr(e)}",
             }
         ), 500
 

@@ -890,6 +890,8 @@ export default function App() {
   const [enableBleed, setEnableBleed] = useState(true);
   const [showRasterTemp, setShowRasterTemp] = useState(false);
   const [rasterTempSrc, setRasterTempSrc] = useState("");
+  const [computeBusy, setComputeBusy] = useState(false);
+  const [rasterBusy, setRasterBusy] = useState(false);
   const [drawScale, setDrawScale] = useState(0.5);
   const [packGrid, setPackGrid] = useState(10);
   const [packAngle, setPackAngle] = useState(15);
@@ -902,6 +904,7 @@ export default function App() {
   const [zoneClickLogs, setZoneClickLogs] = useState([]);
   const [packedEditMode, setPackedEditMode] = useState("none"); // none | move | rotate
   const [manualPackedEdits, setManualPackedEdits] = useState({});
+  const [packUiLog, setPackUiLog] = useState("");
   const packedEditSessionRef = useRef(null);
   const manualPackedSaveTimerRef = useRef(null);
 
@@ -2398,80 +2401,20 @@ export default function App() {
   }, [packedEmptyCellsDerived, packedSource]);
 
   const packedLabelSnappedAll = useMemo(() => {
-    if (!packedSource?.zone_boundaries) return [];
-    const out = [];
-    const used = new Set();
-    const cellSize = 6;
-    const cellIndex = (x, y) => {
-      const gx = Math.round(x / cellSize);
-      const gy = Math.round(y / cellSize);
-      return { gx, gy };
-    };
-    const blockCell = (gx, gy) => {
-      for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          used.add(`${gx + dx}:${gy + dy}`);
-        }
-      }
-    };
-    Object.entries(packedSource.zone_boundaries || {}).forEach(([zid, paths]) => {
-      if (!paths || !paths.length) return;
-      const shift =
-        packedSource.zone_shift?.[zid] ?? packedSource.zone_shift?.[parseInt(zid, 10)];
-      const rot =
-        packedSource.zone_rot?.[zid] ?? packedSource.zone_rot?.[parseInt(zid, 10)] ?? 0;
-      const center =
-        packedSource.zone_center?.[zid] ??
-        packedSource.zone_center?.[parseInt(zid, 10)] ??
-        [0, 0];
-      let best = null;
-      (paths || []).forEach((p) => {
-        const tpts = transformPath(p, shift, rot, center);
-        if (!tpts || tpts.length < 3) return;
-        const { area, cx, cy } = polyAreaAndCentroid(tpts);
-        const absArea = Math.abs(area);
-        if (!best || absArea > best.absArea) best = { absArea, cx, cy };
-      });
-      if (!best) return;
-      const bin =
-        packedSource?.placement_bin?.[zid] ??
-        packedSource?.placement_bin?.[parseInt(zid, 10)];
-      const page = bin === 1 ? 1 : 0;
-      const pageOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
-      const anchorX = best.cx + pageOffset;
-      const anchorY = best.cy;
-      const cells = packedCellsByBin[page] || [];
-      let bestCell = null;
-      let bestD = Infinity;
-      for (const cell of cells) {
-        const dx0 = cell[0] - anchorX;
-        const dy0 = cell[1] - anchorY;
-        const d = dx0 * dx0 + dy0 * dy0;
-        const { gx, gy } = cellIndex(cell[0], cell[1]);
-        if (used.has(`${gx}:${gy}`)) continue;
-        if (d < bestD) {
-          bestD = d;
-          bestCell = cell;
-        }
-      }
-      const x = bestCell ? bestCell[0] : anchorX;
-      const y = bestCell ? bestCell[1] : anchorY;
-      if (bestCell) {
-        const { gx, gy } = cellIndex(bestCell[0], bestCell[1]);
-        blockCell(gx, gy);
-      }
-      const label = getZoneAlias(zid, packedSource);
-      out.push({ zid, label, x, y, page });
-    });
-    return out;
-  }, [packedCellsByBin, packedSource]);
+    // Keep render deterministic: no extra snapping/adjustment after raster->vector conversion.
+    return [];
+  }, [packedSource]);
 
   const packedIndexItems = useMemo(() => {
     if (!packedSource) return [];
-    if (packedLabelSnappedAll.length) return packedLabelSnappedAll;
     const out = [];
+    const occupied = [];
+    const intersects = (a, b) =>
+      !(a.x + a.w < b.x || b.x + b.w < a.x || a.y + a.h < b.y || b.y + b.h < a.y);
+    const pageW = packedSource?.canvas?.w || 0;
+    const pageH = packedSource?.canvas?.h || 0;
     Object.entries(packedSource.zone_labels || {}).forEach(([zid, lbl]) => {
-      if (!lbl || !Number.isFinite(lbl.x) || !Number.isFinite(lbl.y)) return;
+      if (!lbl) return;
       const shift =
         packedSource.zone_shift?.[zid] ?? packedSource.zone_shift?.[parseInt(zid, 10)];
       if (!shift) return;
@@ -2483,24 +2426,87 @@ export default function App() {
         packedSource.zone_center?.[zid] ??
         packedSource.zone_center?.[parseInt(zid, 10)] ??
         [0, 0];
-      const [pt] = transformPath([[lbl.x, lbl.y]], shift, rot, center);
-      if (!pt) return;
+      const paths =
+        packedSource.zone_boundaries?.[zid] ??
+        packedSource.zone_boundaries?.[parseInt(zid, 10)] ??
+        [];
+      if (!paths?.length) return;
       const bin =
         packedSource?.placement_bin?.[zid] ??
         packedSource?.placement_bin?.[parseInt(zid, 10)];
       const page = bin === 1 ? 1 : 0;
       const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
+      const label = `${getZoneAlias(zid, packedSource)}`;
+      const size = Math.max(labelFontSize / Math.max(regionScale, 0.0001), 6 / Math.max(regionScale, 0.0001));
+      const metrics = measureText(label, size, labelFontFamily);
+      const halfW = metrics.width / 2;
+      const halfH = metrics.height / 2;
+
+      let bestPath = null;
+      let bestAbsArea = -1;
+      (paths || []).forEach((p) => {
+        const tpts = transformPath(p, shift, rot, center);
+        if (!tpts || tpts.length < 3) return;
+        const { area } = polyAreaAndCentroid(tpts);
+        const aa = Math.abs(area || 0);
+        if (aa > bestAbsArea) {
+          bestAbsArea = aa;
+          bestPath = tpts;
+        }
+      });
+      if (!bestPath || bestPath.length < 2) return;
+
+      const { area: polyArea } = polyAreaAndCentroid(bestPath);
+      const candidates = [];
+      for (let i = 0; i < bestPath.length; i++) {
+        const p0 = bestPath[i];
+        const p1 = bestPath[(i + 1) % bestPath.length];
+        const vx = p1[0] - p0[0];
+        const vy = p1[1] - p0[1];
+        const len = Math.hypot(vx, vy);
+        if (len < 1e-6) continue;
+        const nx = polyArea >= 0 ? vy / len : -vy / len;
+        const ny = polyArea >= 0 ? -vx / len : vx / len;
+        const tx = vx / len;
+        const ty = vy / len;
+        const mx = 0.5 * (p0[0] + p1[0]);
+        const my = 0.5 * (p0[1] + p1[1]);
+        for (const d of [7, 11, 15]) {
+          for (const s of [0, 6, -6, 12, -12]) {
+            candidates.push({ x: mx + tx * s + nx * d + xOffset, y: my + ty * s + ny * d, edgeLen: len });
+          }
+        }
+      }
+      candidates.sort((a, b) => b.edgeLen - a.edgeLen);
+
+      let chosen = null;
+      for (const c of candidates) {
+        if (c.x - halfW < 0 || c.x + halfW > pageW + (page === 1 ? pageW + 40 : 0)) continue;
+        if (c.y - halfH < 0 || c.y + halfH > pageH) continue;
+        const box = { x: c.x - halfW, y: c.y - halfH, w: metrics.width, h: metrics.height };
+        if (occupied.some((b) => intersects(box, b))) continue;
+        chosen = c;
+        occupied.push(box);
+        break;
+      }
+      if (!chosen) {
+        const [pt] = transformPath([[lbl.x, lbl.y]], shift, rot, center);
+        if (!pt) return;
+        chosen = { x: pt[0] + xOffset, y: pt[1] };
+      }
       out.push({
         zid: String(zid),
-        label: `${getZoneAlias(zid, packedSource)}`,
-        x: pt[0] + xOffset,
-        y: pt[1],
+        label,
+        x: chosen.x,
+        y: chosen.y,
       });
     });
     return out;
-  }, [packedSource, packedLabelSnappedAll]);
+  }, [packedSource, packedLabelSnappedAll, labelFontFamily, labelFontSize, regionScale]);
 
   const packedLowAreaWarnings = useMemo(() => {
+    // Disable warning markers while validating raster->vector flow.
+    return [];
     if (!packedSource?.zone_boundaries) return [];
     const zoneCandidates = [];
     Object.entries(packedSource.zone_boundaries || {}).forEach(([zid, paths]) => {
@@ -2706,6 +2712,10 @@ export default function App() {
         setPackedFillPaths2(parsed2.fillPaths);
         setPackedBleedPaths2(parsed2.bleedPaths);
         setPackedBleedError2(parsed2.hasBleed ? "" : "packed_page2.svg missing bleed layer");
+      } else {
+        setPackedFillPaths2([]);
+        setPackedBleedPaths2([]);
+        setPackedBleedError2("");
       }
       if (data?.zone_shift || data?.zone_rot || data?.zone_center || data?.placement_bin) {
         setZoneScene((prev) =>
@@ -2720,8 +2730,23 @@ export default function App() {
             : prev
         );
       }
+      const tTotal = data?.timings_ms?.total;
+      if (data?.one_page_ok === true) {
+        setPackUiLog(
+          `Pack: One page OK${Number.isFinite(tTotal) ? ` (${Math.round(tTotal)} ms)` : ""}`
+        );
+      } else if (Number.isFinite(data?.unplaced_count) && data.unplaced_count > 0) {
+        setPackUiLog(
+          `Pack: WARNING overflow, unplaced=${data.unplaced_count}${
+            Number.isFinite(tTotal) ? ` (${Math.round(tTotal)} ms)` : ""
+          }`
+        );
+      } else if (Number.isFinite(tTotal)) {
+        setPackUiLog(`Pack: ${Math.round(tTotal)} ms`);
+      }
     } catch (err) {
       setPackedBleedError(err.message || String(err));
+      setPackUiLog(`Pack: failed (${err.message || String(err)})`);
     }
   };
 
@@ -2744,8 +2769,28 @@ export default function App() {
   const computePackedFromCurrentZone = async () => {
     const source = zoneScene || scene;
     if (!source?.regions || !source?.zone_id || !source?.canvas) return;
+    if (computeBusy) return;
     try {
       setError("");
+      setComputeBusy(true);
+      setSceneLoading(true);
+      setShowRasterTemp(false);
+      await refreshPackedFromZoneScene(source, enableBleed);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setSceneLoading(false);
+      setComputeBusy(false);
+    }
+  };
+
+  const showTempRasterFromCurrentZone = async () => {
+    const source = zoneScene || scene;
+    if (!source?.regions || !source?.zone_id || !source?.canvas) return;
+    if (rasterBusy) return;
+    try {
+      setError("");
+      setRasterBusy(true);
       const res = await fetch("/api/pack_from_scene", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2772,6 +2817,8 @@ export default function App() {
       setShowRasterTemp(true);
     } catch (err) {
       setError(err.message || String(err));
+    } finally {
+      setRasterBusy(false);
     }
   };
 
@@ -2895,6 +2942,7 @@ export default function App() {
           ? ` empty=${(scene.debug.zones_empty || []).length} hull=${(scene.debug.zones_convex_hull || []).length} avg_area=${zoneAreaStats.avg.toFixed(2)}`
           : " n/a"}
       </div>
+      {packUiLog ? <div className="zone-count">{packUiLog}</div> : null}
       {zoneClickLogs.slice(-4).map((line, idx) => (
         <div className="zone-count" key={`zlog-${idx}`}>
           {line}
@@ -4115,8 +4163,16 @@ export default function App() {
                 <button
                   className="btn"
                   onClick={() => computePackedFromCurrentZone()}
+                  disabled={computeBusy}
                   >
-                  Compute
+                  {computeBusy ? "Computing..." : "Compute"}
+                </button>
+                <button
+                  className="btn"
+                  onClick={() => showTempRasterFromCurrentZone()}
+                  disabled={rasterBusy}
+                >
+                  {rasterBusy ? "Loading Raster..." : "Temp Raster"}
                 </button>
                 <button
                   className="icon-button"
