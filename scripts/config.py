@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 
 SVG_PATH = Path("convoi.svg")
@@ -52,7 +53,7 @@ EDGE_EPS = 0.0
 MIDPOINT_EPS = 0.2
 LINE_EXTEND = float(os.getenv("LINE_EXTEND", "0"))
 INTERSECT_SNAP = float(os.getenv("INTERSECT_SNAP", "0.1"))
-PADDING = 0
+PADDING = 5
 PACK_MARGIN_X = 0
 PACK_MARGIN_Y = 0
 PACK_GRID_STEP = 1
@@ -62,29 +63,56 @@ USE_ZONE_CACHE = False
 LABEL_FONT_SCALE = 0.64
 LABEL_OFFSET = 10.0
 PACK_LABEL_SCALE = 2.4
-PACK_BLEED = 3.5
+PACK_BLEED = 3
+
+
+def _safe_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except Exception:
+        return default
+    return val if math.isfinite(val) else default
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except Exception:
+        return default
+    if not math.isfinite(val):
+        return default
+    try:
+        return int(val)
+    except Exception:
+        return default
 
 
 def _apply_pack_env() -> None:
     global DRAW_SCALE, PADDING, PACK_MARGIN_X, PACK_MARGIN_Y, PACK_BLEED, PACK_GRID_STEP, PACK_ANGLE_STEP, PACK_MODE
     global SMALL_ZONE_AREA, SMALL_ZONE_BBOX
     if "DRAW_SCALE" in os.environ:
-        DRAW_SCALE = float(os.environ["DRAW_SCALE"])
+        DRAW_SCALE = _safe_float_env("DRAW_SCALE", DRAW_SCALE)
     if "PACK_PADDING" in os.environ:
-        PADDING = float(os.environ["PACK_PADDING"])
+        PADDING = _safe_float_env("PACK_PADDING", PADDING)
     if "PACK_MARGIN_X" in os.environ:
-        PACK_MARGIN_X = int(float(os.environ["PACK_MARGIN_X"]))
+        PACK_MARGIN_X = _safe_int_env("PACK_MARGIN_X", PACK_MARGIN_X)
     if "PACK_MARGIN_Y" in os.environ:
-        PACK_MARGIN_Y = int(float(os.environ["PACK_MARGIN_Y"]))
+        PACK_MARGIN_Y = _safe_int_env("PACK_MARGIN_Y", PACK_MARGIN_Y)
     if "PACK_BLEED" in os.environ:
-        PACK_BLEED = int(float(os.environ["PACK_BLEED"]))
+        PACK_BLEED = _safe_int_env("PACK_BLEED", PACK_BLEED)
     if "PACK_GRID_STEP" in os.environ:
-        PACK_GRID_STEP = float(os.environ["PACK_GRID_STEP"])
+        PACK_GRID_STEP = _safe_float_env("PACK_GRID_STEP", PACK_GRID_STEP)
     if "PACK_ANGLE_STEP" in os.environ:
-        PACK_ANGLE_STEP = float(os.environ["PACK_ANGLE_STEP"])
+        PACK_ANGLE_STEP = _safe_float_env("PACK_ANGLE_STEP", PACK_ANGLE_STEP)
     if "PACK_MODE" in os.environ:
         PACK_MODE = str(os.environ["PACK_MODE"]).strip().lower()
     if "SMALL_ZONE_AREA" in os.environ:
-        SMALL_ZONE_AREA = float(os.environ["SMALL_ZONE_AREA"])
+        SMALL_ZONE_AREA = _safe_float_env("SMALL_ZONE_AREA", SMALL_ZONE_AREA)
     if "SMALL_ZONE_BBOX" in os.environ:
-        SMALL_ZONE_BBOX = float(os.environ["SMALL_ZONE_BBOX"])
+        SMALL_ZONE_BBOX = _safe_float_env("SMALL_ZONE_BBOX", SMALL_ZONE_BBOX)

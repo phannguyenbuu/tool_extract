@@ -46,25 +46,33 @@ def _parse_points(points_str: str) -> List[Tuple[float, float]]:
 
 
 def _iter_geometry(root: ET.Element) -> Iterable[Tuple[str, List[Tuple[float, float]]]]:
-    for el in root.iter():
-        tag = el.tag.rsplit("}", 1)[-1]
-        if tag == "polyline":
-            pts = _parse_points(el.attrib.get("points", ""))
-            if len(pts) >= 2:
-                yield ("polyline", pts)
-        elif tag == "polygon":
-            pts = _parse_points(el.attrib.get("points", ""))
-            if len(pts) >= 3:
-                yield ("polygon", pts)
-        elif tag == "line":
-            try:
-                x1 = float(el.attrib.get("x1", "0"))
-                y1 = float(el.attrib.get("y1", "0"))
-                x2 = float(el.attrib.get("x2", "0"))
-                y2 = float(el.attrib.get("y2", "0"))
-                yield ("polyline", [(x1, y1), (x2, y2)])
-            except ValueError:
-                continue
+    skip_tags = {"defs", "clippath"}
+
+    def walk(el: ET.Element, skipped: bool = False) -> Iterable[Tuple[str, List[Tuple[float, float]]]]:
+        tag = el.tag.rsplit("}", 1)[-1].lower()
+        current_skipped = skipped or tag in skip_tags
+        if not current_skipped:
+            if tag == "polyline":
+                pts = _parse_points(el.attrib.get("points", ""))
+                if len(pts) >= 2:
+                    yield ("polyline", pts)
+            elif tag == "polygon":
+                pts = _parse_points(el.attrib.get("points", ""))
+                if len(pts) >= 3:
+                    yield ("polygon", pts)
+            elif tag == "line":
+                try:
+                    x1 = float(el.attrib.get("x1", "0"))
+                    y1 = float(el.attrib.get("y1", "0"))
+                    x2 = float(el.attrib.get("x2", "0"))
+                    y2 = float(el.attrib.get("y2", "0"))
+                    yield ("polyline", [(x1, y1), (x2, y2)])
+                except ValueError:
+                    return
+        for child in list(el):
+            yield from walk(child, current_skipped)
+
+    yield from walk(root, False)
 
 
 def _get_canvas_size(root: ET.Element, scale: float) -> Tuple[int, int]:
@@ -175,7 +183,12 @@ def _find_embedded_image(root: ET.Element) -> Tuple[Path, np.ndarray, Tuple[floa
 
 def _read_image_any(path: Path) -> np.ndarray:
     with Image.open(path) as im:
-        im = im.convert("RGB")
+        if im.mode in {"RGBA", "LA"} or (im.mode == "P" and "transparency" in im.info):
+            rgba = im.convert("RGBA")
+            bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            im = Image.alpha_composite(bg, rgba).convert("RGB")
+        else:
+            im = im.convert("RGB")
         arr = np.array(im)
         return arr[:, :, ::-1].copy()
 

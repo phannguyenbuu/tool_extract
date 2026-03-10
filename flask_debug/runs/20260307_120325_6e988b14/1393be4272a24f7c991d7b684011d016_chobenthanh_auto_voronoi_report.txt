@@ -1,0 +1,26 @@
+SVG Auto Voronoi Map Report
+Input SVG: D:\Dropbox\_Documents\_Vlance_2026\rtoy\tool_extract\flask_debug\uploads\1393be4272a24f7c991d7b684011d016_chobenthanh.svg
+
+Polygon count: 72
+Average area: 0.037909
+Min area: 0.007798
+Max area: 0.097759
+Std area: 0.017478
+Outlier count: 29
+Snap vertex count: 458
+
+Meta:
+- params: {'target_count': 110, 'min_count': 100, 'max_count': 120, 'iterations': 40, 'snap_k': 5, 'small_threshold': 0.75, 'large_threshold': 1.25}
+- voronoi_score: 15004.676847284989
+- seed_count: 110
+- before_stats: {'count': 72, 'average': 0.03826359943197106, 'minimum': 0.017481314329965286, 'maximum': 0.11872245723832318, 'std_area': 0.019844332762165007, 'outlier_count': 40, 'too_small_count': 26, 'too_large_count': 14}
+- after_stats: {'count': 72, 'average': 0.03826359943197106, 'minimum': 0.017481314329965286, 'maximum': 0.11872245723832318, 'std_area': 0.019844332762165007, 'outlier_count': 40, 'too_small_count': 26, 'too_large_count': 14}
+- snap_vertex_count: 458
+- snapped_vertex_count: 15
+- mean_snap_distance: 0.49016226405274094
+- max_snap_distance: 4.846648326421058
+- stats: {'count': 72, 'average': 0.03790887904388708, 'minimum': 0.007798021201304156, 'maximum': 0.09775906529959465, 'std_area': 0.01747770021022653, 'outlier_count': 29, 'too_small_count': 15, 'too_large_count': 14}
+- score: 730.5662531457515
+- improved_polygons: 15
+- boundary_area: 5.130000000000022
+- boundary_bounds: [358.8, 422.5, 369.0, 424.3]

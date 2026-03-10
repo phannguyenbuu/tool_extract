@@ -20,6 +20,7 @@ Local toolchain for parsing an input SVG, building regions/zones, packing them, 
 Python packages used (install into a venv):
 - `flask`
 - `numpy`
+- `scipy`
 - `opencv-python`
 - `shapely`
 - `rectpack`
@@ -30,7 +31,7 @@ Python packages used (install into a venv):
 1. Create and activate a venv.
 2. Install Python deps:
    ```bash
-   python -m pip install flask numpy opencv-python shapely rectpack pillow
+   python -m pip install flask numpy scipy opencv-python shapely rectpack pillow
    python -m pip install reportlab svglib  # optional, for PDF export
    ```
 3. Install frontend deps:
@@ -39,18 +40,17 @@ Python packages used (install into a venv):
    npm install
    ```
 
-## Run (recommended dev flow)
-1. Start the backend API:
+## Run (recommended)
+1. Build the frontend:
+   ```bash
+   cd frontend
+   npm run build
+   ```
+2. Start the backend API:
    ```bash
    python server.py
    ```
-   The API listens on `http://127.0.0.1:5000`.
-2. Start the frontend dev server:
-   ```bash
-   cd frontend
-   npm run dev
-   ```
-   Vite runs on `http://127.0.0.1:5173` and proxies `/api` + `/out` to Flask.
+   The app is served from `http://127.0.0.1:5000`.
 
 ## Run (single-server build)
 1. Build the frontend:
@@ -62,7 +62,15 @@ Python packages used (install into a venv):
    ```bash
    python server.py
    ```
-   Flask will serve `frontend/dist`.
+   Flask will serve `frontend/dist` on `http://127.0.0.1:5000`.
+
+## Optional frontend-only dev server
+If you explicitly want Vite HMR during frontend work:
+```bash
+cd frontend
+npm run dev
+```
+That dev server uses Vite's default port and proxies `/api` + `/out` to Flask on `127.0.0.1:5000`.
 
 ## Legacy upload tool
 This repo also includes a simple upload flow (JSON + image) for polygonize + offset:

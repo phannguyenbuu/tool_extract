@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
@@ -305,6 +306,35 @@ def _iter_geoms(geom) -> Iterable:
     return [geom]
 
 
+def _is_near_canvas_rect(
+    pts: List[Tuple[float, float]],
+    canvas: Tuple[int, int],
+    margin: float = 2.0,
+    min_area_ratio: float = 0.9,
+) -> bool:
+    if len(pts) != 4:
+        return False
+    poly = Polygon(pts)
+    if poly.is_empty or poly.area <= 0:
+        return False
+    w, h = float(canvas[0]), float(canvas[1])
+    canvas_area = max(w * h, 1.0)
+    if poly.area < canvas_area * min_area_ratio:
+        return False
+    minx, miny, maxx, maxy = poly.bounds
+    if abs(minx - 0.0) > margin:
+        return False
+    if abs(miny - 0.0) > margin:
+        return False
+    if abs(maxx - w) > margin:
+        return False
+    if abs(maxy - h) > margin:
+        return False
+    xs = sorted({round(float(x), 3) for x, _ in pts})
+    ys = sorted({round(float(y), 3) for _, y in pts})
+    return len(xs) <= 2 and len(ys) <= 2
+
+
 def build_regions_from_svg(
     svg_path: Path, snap_override: float | None = None
 ) -> Tuple[List[RegionInfo], List[List[Tuple[float, float]]], Tuple[int, int], Dict[str, float]]:
@@ -367,6 +397,17 @@ def build_regions_from_svg(
                     coords = coords[:-1]
                 if len(coords) >= 3:
                     raw_poly_pts.append([(float(x), float(y)) for x, y in coords])
+
+    filtered_raw_poly_pts: List[List[Tuple[float, float]]] = []
+    removed_canvas_rect = 0
+    for pts in raw_poly_pts:
+        if _is_near_canvas_rect(pts, canvas):
+            removed_canvas_rect += 1
+            continue
+        filtered_raw_poly_pts.append(pts)
+    raw_poly_pts = filtered_raw_poly_pts
+    debug["polygons_removed_canvas_rect"] = float(removed_canvas_rect)
+    debug["polygons_raw"] = float(len(raw_poly_pts) + removed_canvas_rect)
 
     polys: List[List[Tuple[float, float]]] = []
     tri_out_pts: List[List[Tuple[float, float]]] = []
@@ -459,12 +500,21 @@ def write_png(polys: List[List[Tuple[float, float]]], regions: List[RegionInfo],
 
 def compute_region_colors(polys: List[List[Tuple[float, float]]], canvas: Tuple[int, int]) -> Tuple[List[Tuple[int, int, int]], np.ndarray]:
     root = ET.parse(config.SVG_PATH).getroot()
-    img_path, _, _ = svg_utils._find_embedded_image(root)
+    img_path, img_transform, img_display_size = svg_utils._find_embedded_image(root)
     img = svg_utils._read_image_any(img_path)
-    w, h = canvas
-    w_px = int(w * config.DRAW_SCALE)
-    h_px = int(h * config.DRAW_SCALE)
-    resized = cv2.resize(img, (w_px, h_px), interpolation=cv2.INTER_AREA)
+    img_h, img_w = img.shape[:2]
+    display_w = float(img_display_size[0]) if img_display_size and img_display_size[0] else 0.0
+    display_h = float(img_display_size[1]) if img_display_size and img_display_size[1] else 0.0
+    use_direct_image_space = display_w > 1e-6 and display_h > 1e-6
+
+    if use_direct_image_space:
+        scale_x = float(img_w) / display_w
+        scale_y = float(img_h) / display_h
+    else:
+        w, h = canvas
+        w_px = max(1, int(w * config.DRAW_SCALE))
+        h_px = max(1, int(h * config.DRAW_SCALE))
+        resized = cv2.resize(img, (w_px, h_px), interpolation=cv2.INTER_AREA)
 
     colors: List[Tuple[int, int, int]] = []
     for pts in polys:
@@ -472,18 +522,106 @@ def compute_region_colors(polys: List[List[Tuple[float, float]]], canvas: Tuple[
         if poly.is_empty:
             colors.append(config.WHITE_FALLBACK)
             continue
-        cx, cy = poly.centroid.x, poly.centroid.y
-        ix_int = int(round(cx * config.DRAW_SCALE))
-        iy_int = int(round(cy * config.DRAW_SCALE))
-        if 0 <= ix_int < w_px and 0 <= iy_int < h_px:
-            b, g, r = resized[iy_int, ix_int]
-            color = (int(b), int(g), int(r))
+        if use_direct_image_space:
+            mapped_pts = [
+                svg_utils._invert_transform_point(float(p[0]), float(p[1]), img_transform)
+                for p in pts
+            ]
+            pts_scaled = np.array(
+                [
+                    [
+                        mapped[0] * scale_x,
+                        mapped[1] * scale_y,
+                    ]
+                    for mapped in mapped_pts
+                ],
+                dtype=np.float32,
+            )
+            sample_img = img
+            sample_w = img_w
+            sample_h = img_h
+            rep = poly.representative_point()
+            rep_local = svg_utils._invert_transform_point(float(rep.x), float(rep.y), img_transform)
+            rep_px = (rep_local[0] * scale_x, rep_local[1] * scale_y)
         else:
+            pts_scaled = np.array(
+                [[p[0] * config.DRAW_SCALE, p[1] * config.DRAW_SCALE] for p in pts],
+                dtype=np.float32,
+            )
+            sample_img = resized
+            sample_w = w_px
+            sample_h = h_px
+            rep = poly.representative_point()
+            rep_px = (float(rep.x) * config.DRAW_SCALE, float(rep.y) * config.DRAW_SCALE)
+        minx = max(0, int(math.floor(np.min(pts_scaled[:, 0]))))
+        miny = max(0, int(math.floor(np.min(pts_scaled[:, 1]))))
+        maxx = min(sample_w - 1, int(math.ceil(np.max(pts_scaled[:, 0]))))
+        maxy = min(sample_h - 1, int(math.ceil(np.max(pts_scaled[:, 1]))))
+        if minx > maxx or miny > maxy:
             color = (255, 255, 255)
+        else:
+            local = pts_scaled.copy()
+            local[:, 0] -= minx
+            local[:, 1] -= miny
+            mask = np.zeros((maxy - miny + 1, maxx - minx + 1), dtype=np.uint8)
+            cv2.fillPoly(mask, [np.round(local).astype(np.int32)], 255)
+            region_img = sample_img[miny : maxy + 1, minx : maxx + 1]
+            use_mask = mask
+            if mask.shape[0] >= 21 and mask.shape[1] >= 21:
+                inner_2 = cv2.erode(mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
+                inner_10 = cv2.erode(mask, np.ones((21, 21), dtype=np.uint8), iterations=1)
+                ring_2_10 = cv2.subtract(inner_2, inner_10)
+                if int(np.count_nonzero(ring_2_10)) >= max(12, int(np.count_nonzero(mask) * 0.04)):
+                    use_mask = ring_2_10
+                elif int(np.count_nonzero(inner_2)) >= max(8, int(np.count_nonzero(mask) * 0.1)):
+                    use_mask = inner_2
+            elif mask.shape[0] >= 3 and mask.shape[1] >= 3:
+                eroded = cv2.erode(mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
+                if int(np.count_nonzero(eroded)) >= max(4, int(np.count_nonzero(mask) * 0.15)):
+                    use_mask = eroded
+            pixels = region_img[use_mask > 0]
+            if pixels.size == 0:
+                color = (255, 255, 255)
+            else:
+                sample = pixels
+                non_black = sample[np.max(sample, axis=1) > 12]
+                if len(non_black):
+                    sample = non_black
+                non_white = sample[np.min(sample, axis=1) < 245]
+                if len(non_white):
+                    sample = non_white
+                if len(sample) < 12:
+                    rx = int(round(rep_px[0])) - minx
+                    ry = int(round(rep_px[1])) - miny
+                    h_mask, w_mask = mask.shape[:2]
+                    picked = []
+                    for rad in (1, 2, 3, 4):
+                        for yy in range(max(0, ry - rad), min(h_mask, ry + rad + 1)):
+                            for xx in range(max(0, rx - rad), min(w_mask, rx + rad + 1)):
+                                if mask[yy, xx] <= 0:
+                                    continue
+                                pix = region_img[yy, xx]
+                                if int(max(pix)) <= 12:
+                                    continue
+                                if int(min(pix)) >= 245:
+                                    continue
+                                picked.append(pix)
+                        if len(picked) >= 6:
+                            break
+                    if picked:
+                        sample = np.asarray(picked, dtype=np.uint8)
+                med = np.median(sample, axis=0)
+                color = (int(med[0]), int(med[1]), int(med[2]))
         if color[0] >= 245 and color[1] >= 245 and color[2] >= 245:
             color = config.WHITE_FALLBACK
         colors.append(color)
 
+    if use_direct_image_space:
+        w, h = canvas
+        w_px = max(1, int(w * config.DRAW_SCALE))
+        h_px = max(1, int(h * config.DRAW_SCALE))
+        preview = cv2.resize(img, (w_px, h_px), interpolation=cv2.INTER_AREA)
+        return colors, preview
     return colors, resized
 
 

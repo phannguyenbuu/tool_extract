@@ -5,32 +5,320 @@ import os
 import subprocess
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict
 
 from flask import Flask, jsonify, request, send_from_directory
 import xml.etree.ElementTree as ET
 from PIL import Image, ImageDraw, ImageFont
+from shapely.geometry import LineString, Point
 
 import new_toy
-from scripts import packing, zones, config
+from scripts import packing, zones, config, source_voronoi
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "frontend"
 DIST_DIR = WEB_DIR / "dist"
-STATE_JSON = ROOT / "ui_state.json"
-STATE_SVG = ROOT / "ui_state.svg"
-PACKED_LABELS_JSON = ROOT / "packed_labels.json"
-ZONE_LABELS_JSON = ROOT / "zone_labels.json"
-SCENE_JSON = ROOT / "scene_cache.json"
-SOURCE_ZONE_CLICK_JSON = ROOT / "soure_zone_click.json"
+SOURCES_DIR = ROOT / "sources"
+ACTIVE_SOURCE_JSON = ROOT / "active_source.json"
+DEFAULT_SOURCE_NAME = "convoi.svg"
+LEGACY_STATE_JSON = ROOT / "ui_state.json"
+LEGACY_STATE_SVG = ROOT / "ui_state.svg"
+LEGACY_PACKED_LABELS_JSON = ROOT / "packed_labels.json"
+LEGACY_ZONE_LABELS_JSON = ROOT / "zone_labels.json"
+LEGACY_SCENE_JSON = ROOT / "scene_cache.json"
+LEGACY_SOURCE_ZONE_CLICK_JSON = ROOT / "source_zone_click.json"
+LEGACY_SOURCE_ZONE_CLICK_JSON_OLD = ROOT / "soure_zone_click.json"
 PACKED_ZONE_SCENE_SVG = ROOT / "packed_zone_scene.svg"
 PACKED_ZONE_SCENE_SVG_PAGE2 = ROOT / "packed_zone_scene_page2.svg"
-SVG_PATH = ROOT / "convoi.svg"
-SVG_BACKUP = ROOT / "convoi_backup.svg"
+RASTER_PACK_TMP_JSON = ROOT / "tmp_raster_pack.json"
+RASTER_PACK_TMP_PNG = ROOT / "tmp_raster_pack.png"
 EXPORT_DIR = ROOT / "export"
+# Show bleed layer in packed output.
+PACKED_INCLUDE_BLEED = True
 
 app = Flask(__name__, static_folder=None)
+
+
+def _merge_ordered_boundary_points(
+    ordered: list[tuple[float, tuple[float, float]]],
+    threshold: float,
+) -> list[tuple[float, float]]:
+    if not ordered:
+        return []
+    if threshold <= 0:
+        return [pt for _s, pt in ordered]
+    out: list[tuple[float, float]] = []
+    i = 0
+    while i < len(ordered):
+        cluster = [ordered[i][1]]
+        j = i + 1
+        prev = ordered[i][1]
+        while j < len(ordered):
+            cur = ordered[j][1]
+            if math.hypot(cur[0] - prev[0], cur[1] - prev[1]) > threshold:
+                break
+            cluster.append(cur)
+            prev = cur
+            j += 1
+        cx = sum(p[0] for p in cluster) / len(cluster)
+        cy = sum(p[1] for p in cluster) / len(cluster)
+        out.append((cx, cy))
+        i = j
+    return out
+
+
+def _weld_projected_points(
+    ordered: list[tuple[float, tuple[float, float]]],
+    zone_outline: list[tuple[float, float]],
+    weld_threshold: float = 1.0,
+    vertex_snap_threshold: float = 1.0,
+) -> list[tuple[float, float]]:
+    if not ordered:
+        return []
+    welded = _merge_ordered_boundary_points(ordered, weld_threshold)
+    if not welded:
+        return []
+    snapped: list[tuple[float, float]] = []
+    v2 = vertex_snap_threshold * vertex_snap_threshold
+    for p in welded:
+        best = p
+        best_d2 = v2
+        for v in zone_outline:
+            dx = p[0] - v[0]
+            dy = p[1] - v[1]
+            d2 = dx * dx + dy * dy
+            if d2 <= best_d2:
+                best_d2 = d2
+                best = (float(v[0]), float(v[1]))
+        snapped.append(best)
+    deduped: list[tuple[float, float]] = []
+    for p in snapped:
+        if not deduped or math.hypot(p[0] - deduped[-1][0], p[1] - deduped[-1][1]) > 1e-9:
+            deduped.append(p)
+    if len(deduped) > 1 and math.hypot(deduped[0][0] - deduped[-1][0], deduped[0][1] - deduped[-1][1]) <= 1e-9:
+        deduped = deduped[:-1]
+    return deduped
+
+
+def _build_zone_polys_svg_bleed_logic(
+    polys: list[list[tuple[float, float]]],
+    zone_id: list,
+    bleed_radius: float,
+) -> tuple[list[list[tuple[float, float]]], list[int]]:
+    # Mirror SVG bleed debug logic: take near-boundary region vertices, project to boundary,
+    # weld/snap, then use this outline as zone_poly.
+    zone_to_regions: dict[int, list[list[tuple[float, float]]]] = {}
+    for rid, poly in enumerate(polys):
+        if rid >= len(zone_id) or len(poly) < 3:
+            continue
+        try:
+            zid = int(zone_id[rid])
+        except Exception:
+            continue
+        zone_to_regions.setdefault(zid, []).append(poly)
+
+    zone_order = sorted(zone_to_regions.keys())
+    zone_polys: list[list[tuple[float, float]]] = []
+    out_order: list[int] = []
+    for zid in zone_order:
+        zone_region_pts = zone_to_regions.get(zid, [])
+        if not zone_region_pts:
+            continue
+        zone_outline_map = zones.build_zone_boundaries(zone_region_pts, [0] * len(zone_region_pts))
+        outline = (zone_outline_map.get(0) or [[]])[0]
+        if len(outline) < 3:
+            continue
+        outline = [(float(x), float(y)) for x, y in outline]
+        boundary = LineString(outline + [outline[0]])
+        ordered: list[tuple[float, tuple[float, float]]] = []
+        for poly in zone_region_pts:
+            for p in poly:
+                pt = (float(p[0]), float(p[1]))
+                if float(boundary.distance(Point(pt))) > bleed_radius + 1e-9:
+                    continue
+                s = float(boundary.project(Point(pt)))
+                pi = boundary.interpolate(s)
+                ordered.append((s, (float(pi.x), float(pi.y))))
+        if not ordered:
+            zone_polys.append(outline)
+            out_order.append(zid)
+            continue
+        ordered.sort(key=lambda x: x[0])
+        welded = _weld_projected_points(
+            ordered,
+            outline,
+            weld_threshold=1.0,
+            vertex_snap_threshold=1.0,
+        )
+        final_outline = _merge_ordered_boundary_points([(float(i), p) for i, p in enumerate(welded)], 0.5)
+        if len(final_outline) < 3:
+            final_outline = outline
+        zone_polys.append(final_outline)
+        out_order.append(zid)
+    return zone_polys, out_order
+
+
+def _cache_file(prefix: str, source_name: str, ext: str = ".json") -> Path:
+    stem = Path(source_name).stem
+    return ROOT / f"{prefix}_{stem}{ext}"
+
+
+def _state_json_path(source_name: str) -> Path:
+    return _cache_file("ui_state", source_name)
+
+
+def _state_svg_path(source_name: str) -> Path:
+    return _cache_file("ui_state", source_name, ext=".svg")
+
+
+def _packed_labels_path(source_name: str) -> Path:
+    return _cache_file("packed_labels", source_name)
+
+
+def _zone_labels_path(source_name: str) -> Path:
+    return _cache_file("zone_labels", source_name)
+
+
+def _scene_cache_path(source_name: str) -> Path:
+    return _cache_file("scene_cache", source_name)
+
+
+def _source_click_path(source_name: str) -> Path:
+    return _cache_file("source_zone_click", source_name)
+
+
+def _source_snap_region_map_path(source_name: str) -> Path:
+    return _cache_file("source_snap_region_map", source_name)
+
+
+def _zone_debug_path(source_name: str) -> Path:
+    return _cache_file("zone_debug", source_name)
+
+
+def _source_edit_cache_path(source_name: str) -> Path:
+    return _cache_file("source_edit_cache", source_name)
+
+
+def _legacy_fallback_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _load_state_json(source_name: str) -> dict:
+    state_json = _state_json_path(source_name)
+    if state_json.exists():
+        try:
+            return json.loads(state_json.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    if source_name == DEFAULT_SOURCE_NAME and LEGACY_STATE_JSON.exists():
+        return _legacy_fallback_json(LEGACY_STATE_JSON)
+    return {}
+
+
+def _load_source_edit_cache(source_name: str) -> dict:
+    cache_path = _source_edit_cache_path(source_name)
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _strip_source_edit_keys(data: dict | None) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    out = dict(data)
+    for key in ("svg_nodes", "svg_segments", "source_voronoi"):
+        out.pop(key, None)
+    return out
+
+
+def _list_recent_source_names() -> list[str]:
+    names: list[str] = []
+    default_svg = ROOT / DEFAULT_SOURCE_NAME
+    if default_svg.exists():
+        names.append(DEFAULT_SOURCE_NAME)
+    if SOURCES_DIR.exists():
+        for p in sorted(SOURCES_DIR.glob("*.svg"), key=lambda x: x.name.lower()):
+            if p.name.lower().endswith("_fill.svg"):
+                continue
+            if p.name not in names:
+                names.append(p.name)
+    return names
+
+
+def _resolve_source_name(name: str | None) -> str | None:
+    if not name:
+        return None
+    safe = os.path.basename(str(name).strip())
+    if not safe.lower().endswith(".svg"):
+        return None
+    if safe in _list_recent_source_names():
+        return safe
+    return None
+
+
+def _source_path_from_name(source_name: str) -> Path | None:
+    if source_name == DEFAULT_SOURCE_NAME and (ROOT / source_name).exists():
+        return ROOT / source_name
+    p = SOURCES_DIR / source_name
+    if p.exists():
+        return p
+    p2 = ROOT / source_name
+    if p2.exists():
+        return p2
+    return None
+
+
+def _set_active_source_name(source_name: str) -> None:
+    ACTIVE_SOURCE_JSON.write_text(
+        json.dumps({"name": source_name}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _get_active_source_name(requested: str | None = None) -> str:
+    resolved = _resolve_source_name(requested)
+    if resolved:
+        _set_active_source_name(resolved)
+        return resolved
+    if ACTIVE_SOURCE_JSON.exists():
+        try:
+            data = json.loads(ACTIVE_SOURCE_JSON.read_text(encoding="utf-8"))
+            cached = _resolve_source_name(data.get("name"))
+            if cached:
+                return cached
+        except Exception:
+            pass
+    files = _list_recent_source_names()
+    source_name = files[0] if files else DEFAULT_SOURCE_NAME
+    _set_active_source_name(source_name)
+    return source_name
+
+
+def _activate_source(source_name: str) -> Path:
+    src = _source_path_from_name(source_name)
+    if src is None:
+        raise FileNotFoundError(f"source not found: {source_name}")
+    config.SVG_PATH = src
+    new_toy.config.SVG_PATH = src
+    try:
+        setattr(new_toy, "SVG_PATH", src)
+    except Exception:
+        pass
+    return src
+
+
+@app.get("/api/recent_sources")
+def api_recent_sources():
+    files = _list_recent_source_names()
+    active = _get_active_source_name(request.args.get("source"))
+    return jsonify({"files": files, "active": active})
 
 
 def ensure_outputs() -> None:
@@ -44,6 +332,13 @@ def ensure_outputs() -> None:
 @app.get("/api/scene")
 def api_scene():
     snap = request.args.get("snap", type=float) or new_toy.INTERSECT_SNAP
+    source_name = _get_active_source_name(request.args.get("source"))
+    source_path = _activate_source(source_name)
+    # YOLO MODE: FORCE RECOMPUTE
+    scene_json = _scene_cache_path(source_name)
+    if False and scene_json.exists():
+        return json.loads(scene_json.read_text(encoding="utf-8"))
+    zone_labels_json = _zone_labels_path(source_name)
     for key, env_key in (
         ("pack_padding", "PACK_PADDING"),
         ("pack_margin_x", "PACK_MARGIN_X"),
@@ -57,29 +352,96 @@ def api_scene():
         val = request.args.get(key)
         if val is not None:
             os.environ[env_key] = str(val)
-    data = new_toy.compute_scene(new_toy.SVG_PATH, snap, render_packed_png=False)
-    SCENE_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    zone_labels = data.get("zone_labels")
-    if isinstance(zone_labels, dict):
-        ZONE_LABELS_JSON.write_text(
-            json.dumps(zone_labels, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    # keep packed.svg in sync for Konva vector preview
+
+    data = new_toy.compute_scene(source_path, snap, render_packed_png=False)
+    data["source_name"] = source_name
     try:
-        canvas = data.get("canvas") or {}
-        w = int(canvas.get("w", 0))
-        h = int(canvas.get("h", 0))
-        if w > 0 and h > 0:
-            new_toy.write_pack_svg(
-                data.get("regions", []),
-                data.get("zone_id", []),
-                data.get("zone_order", []),
-                [],
-                data.get("placements", []),
-                (w, h),
-                data.get("colors_bgr", []),
-                data.get("rot_info", []),
+        scene_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        if source_name == DEFAULT_SOURCE_NAME:
+            LEGACY_SCENE_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        zone_labels = data.get("zone_labels")
+        if isinstance(zone_labels, dict):
+            zone_labels_json.write_text(
+                json.dumps(zone_labels, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+            if source_name == DEFAULT_SOURCE_NAME:
+                LEGACY_ZONE_LABELS_JSON.write_text(
+                    json.dumps(zone_labels, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+    except Exception:
+        pass
+    # Do not generate packed preview during /api/scene reload.
+    # Packed output is generated only via /api/pack_from_scene (Compute/Repack).
+    return jsonify(data)
+
+
+@app.get("/api/zone_debug")
+def api_zone_debug():
+    source_name = _get_active_source_name(request.args.get("source"))
+    path = _zone_debug_path(source_name)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return jsonify({"vertices": {k: v.get("vertices") for k, v in data.items()}})
+        except Exception:
+            pass
+    return jsonify({"vertices": {}, "error": "missing zone_debug"})
+
+
+@app.get("/api/source_voronoi")
+def api_source_voronoi():
+    source_name = _get_active_source_name(request.args.get("source"))
+    source_path = _activate_source(source_name)
+    cached = _load_source_edit_cache(source_name).get("source_voronoi")
+    if isinstance(cached, dict):
+        data = dict(cached)
+        if "snappedCells" in data and "snapped_cells" not in data:
+            data["snapped_cells"] = data.get("snappedCells") or []
+        data["source_name"] = source_name
+        return jsonify(data)
+    count = request.args.get("count", type=int) or config.TARGET_ZONES
+    relax = request.args.get("relax", type=int)
+    seed = request.args.get("seed", type=int)
+    data = source_voronoi.build_source_voronoi(
+        source_path,
+        count=count,
+        relax=2 if relax is None else relax,
+        seed=7 if seed is None else seed,
+    )
+    data["source_name"] = source_name
+    return jsonify(data)
+
+
+@app.get("/api/source_region_scene")
+def api_source_region_scene():
+    source_name = _get_active_source_name(request.args.get("source"))
+    source_path = _activate_source(source_name)
+    count = request.args.get("count", type=int) or config.TARGET_ZONES
+    relax = request.args.get("relax", type=int)
+    seed = request.args.get("seed", type=int)
+    source_edit = _load_source_edit_cache(source_name)
+    data = source_voronoi.build_source_region_scene(
+        source_path,
+        count=count,
+        relax=2 if relax is None else relax,
+        seed=7 if seed is None else seed,
+        cached_nodes=source_edit.get("svg_nodes"),
+        cached_segments=source_edit.get("svg_segments"),
+        cached_voronoi=source_edit.get("source_voronoi"),
+    )
+    data["source_name"] = source_name
+    try:
+        _source_snap_region_map_path(source_name).write_text(
+            json.dumps(
+                {
+                    "source_name": source_name,
+                    "snap_region_map": data.get("snap_region_map", {}),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     except Exception:
         pass
     return jsonify(data)
@@ -114,20 +476,36 @@ def api_render():
 @app.post("/api/state")
 def api_state():
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
-    STATE_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    source_name = _get_active_source_name(request.args.get("source"))
+    state_json = _state_json_path(source_name)
+    state_svg = _state_svg_path(source_name)
+    source_edit_json = _source_edit_cache_path(source_name)
+    state_payload = _strip_source_edit_keys(payload)
+    state_json.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if source_name == DEFAULT_SOURCE_NAME:
+        LEGACY_STATE_JSON.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    source_edit_payload = {}
+    for key in ("svg_nodes", "svg_segments", "source_voronoi"):
+        if key in payload:
+            source_edit_payload[key] = payload.get(key)
+    if source_edit_payload:
+        source_edit_json.write_text(
+            json.dumps(source_edit_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     # build a lightweight svg for fast restore
-    canvas = payload.get("canvas", {})
+    canvas = state_payload.get("canvas", {})
     w = canvas.get("w", 1000)
     h = canvas.get("h", 1000)
     paths = []
-    for region in payload.get("regions", []):
+    for region in state_payload.get("regions", []):
         if not region:
             continue
         d = "M " + " L ".join(f"{p[0]} {p[1]}" for p in region) + " Z"
         paths.append(f'<path d="{d}" fill="none" stroke="#999" stroke-width="0.5"/>')
     labels = []
-    for lbl in payload.get("labels", []):
+    for lbl in state_payload.get("labels", []):
         labels.append(
             f'<text x="{lbl["x"]}" y="{lbl["y"]}" font-size="6" fill="#000">{lbl["label"]}</text>'
         )
@@ -139,44 +517,89 @@ def api_state():
         + "".join(labels)
         + "</svg>"
     )
-    STATE_SVG.write_text(svg, encoding="utf-8")
+    state_svg.write_text(svg, encoding="utf-8")
+    if source_name == DEFAULT_SOURCE_NAME:
+        LEGACY_STATE_SVG.write_text(svg, encoding="utf-8")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/reset_source_cache")
+def api_reset_source_cache():
+    source_name = _get_active_source_name(request.args.get("source"))
+    edit_cache = _source_edit_cache_path(source_name)
+    snap_map = _source_snap_region_map_path(source_name)
+    for path in (edit_cache, snap_map):
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    state_json = _state_json_path(source_name)
+    if state_json.exists():
+        try:
+            data = json.loads(state_json.read_text(encoding="utf-8"))
+            data.pop("source_region_scene_cache", None)
+            state_json.write_text(
+                json.dumps(_strip_source_edit_keys(data), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+    if source_name == DEFAULT_SOURCE_NAME and LEGACY_STATE_JSON.exists():
+        try:
+            data = json.loads(LEGACY_STATE_JSON.read_text(encoding="utf-8"))
+            data.pop("source_region_scene_cache", None)
+            LEGACY_STATE_JSON.write_text(
+                json.dumps(_strip_source_edit_keys(data), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
     return jsonify({"ok": True})
 
 
 @app.get("/api/state")
 def api_get_state():
-    if STATE_JSON.exists():
-        try:
-            data = json.loads(STATE_JSON.read_text(encoding="utf-8"))
-            return jsonify(data)
-        except Exception:
-            return jsonify({})
-    return jsonify({})
+    source_name = _get_active_source_name(request.args.get("source"))
+    data = _load_state_json(source_name)
+    data.update(_load_source_edit_cache(source_name))
+    return jsonify(data)
 
 
 @app.get("/api/packed_labels")
 def api_packed_labels():
-    if PACKED_LABELS_JSON.exists():
+    source_name = _get_active_source_name(request.args.get("source"))
+    packed_labels_json = _packed_labels_path(source_name)
+    if packed_labels_json.exists():
         try:
-            data = json.loads(PACKED_LABELS_JSON.read_text(encoding="utf-8"))
+            data = json.loads(packed_labels_json.read_text(encoding="utf-8"))
             return jsonify(data)
         except Exception:
             return jsonify({})
+    if source_name == DEFAULT_SOURCE_NAME and LEGACY_PACKED_LABELS_JSON.exists():
+        return jsonify(_legacy_fallback_json(LEGACY_PACKED_LABELS_JSON))
     return jsonify({})
 
 
 @app.post("/api/packed_labels")
 def api_save_packed_labels():
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    source_name = _get_active_source_name(request.args.get("source"))
+    packed_labels_json = _packed_labels_path(source_name)
     data: Dict[str, Any] = {}
-    if PACKED_LABELS_JSON.exists():
+    if packed_labels_json.exists():
         try:
-            data = json.loads(PACKED_LABELS_JSON.read_text(encoding="utf-8"))
+            data = json.loads(packed_labels_json.read_text(encoding="utf-8"))
         except Exception:
             data = {}
     for key, val in payload.items():
         data[str(key)] = val
-    PACKED_LABELS_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    packed_labels_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    if source_name == DEFAULT_SOURCE_NAME:
+        LEGACY_PACKED_LABELS_JSON.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     return jsonify({"ok": True})
 
 
@@ -218,7 +641,32 @@ def _color_to_bgr(val: Any) -> tuple[int, int, int]:
 
 @app.post("/api/pack_from_scene")
 def api_pack_from_scene():
+    t_total_start = time.perf_counter()
+    timings_ms: Dict[str, float] = {}
+    _t = t_total_start
+    def _mark(name: str) -> None:
+        nonlocal _t
+        now = time.perf_counter()
+        timings_ms[name] = round((now - _t) * 1000.0, 2)
+        _t = now
+
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    source_name = _get_active_source_name(request.args.get("source") or payload.get("source"))
+    _activate_source(source_name)
+    raster_only = bool(payload.get("raster_only", False))
+    print(f"[pack_from_scene] start source={source_name} raster_only={int(raster_only)}")
+    for key, env_key in (
+        ("pack_padding", "PACK_PADDING"),
+        ("pack_margin_x", "PACK_MARGIN_X"),
+        ("pack_margin_y", "PACK_MARGIN_Y"),
+        ("pack_bleed", "PACK_BLEED"),
+        ("draw_scale", "DRAW_SCALE"),
+        ("pack_grid", "PACK_GRID_STEP"),
+        ("pack_angle", "PACK_ANGLE_STEP"),
+        ("pack_mode", "PACK_MODE"),
+    ):
+        if key in payload and payload.get(key) is not None:
+            os.environ[env_key] = str(payload.get(key))
     canvas = payload.get("canvas") or {}
     w = int(canvas.get("w", 0) or 0)
     h = int(canvas.get("h", 0) or 0)
@@ -229,6 +677,21 @@ def api_pack_from_scene():
     if not regions or not zone_id:
         return jsonify({"ok": False, "error": "regions/zone_id missing"}), 400
     config._apply_pack_env()
+    unique_zone_count = len({int(z) for z in zone_id if isinstance(z, (int, float, str))})
+    print(
+        "[pack_from_scene] input "
+        f"canvas={w}x{h} regions={len(regions)} zones={unique_zone_count} "
+        f"padding={getattr(config, 'PADDING', 0)} bleed={getattr(config, 'PACK_BLEED', 0)} "
+        f"grid={getattr(config, 'PACK_GRID_STEP', 0)} angle={getattr(config, 'PACK_ANGLE_STEP', 0)} "
+        f"mode={getattr(config, 'PACK_MODE', 'fast')}"
+    )
+    print("[pack_from_scene] scene_cache reuse=yes recompute_scene=no")
+    _mark("init_validate")
+    grid_step = max(1.0, float(getattr(config, "PACK_GRID_STEP", 5.0) or 5.0))
+    # Fixed margin as requested.
+    config.PACK_MARGIN_X = 10
+    config.PACK_MARGIN_Y = 10
+    # Always compute fresh (no cache), using TS-style raster-first packing.
     polys = []
     for poly in regions:
         pts = []
@@ -239,56 +702,285 @@ def api_pack_from_scene():
                 pts.append((float(p[0]), float(p[1])))
             except Exception:
                 continue
-        if pts:
-            polys.append(pts)
-        else:
-            polys.append([])
-    zone_polys, zone_order, _zone_poly_debug = zones.build_zone_polys(polys, zone_id)
+        polys.append(pts if pts else [])
+    _mark("normalize_regions")
+    # Always derive zone_polys from the same logic used by SVG bleed debug
+    # (near-boundary vertices -> projection -> weld/snap), so packed flow matches debug flow.
+    zone_polys, zone_order = _build_zone_polys_svg_bleed_logic(
+        polys,
+        zone_id,
+        float(getattr(config, "PACK_BLEED", 0.0) or 0.0),
+    )
+    explicit_zone_polys = False
+    if not zone_polys:
+        zone_polys, zone_order, _zone_poly_debug = zones.build_zone_polys(polys, zone_id)
+    print(
+        f"[pack_from_scene] zone_polys built={len(zone_polys)} zone_order={len(zone_order)} "
+        f"explicit={int(explicit_zone_polys)}"
+    )
+    _mark("build_zone_polys")
+    # Bleed is applied before raster nest via inflated zone polygons.
     zone_pack_polys = packing._build_zone_pack_polys(
         zone_polys, float(config.PACK_BLEED), bevel_angle=60.0
     )
+    print(
+        "[pack_from_scene] bleed_polys "
+        f"enabled={int(float(getattr(config, 'PACK_BLEED', 0) or 0) > 0)} "
+        f"bleed={float(getattr(config, 'PACK_BLEED', 0) or 0):.2f}"
+    )
+    _mark("build_bleed_polys")
+    # TS-style raster pack (ultra-fast): large-first, then fill holes with small pieces.
+    margin_x = max(0.0, float(getattr(config, "PACK_MARGIN_X", 0.0) or 0.0))
+    margin_y = max(0.0, float(getattr(config, "PACK_MARGIN_Y", 0.0) or 0.0))
+    pack_gap = max(0.0, float(getattr(config, "PADDING", 0.0) or 0.0))
+    n = len(zone_pack_polys)
+    placements: list[tuple[float, float, int, int, bool]] = [(-1.0, -1.0, 0, 0, False)] * n
+    rot_info: list[dict[str, float]] = [
+        {"angle": 0.0, "cx": 0.0, "cy": 0.0, "minx": 0.0, "miny": 0.0, "bin": -1}
+        for _ in range(n)
+    ]
+    raster_report: Dict[str, Any] = {"count": 0, "pairs": []}
+    raster_scale_factor = 4.0  # 1/4 resolution
+    # Denser setting to avoid sparse layout and overflow artifacts.
+    grid_for_raster = 6.0
+    raster_cell = max(4, int(round(min(12.0, grid_for_raster))))
+    search_stride = 2
+    safety_for_raster = max(0.25, min(1.0, pack_gap * 0.15))
+    # 5-degree step full half-turn for better local orientation near dense rows.
+    rotations_5 = [float(a) for a in range(0, 180, 5)]
+    print(
+        "[pack_from_scene] raster_config "
+        f"scale=1/{int(raster_scale_factor)} grid_for_raster={grid_for_raster} "
+        f"cell={raster_cell} stride={search_stride} safety={safety_for_raster:.3f} "
+        f"rotations={len(rotations_5)}"
+    )
+
     zone_pack_centers = []
-    for p in zone_pack_polys:
+    area_map: Dict[int, float] = {}
+    for idx, p in enumerate(zone_pack_polys):
         if p:
             pg = packing.Polygon(p)
             if pg.is_empty:
                 zone_pack_centers.append((0.0, 0.0))
+                area_map[idx] = 0.0
             else:
                 c = pg.centroid
                 zone_pack_centers.append((float(c.x), float(c.y)))
+                area_map[idx] = abs(float(pg.area))
         else:
             zone_pack_centers.append((0.0, 0.0))
-    placements, _order, rot_info = packing.pack_regions(
+            area_map[idx] = 0.0
+    _mark("prep_centers_area")
+
+    sorted_desc = sorted(range(n), key=lambda i: area_map.get(i, 0.0), reverse=True)
+    split_large = max(1, int(round(len(sorted_desc) * 0.55))) if sorted_desc else 0
+    large_ids = sorted_desc[:split_large]
+    small_ids = sorted_desc[split_large:]
+    small_asc = sorted(small_ids, key=lambda i: area_map.get(i, 0.0))
+    # TS-like queue: place large first, then let small pieces fill holes.
+    queue = large_ids + small_asc
+    print(
+        "[pack_from_scene] queue "
+        f"total={len(queue)} large_first={len(large_ids)} small_fill={len(small_asc)}"
+    )
+
+    # One-page TS-like queue pass.
+    pp, _o, rr = packing.pack_regions_raster_fast(
         zone_pack_polys,
         (w, h),
-        allow_rotate=True,
-        angle_step=5.0,
-        grid_step=config.PACK_GRID_STEP,
-        fixed_angles=None,
         fixed_centers=zone_pack_centers,
-        max_bins=2,
-        try_heuristics=True,
-        two_pass=True,
-        preferred_indices=None,
-        use_gap_only=False,
+        grid_step=grid_for_raster,
+        rotations=rotations_5,
+        search_stride=search_stride,
+        safety_padding=safety_for_raster,
+        place_ids=queue,
     )
-    placement_bin = [int(info.get("bin", -1)) for info in rot_info]
-    placement_bin_by_zid = {
-        zid: placement_bin[idx]
-        for idx, zid in enumerate(zone_order)
-        if idx < len(placement_bin)
+    placed_now: set[int] = set()
+    for idx in queue:
+        if idx >= len(pp) or idx >= len(rr):
+            continue
+        dx, dy, bw, bh, rf = pp[idx]
+        if bw <= 0 or bh <= 0:
+            continue
+        placements[idx] = (dx, dy, bw, bh, rf)
+        ri = dict(rr[idx])
+        ri["bin"] = 0
+        rot_info[idx] = ri
+        placed_now.add(idx)
+    queue = [idx for idx in queue if idx not in placed_now]
+    print(
+        "[pack_from_scene] page1 "
+        f"placed={len(placed_now)} unplaced={len(queue)} "
+        f"fill_rate={(len(placed_now) / max(1, n)):.3f}"
+    )
+    _mark("pack_page1")
+
+    # Center packed bbox in canvas for cleaner margins.
+    placed_ids = [i for i in range(n) if placements[i][2] > 0 and placements[i][3] > 0]
+    if placed_ids:
+        minx = miny = float("inf")
+        maxx = maxy = float("-inf")
+        for rid in placed_ids:
+            pts = zone_pack_polys[rid]
+            if not pts:
+                continue
+            info = rot_info[rid]
+            dx, dy, _, _, _ = placements[rid]
+            ang = float(info.get("angle", 0.0))
+            cx = float(info.get("cx", 0.0))
+            cy = float(info.get("cy", 0.0))
+            for p in packing._rotate_pts(pts, ang, cx, cy):
+                x = float(p[0]) + float(dx)
+                y = float(p[1]) + float(dy)
+                minx = min(minx, x)
+                miny = min(miny, y)
+                maxx = max(maxx, x)
+                maxy = max(maxy, y)
+        if minx < maxx and miny < maxy and math.isfinite(minx) and math.isfinite(maxx):
+            cx_box = 0.5 * (minx + maxx)
+            cy_box = 0.5 * (miny + maxy)
+            shift_x = (float(w) * 0.5) - cx_box
+            shift_y = (float(h) * 0.5) - cy_box
+            for rid in placed_ids:
+                dx, dy, bw, bh, rf = placements[rid]
+                placements[rid] = (float(dx) + shift_x, float(dy) + shift_y, bw, bh, rf)
+            print(
+                "[pack_from_scene] center_bbox "
+                f"placed={len(placed_ids)} shift=({shift_x:.2f},{shift_y:.2f}) "
+                f"bbox=({minx:.2f},{miny:.2f})-({maxx:.2f},{maxy:.2f})"
+            )
+    else:
+        print("[pack_from_scene] center_bbox skipped=no placed zones")
+    _mark("center_bbox")
+
+    unplaced_count = len(queue)
+    if unplaced_count > 0:
+        print(f"[pack_from_scene] WARNING: one page overflow, unplaced={unplaced_count}")
+    else:
+        print("[pack_from_scene] One page OK")
+
+    raster_report = packing.raster_overlap_report(
+        zone_pack_polys, placements, rot_info, (w, h), cell=raster_cell
+    )
+    overlap_pairs = raster_report.get("pairs", []) or []
+    print(
+        "[pack_from_scene] raster_overlap "
+        f"count={int(raster_report.get('count', 0))} "
+        f"sample_pairs={overlap_pairs[:5]}"
+    )
+    _mark("raster_overlap")
+
+    tmp_payload = {
+        "canvas": {"w": w, "h": h},
+        "pages": 1,
+        "raster_scale_factor": raster_scale_factor,
+        "strict_gap": pack_gap,
+        "one_page_ok": unplaced_count == 0,
+        "unplaced_count": unplaced_count,
+        "timings_ms": timings_ms,
+        "raster_check": raster_report,
+        "placements": [[float(a), float(b), int(c), int(d), bool(e)] for (a, b, c, d, e) in placements],
+        "rot_info": rot_info,
     }
+    try:
+        RASTER_PACK_TMP_JSON.write_text(
+            json.dumps(tmp_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"[pack_from_scene] write tmp_json path={RASTER_PACK_TMP_JSON}")
+    except Exception:
+        pass
+    _mark("write_tmp_json")
+    try:
+        img = Image.new("RGB", (max(1, int(w)), max(1, int(h))), (6, 14, 46))
+        draw = ImageDraw.Draw(img, "RGBA")
+        overlap_ids = set()
+        for pair in raster_report.get("pairs", []) or []:
+            try:
+                overlap_ids.add(int(pair[0]))
+                overlap_ids.add(int(pair[1]))
+            except Exception:
+                continue
+        for rid, pts in enumerate(zone_pack_polys):
+            if rid >= len(placements) or rid >= len(rot_info) or not pts:
+                continue
+            dx, dy, bw, bh, _ = placements[rid]
+            if bw <= 0 or bh <= 0:
+                continue
+            info = rot_info[rid]
+            bin_idx = int(info.get("bin", 0))
+            if bin_idx != 0:
+                continue
+            try:
+                ang = float(info.get("angle", 0.0))
+                cx = float(info.get("cx", 0.0))
+                cy = float(info.get("cy", 0.0))
+            except Exception:
+                continue
+            tpts = []
+            for p in packing._rotate_pts(pts, ang, cx, cy):
+                x = float(p[0]) + float(dx)
+                y = float(p[1]) + float(dy)
+                if not (math.isfinite(x) and math.isfinite(y)):
+                    tpts = []
+                    break
+                tpts.append((x, y))
+            if len(tpts) < 3:
+                continue
+            r = (rid * 67) % 180 + 60
+            g = (rid * 41) % 180 + 60
+            b = (rid * 23) % 180 + 60
+            try:
+                draw.polygon(tpts, fill=(r, g, b, 130))
+                if rid in overlap_ids:
+                    draw.line(tpts + [tpts[0]], fill=(255, 64, 64, 255), width=3)
+                else:
+                    draw.line(tpts + [tpts[0]], fill=(255, 255, 255, 220), width=1)
+            except Exception:
+                continue
+        img.save(RASTER_PACK_TMP_PNG)
+        print(f"[pack_from_scene] write tmp_png path={RASTER_PACK_TMP_PNG}")
+    except Exception:
+        pass
+    _mark("write_tmp_png")
+    placement_bin = [int(info.get("bin", -1)) for info in rot_info]
+    placement_bin_by_zid = {}
+    for idx, zid in enumerate(zone_order):
+        if idx >= len(placement_bin) or idx >= len(placements):
+            continue
+        if placements[idx][2] <= 0 or placements[idx][3] <= 0:
+            continue
+        placement_bin_by_zid[zid] = placement_bin[idx]
     zone_shift: Dict[int, tuple[float, float]] = {}
     zone_rot: Dict[int, float] = {}
     zone_center: Dict[int, tuple[float, float]] = {}
     for idx, zid in enumerate(zone_order):
         if idx >= len(placements):
             continue
-        dx, dy, _, _, _ = placements[idx]
+        dx, dy, bw, bh, _ = placements[idx]
+        if bw <= 0 or bh <= 0:
+            continue
         zone_shift[zid] = (float(dx), float(dy))
         info = rot_info[idx] if idx < len(rot_info) else {"angle": 0.0, "cx": 0.0, "cy": 0.0}
         zone_rot[zid] = float(info.get("angle", 0.0))
         zone_center[zid] = (float(info.get("cx", 0.0)), float(info.get("cy", 0.0)))
+    if raster_only:
+        timings_ms["total"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
+        print(f"[pack_from_scene] done raster_only=1 timings_ms={timings_ms}")
+        return jsonify(
+            {
+                "ok": True,
+                "raster_only": True,
+                "raster_tmp_path": str(RASTER_PACK_TMP_PNG),
+                "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG),
+                "raster_tmp_png_url": "/out/tmp_raster_pack.png",
+                "raster_tmp_json_path": str(RASTER_PACK_TMP_JSON),
+                "raster_overlap_count": int(raster_report.get("count", 0)),
+                "raster_pages": 1,
+                "one_page_ok": unplaced_count == 0,
+                "unplaced_count": unplaced_count,
+                "timings_ms": timings_ms,
+            }
+        )
     colors_raw = payload.get("region_colors") or []
     colors = []
     for i in range(len(polys)):
@@ -307,50 +999,74 @@ def api_pack_from_scene():
         placement_bin_by_zid=placement_bin_by_zid,
         page_idx=0,
         out_path=PACKED_ZONE_SCENE_SVG,
+        include_bleed=PACKED_INCLUDE_BLEED,
     )
-    packing.write_pack_svg(
-        polys,
-        zone_id,
-        zone_order,
-        zone_polys,
-        placements,
-        (w, h),
-        colors,
-        rot_info,
-        placement_bin=placement_bin,
-        placement_bin_by_zid=placement_bin_by_zid,
-        page_idx=1,
-        out_path=PACKED_ZONE_SCENE_SVG_PAGE2,
+    print(
+        "[pack_from_scene] write_svg "
+        f"path={PACKED_ZONE_SCENE_SVG} include_bleed={int(bool(PACKED_INCLUDE_BLEED))}"
     )
-    return jsonify(
-        {
-            "ok": True,
-            "packed_svg": PACKED_ZONE_SCENE_SVG.read_text(encoding="utf-8"),
-            "packed_svg_page2": PACKED_ZONE_SCENE_SVG_PAGE2.read_text(encoding="utf-8"),
-            "zone_shift": zone_shift,
-            "zone_rot": zone_rot,
-            "zone_center": zone_center,
-            "placement_bin": placement_bin_by_zid,
-        }
+    _mark("write_svg_page1")
+    timings_ms["total"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
+    print(
+        "[pack_from_scene] done "
+        f"one_page_ok={int(unplaced_count == 0)} unplaced={unplaced_count} "
+        f"timings_ms={timings_ms}"
     )
+    result = {
+        "ok": True,
+        "source_name": source_name,
+        "packed_svg": PACKED_ZONE_SCENE_SVG.read_text(encoding="utf-8"),
+        "packed_svg_page2": "",
+        "zone_polys": zone_polys,
+        "zone_order": zone_order,
+        "zone_pack_polys": zone_pack_polys,
+        "zone_shift": zone_shift,
+        "zone_rot": zone_rot,
+        "zone_center": zone_center,
+        "placement_bin": placement_bin_by_zid,
+        "raster_tmp_path": str(RASTER_PACK_TMP_PNG),
+        "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG),
+        "raster_tmp_png_url": "/out/tmp_raster_pack.png",
+        "raster_tmp_json_path": str(RASTER_PACK_TMP_JSON),
+        "raster_overlap_count": int(raster_report.get("count", 0)),
+        "raster_pages": 1,
+        "one_page_ok": unplaced_count == 0,
+        "unplaced_count": unplaced_count,
+        "timings_ms": timings_ms,
+    }
+    return jsonify(result)
 
 
 @app.get("/api/source_zone_click")
 def api_get_source_zone_click():
-    if SOURCE_ZONE_CLICK_JSON.exists():
+    source_name = _get_active_source_name(request.args.get("source"))
+    src = _source_click_path(source_name)
+    if not src.exists() and source_name == DEFAULT_SOURCE_NAME:
+        src = (
+            LEGACY_SOURCE_ZONE_CLICK_JSON
+            if LEGACY_SOURCE_ZONE_CLICK_JSON.exists()
+            else LEGACY_SOURCE_ZONE_CLICK_JSON_OLD
+        )
+    if src.exists():
         try:
-            data = json.loads(SOURCE_ZONE_CLICK_JSON.read_text(encoding="utf-8"))
+            data = json.loads(src.read_text(encoding="utf-8"))
             if isinstance(data, list):
+                print(f"[source_zone_click] load source={source_name} path={src} count={len(data)}")
                 return jsonify({"clicks": data})
             if isinstance(data, dict):
-                return jsonify({"clicks": data.get("clicks", [])})
+                clicks = data.get("clicks", [])
+                print(f"[source_zone_click] load source={source_name} path={src} count={len(clicks)}")
+                return jsonify({"clicks": clicks})
         except Exception:
+            print(f"[source_zone_click] load source={source_name} path={src} parse_error=1")
             return jsonify({"clicks": []})
+    print(f"[source_zone_click] load source={source_name} path={src} count=0")
     return jsonify({"clicks": []})
 
 
 @app.post("/api/source_zone_click")
 def api_save_source_zone_click():
+    source_name = _get_active_source_name(request.args.get("source"))
     payload: Any = request.get_json(silent=True) or []
     clicks = payload if isinstance(payload, list) else payload.get("clicks", [])
     cleaned = []
@@ -359,18 +1075,41 @@ def api_save_source_zone_click():
             continue
         x = item.get("x")
         y = item.get("y")
+        rid = item.get("rid")
+        attach_to = item.get("attach_to")
+        row: Dict[str, Any] = {}
         if isinstance(x, (int, float)) and isinstance(y, (int, float)):
             if math.isfinite(x) and math.isfinite(y):
-                cleaned.append({"x": float(x), "y": float(y)})
-    SOURCE_ZONE_CLICK_JSON.write_text(
-        json.dumps({"clicks": cleaned}, ensure_ascii=False, indent=2), encoding="utf-8"
+                row["x"] = float(x)
+                row["y"] = float(y)
+        if isinstance(rid, (int, float)) and math.isfinite(float(rid)):
+            row["rid"] = int(rid)
+        if isinstance(attach_to, (int, float)) and math.isfinite(float(attach_to)):
+            row["attach_to"] = int(attach_to)
+        if row:
+            cleaned.append(row)
+    payload_text = json.dumps({"clicks": cleaned}, ensure_ascii=False, indent=2)
+    _source_click_path(source_name).write_text(payload_text, encoding="utf-8")
+    print(
+        f"[source_zone_click] save source={source_name} path={_source_click_path(source_name)} "
+        f"count={len(cleaned)}"
     )
+    if source_name == DEFAULT_SOURCE_NAME:
+        try:
+            LEGACY_SOURCE_ZONE_CLICK_JSON.write_text(payload_text, encoding="utf-8")
+            LEGACY_SOURCE_ZONE_CLICK_JSON_OLD.write_text(payload_text, encoding="utf-8")
+        except Exception:
+            pass
     return jsonify({"ok": True, "count": len(cleaned)})
 
 
 @app.post("/api/export")
 def api_export():
     try:
+        source_name = _get_active_source_name(request.args.get("source"))
+        src_path = _activate_source(source_name)
+        scene_json = _scene_cache_path(source_name)
+        zone_labels_json = _zone_labels_path(source_name)
         print("[export] 0% start")
         EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         print("[export] 10% use existing outputs")
@@ -383,9 +1122,9 @@ def api_export():
         canvas_w = None
         canvas_h = None
         cached_scene: Dict[str, Any] = {}
-        if SCENE_JSON.exists():
+        if scene_json.exists():
             try:
-                cached_scene = json.loads(SCENE_JSON.read_text(encoding="utf-8"))
+                cached_scene = json.loads(scene_json.read_text(encoding="utf-8"))
             except Exception:
                 cached_scene = {}
         print(
@@ -406,9 +1145,9 @@ def api_export():
         else:
             print("[export] 13% canvas=missing")
 
-        prefix = new_toy.config.SVG_PATH.stem
+        prefix = src_path.stem
         print("[export] 90% write svgs")
-        prefix = new_toy.config.SVG_PATH.stem
+        prefix = src_path.stem
         zone_outline_svg = ROOT / "zone_outline.svg"
         packed_svg = ROOT / "packed.svg"
 
@@ -434,6 +1173,12 @@ def api_export():
                     rp = rotate_pt(p, ang, cx, cy)
                     out.append([rp[0] + dx, rp[1] + dy])
                 return out
+
+            def zone_stroke_color(zid):
+                return "#ffffff"
+
+            def zone_stroke_width(zid):
+                return "1"
 
             parts = [
                 f'<svg xmlns="http://www.w3.org/2000/svg" width="{target_w_mm}mm" height="{target_h_mm}mm" viewBox="0 0 {int(canvas_w)} {int(canvas_h)}">'
@@ -461,7 +1206,9 @@ def api_export():
                     if not tpts:
                         continue
                     d = "M " + " L ".join(f"{p[0]} {p[1]}" for p in tpts) + " Z"
-                    parts.append(f'<path d="{d}" fill="none" stroke="#ffffff" stroke-width="1"/>')
+                    parts.append(
+                        f'<path d="{d}" fill="none" stroke="{zone_stroke_color(zid)}" stroke-width="{zone_stroke_width(zid)}"/>'
+                    )
             packed_label_size = float(new_toy.config.PACK_LABEL_SCALE) * 20.0 * 0.25
             for lbl in packed_labels.values():
                 try:
@@ -505,7 +1252,9 @@ def api_export():
                     if not tpts:
                         continue
                     d = "M " + " L ".join(f"{p[0]} {p[1]}" for p in tpts) + " Z"
-                    parts.append(f'<path d="{d}" fill="none" stroke="#ffffff" stroke-width="1"/>')
+                    parts.append(
+                        f'<path d="{d}" fill="none" stroke="{zone_stroke_color(zid)}" stroke-width="{zone_stroke_width(zid)}"/>'
+                    )
             packed_label_size = float(new_toy.config.PACK_LABEL_SCALE) * 20.0 * 0.25
             label_source: Dict[str, Any] = {}
             if packed_labels_fallback:
@@ -628,9 +1377,9 @@ def api_export():
                     continue
                 parts.append(f'<path d="{d}" fill="none" stroke="#ffffff" stroke-width="1"/>')
             labels = {}
-            if ZONE_LABELS_JSON.exists():
+            if zone_labels_json.exists():
                 try:
-                    labels = json.loads(ZONE_LABELS_JSON.read_text(encoding="utf-8"))
+                    labels = json.loads(zone_labels_json.read_text(encoding="utf-8"))
                 except Exception:
                     labels = {}
             font_size = str(float(new_toy.config.PACK_LABEL_SCALE) * 20.0 * 0.2)
@@ -664,7 +1413,9 @@ def api_save_konva_svg():
     safe_name = os.path.basename(name)
     if not safe_name.lower().endswith(".svg"):
         safe_name = f"{safe_name}.svg"
-    prefix = f"{SVG_PATH.stem}_"
+    source_name = _get_active_source_name(request.args.get("source"))
+    src_path = _activate_source(source_name)
+    prefix = f"{src_path.stem}_"
     if not safe_name.startswith(prefix):
         safe_name = f"{prefix}{safe_name}"
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -724,6 +1475,8 @@ def api_save_html():
 @app.post("/api/export_pdf")
 def api_export_pdf():
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    source_name = _get_active_source_name(request.args.get("source") or payload.get("source"))
+    src_path = _activate_source(source_name)
     pages = payload.get("pages") or []
     if not isinstance(pages, list) or not pages:
         return jsonify({"ok": False, "error": "no pages"}), 400
@@ -737,16 +1490,39 @@ def api_export_pdf():
         from reportlab.pdfgen import canvas as pdf_canvas
         from reportlab.graphics import renderPDF
         from svglib.svglib import svg2rlg
-    except Exception:
-        return jsonify(
-            {
-                "ok": False,
-                "error": "Missing reportlab/svglib. Install: pip install reportlab svglib",
-            }
-        ), 500
+    except Exception as e:
+        try:
+            import site
+            import sys
+
+            user_site = site.getusersitepackages()
+            if user_site and user_site not in sys.path:
+                sys.path.append(user_site)
+            from reportlab.pdfgen import canvas as pdf_canvas
+            from reportlab.graphics import renderPDF
+            from svglib.svglib import svg2rlg
+        except Exception as inner:
+            try:
+                import site
+                import sys
+
+                detail = {
+                    "executable": sys.executable,
+                    "user_site": site.getusersitepackages(),
+                    "path": sys.path,
+                }
+            except Exception:
+                detail = {}
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": f"Missing reportlab/svglib: {repr(inner)}",
+                    "detail": detail,
+                }
+            ), 500
 
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = EXPORT_DIR / f"{SVG_PATH.stem}_konva.pdf"
+    out_path = EXPORT_DIR / f"{src_path.stem}_konva.pdf"
     c = pdf_canvas.Canvas(str(out_path))
     tmp_paths: list[Path] = []
     try:
@@ -869,10 +1645,13 @@ def _rotate_pt(pt: list[float], angle_deg: float, cx: float, cy: float) -> list[
 @app.post("/api/export_sim_video")
 def api_export_sim_video():
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    source_name = _get_active_source_name(request.args.get("source") or payload.get("source"))
+    src_path = _activate_source(source_name)
+    scene_json = _scene_cache_path(source_name)
     scene = payload.get("scene")
-    if scene is None and SCENE_JSON.exists():
+    if scene is None and scene_json.exists():
         try:
-            scene = json.loads(SCENE_JSON.read_text(encoding="utf-8"))
+            scene = json.loads(scene_json.read_text(encoding="utf-8"))
         except Exception:
             scene = None
     if not scene:
@@ -1043,7 +1822,7 @@ def api_export_sim_video():
         frames.append(img)
 
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = EXPORT_DIR / f"{SVG_PATH.stem}_simulate.gif"
+    out_path = EXPORT_DIR / f"{src_path.stem}_simulate.gif"
     try:
         frames[0].save(
             out_path,
@@ -1095,16 +1874,19 @@ def api_download_html():
 @app.post("/api/save_svg")
 def api_save_svg():
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    source_name = _get_active_source_name(request.args.get("source") or payload.get("source"))
+    svg_path = _activate_source(source_name)
+    svg_backup = ROOT / f"{svg_path.stem}_backup.svg"
     nodes = payload.get("nodes", [])
     segs = payload.get("segs", [])
     overlays = payload.get("overlays", []) or []
-    if not SVG_PATH.exists():
-        return jsonify({"ok": False, "error": "convoi.svg not found"}), 404
+    if not svg_path.exists():
+        return jsonify({"ok": False, "error": f"{source_name} not found"}), 404
 
-    if not SVG_BACKUP.exists():
-        SVG_BACKUP.write_bytes(SVG_PATH.read_bytes())
+    if not svg_backup.exists():
+        svg_backup.write_bytes(svg_path.read_bytes())
 
-    tree = ET.parse(SVG_PATH)
+    tree = ET.parse(svg_path)
     root = tree.getroot()
 
     # remove existing line/polyline/polygon (keep image) + overlay group
@@ -1179,7 +1961,7 @@ def api_save_svg():
             og.append(img)
         root.append(og)
 
-    tree.write(SVG_PATH, encoding="utf-8", xml_declaration=True)
+    tree.write(svg_path, encoding="utf-8", xml_declaration=True)
     return jsonify({"ok": True})
 
 
@@ -1203,6 +1985,8 @@ def output_files(path: str):
 
 
 if __name__ == "__main__":
-    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    server_debug = str(os.environ.get("SERVER_DEBUG", "1")).strip().lower() not in {"0", "false", "no"}
+    use_reloader = str(os.environ.get("SERVER_RELOADER", "1")).strip().lower() not in {"0", "false", "no"}
+    if server_debug and os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         ensure_outputs()
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(host="127.0.0.1", port=5000, debug=server_debug, use_reloader=use_reloader)

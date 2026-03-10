@@ -1,18 +1,29 @@
-import React, { useMemo, useRef, useState, useEffect } from "react";
+import React, { useMemo, useRef, useState, useEffect, useCallback } from "react";
 import Konva from "konva";
 import { Stage, Layer, Line, Text, Circle, Rect, Path, Group, Image, Transformer } from "react-konva";
 
 const toPoints = (pts) => pts.flatMap((p) => [p[0], p[1]]);
 
+const toFinite = (v, fallback = 0) => (Number.isFinite(v) ? v : fallback);
+const escapeXml = (value) =>
+  String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+
 const measureText = (text, fontSize, fontFamily) => {
-  const size = Number.isFinite(fontSize) ? fontSize : 12;
+  const size = toFinite(fontSize, 12);
   const family = fontFamily || "Arial";
+  const safeText = String(text ?? "");
   if (Konva?.Util?.getTextWidth) {
-    const width = Konva.Util.getTextWidth(text || "", size, family);
-    return { width, height: size };
+    const widthRaw = Konva.Util.getTextWidth(safeText, size, family);
+    const widthFallback = safeText.length * size * 0.6;
+    return { width: toFinite(widthRaw, widthFallback), height: toFinite(size, 12) };
   }
-  const width = (text ? text.length : 0) * size * 0.6;
-  return { width, height: size };
+  const width = safeText.length * size * 0.6;
+  return { width: toFinite(width, 0), height: toFinite(size, 12) };
 };
 const rotatePt = (pt, angleDeg, cx, cy) => {
   if (!angleDeg) return pt;
@@ -52,6 +63,25 @@ const bboxFromPts = (pts) => {
     if (y > maxy) maxy = y;
   }
   return { minx, maxx, miny, maxy };
+};
+
+const polyCentroid = (poly) => {
+  if (!poly || poly.length < 3) return { area: 0, cx: 0, cy: 0 };
+  let area = 0;
+  let cx = 0;
+  let cy = 0;
+  const n = poly.length;
+  for (let i = 0; i < n; i++) {
+    const [x0, y0] = poly[i];
+    const [x1, y1] = poly[(i + 1) % n];
+    const cross = x0 * y1 - x1 * y0;
+    area += cross;
+    cx += (x0 + x1) * cross;
+    cy += (y0 + y1) * cross;
+  }
+  area *= 0.5;
+  if (Math.abs(area) < 1e-6) return { area: 0, cx: poly[0][0], cy: poly[0][1] };
+  return { area, cx: cx / (6 * area), cy: cy / (6 * area) };
 };
 
 const pointInPoly = (pt, poly) => {
@@ -152,6 +182,53 @@ const scalePts = (pts, ratio) => (pts || []).map((p) => [p[0] * ratio, p[1] * ra
 const scaleSegments = (segments, ratio) =>
   (segments || []).map((seg) => scalePts(seg, ratio));
 
+const scaleVoronoiData = (voronoi, ratio) => {
+  if (!voronoi) return { mask: [], cells: [], snappedCells: [] };
+  return {
+    ...voronoi,
+    mask: (voronoi.mask || []).map(([x, y]) => [x * ratio, y * ratio]),
+    cells: (voronoi.cells || []).map((poly) => (poly || []).map(([x, y]) => [x * ratio, y * ratio])),
+    snappedCells:
+      (voronoi.snappedCells || voronoi.snapped_cells || []).map((poly) =>
+        (poly || []).map(([x, y]) => [x * ratio, y * ratio])
+      ),
+  };
+};
+
+const normalizeNodesForSave = (nodes, scale = 1) =>
+  (nodes || []).map((n, idx) => ({
+    id: idx,
+    x: (n?.x || 0) / scale,
+    y: (n?.y || 0) / scale,
+  }));
+
+const normalizeVoronoiForSave = (voronoi, scale = 1) => ({
+  mask: (voronoi?.mask || []).map(([x, y]) => [x / scale, y / scale]),
+  cells: (voronoi?.cells || []).map((poly) => (poly || []).map(([x, y]) => [x / scale, y / scale])),
+  snapped_cells: (voronoi?.snappedCells || []).map((poly) =>
+    (poly || []).map(([x, y]) => [x / scale, y / scale])
+  ),
+});
+
+const cloneSourceNodes = (nodes) =>
+  (nodes || []).map((n, idx) => ({
+    ...(n || {}),
+    id: Number.isFinite(n?.id) ? n.id : idx,
+    x: Number(n?.x) || 0,
+    y: Number(n?.y) || 0,
+  }));
+
+const cloneSourceSegs = (segs) => (segs || []).map(([a, b]) => [a, b]);
+
+const cloneSourceVoronoi = (voronoi) => ({
+  ...(voronoi || {}),
+  mask: (voronoi?.mask || []).map(([x, y]) => [x, y]),
+  cells: (voronoi?.cells || []).map((poly) => (poly || []).map(([x, y]) => [x, y])),
+  snappedCells: (voronoi?.snappedCells || []).map((poly) =>
+    (poly || []).map(([x, y]) => [x, y])
+  ),
+});
+
 const scaleSceneData = (scene, ratio) => {
   if (!scene || ratio === 1) return scene;
   const scaleNum = (v) => (Number.isFinite(v) ? v * ratio : v);
@@ -205,64 +282,23 @@ const scaleSceneData = (scene, ratio) => {
     zone_labels: scaleLabelDict(scene.zone_labels),
     region_labels: scaleLabelDict(scene.region_labels),
     zone_pack_polys: scalePolyList(scene.zone_pack_polys),
+    zone_polys: scalePolyList(scene.zone_polys),
     placements: scalePlacements(scene.placements),
     rot_info: scaleRotInfo(scene.rot_info),
     zone_shift: scaleShiftDict(scene.zone_shift),
     zone_center: scaleShiftDict(scene.zone_center),
+    voronoi: scene.voronoi
+      ? {
+          ...scene.voronoi,
+          mask: scalePolyList([scene.voronoi.mask || []])[0] || [],
+          cells: scalePolyList(scene.voronoi.cells),
+          snapped_cells: scalePolyList(scene.voronoi.snapped_cells),
+        }
+      : scene.voronoi,
   };
 };
 
-const logPackedPreview = (data) => {
-  if (!data) return;
-  const placements = data.placements || [];
-  const binW = data.canvas?.w || 0;
-  const binH = data.canvas?.h || 0;
-  let placed = 0;
-  let unplaced = 0;
-  let placedArea = 0;
-  const unplacedIds = [];
-  const pageCounts = {};
-  placements.forEach((p, idx) => {
-    const dx = p?.[0] ?? -1;
-    const dy = p?.[1] ?? -1;
-    const bw = p?.[2] ?? 0;
-    const bh = p?.[3] ?? 0;
-    if (dx < 0 || dy < 0 || bw <= 0 || bh <= 0) {
-      unplaced += 1;
-      unplacedIds.push(idx);
-    } else {
-      placed += 1;
-      placedArea += bw * bh;
-    }
-    const bin = data.placement_bin?.[idx];
-    if (bin != null) {
-      pageCounts[bin] = (pageCounts[bin] || 0) + 1;
-    }
-  });
-  const binArea = binW * binH;
-  const fillRatio = binArea ? placedArea / binArea : 0;
-  const debug = data.debug || {};
-  console.groupCollapsed(
-    `[packed preview] placed=${placed} unplaced=${unplaced} area=${placedArea}/${binArea} (${(fillRatio * 100).toFixed(
-      2
-    )}%)`
-  );
-  console.log("canvas", data.canvas);
-  console.log("placed/unplaced", { placed, unplaced, placedArea, binArea, fillRatio });
-  console.log("unplaced_ids", unplacedIds);
-  console.log("page_counts", pageCounts);
-  console.log("debug", debug);
-  console.log("pack_settings", {
-    packPadding: data.pack_padding,
-    packMarginX: data.pack_margin_x,
-    packMarginY: data.pack_margin_y,
-    packGrid: data.pack_grid,
-    packAngle: data.pack_angle,
-    packMode: data.pack_mode,
-    drawScale: data.draw_scale,
-  });
-  console.groupEnd();
-};
+const logPackedPreview = () => {};
 
 // packed zone boundaries are transformed on backend
 
@@ -588,6 +624,152 @@ const mergeNodesIfClose = (nodes, segs, movedId, snap) => {
   return { nodes: newNodes, segs: newSegs };
 };
 
+const buildVoronoiVertexGraph = (cells, eps = 0.01) => {
+  const keyToId = new Map();
+  const vertices = [];
+  const refs = (cells || []).map((poly) =>
+    (poly || []).map((pt) => {
+      const key = `${(pt?.[0] ?? 0).toFixed(3)}:${(pt?.[1] ?? 0).toFixed(3)}`;
+      let id = keyToId.get(key);
+      if (id == null) {
+        id = vertices.length;
+        keyToId.set(key, id);
+        vertices.push({ id, x: pt[0], y: pt[1] });
+      }
+      return id;
+    })
+  );
+  return { vertices, refs, eps };
+};
+
+const rebuildVoronoiCellsFromGraph = (vertices, refs) =>
+  (refs || [])
+    .map((polyRefs) => {
+      const pts = [];
+      (polyRefs || []).forEach((vid) => {
+        const v = vertices[vid];
+        if (!v) return;
+        const prev = pts[pts.length - 1];
+        if (prev && Math.abs(prev[0] - v.x) < 1e-9 && Math.abs(prev[1] - v.y) < 1e-9) return;
+        pts.push([v.x, v.y]);
+      });
+      if (pts.length > 1) {
+        const first = pts[0];
+        const last = pts[pts.length - 1];
+        if (Math.abs(first[0] - last[0]) < 1e-9 && Math.abs(first[1] - last[1]) < 1e-9) {
+          pts.pop();
+        }
+      }
+      return pts.length >= 3 ? pts : null;
+    })
+    .filter(Boolean);
+
+const mergeVoronoiVerticesIfClose = (vertices, refs, movedId, snap) => {
+  if (!snap || snap <= 0) return { vertices, refs };
+  const moved = vertices[movedId];
+  if (!moved) return { vertices, refs };
+  let targetId = null;
+  for (const v of vertices) {
+    if (!v || v.id === movedId) continue;
+    const dx = v.x - moved.x;
+    const dy = v.y - moved.y;
+    if (dx * dx + dy * dy <= snap * snap) {
+      targetId = v.id;
+      break;
+    }
+  }
+  if (targetId == null) return { vertices, refs };
+  const nextVertices = vertices
+    .filter((v) => v.id !== movedId)
+    .map((v) =>
+      v.id === targetId
+        ? { ...v, x: (v.x + moved.x) / 2, y: (v.y + moved.y) / 2 }
+        : { ...v }
+    );
+  const remap = new Map();
+  nextVertices.forEach((v, idx) => {
+    remap.set(v.id, idx);
+  });
+  const nextRefs = (refs || []).map((polyRefs) =>
+    (polyRefs || []).map((vid) => {
+      const nextId = vid === movedId ? targetId : vid;
+      return remap.get(nextId);
+    })
+  );
+  const normalizedVertices = nextVertices.map((v, idx) => ({ ...v, id: idx }));
+  return { vertices: normalizedVertices, refs: nextRefs };
+};
+
+const projectPointToSegment = (pt, a, b) => {
+  const vx = b[0] - a[0];
+  const vy = b[1] - a[1];
+  const ll = vx * vx + vy * vy;
+  if (ll <= 1e-9) return null;
+  const t = ((pt[0] - a[0]) * vx + (pt[1] - a[1]) * vy) / ll;
+  if (t <= 1e-6 || t >= 1 - 1e-6) return null;
+  return [a[0] + t * vx, a[1] + t * vy];
+};
+
+const dedupeGraphNodes = (nodes, segs) => {
+  const keyToId = new Map();
+  const remap = new Map();
+  const nextNodes = [];
+  nodes.forEach((n) => {
+    const key = `${n.x.toFixed(3)},${n.y.toFixed(3)}`;
+    let nid = keyToId.get(key);
+    if (nid == null) {
+      nid = nextNodes.length;
+      keyToId.set(key, nid);
+      nextNodes.push({ id: nid, x: n.x, y: n.y });
+    }
+    remap.set(n.id, nid);
+  });
+  const edgeSeen = new Set();
+  const nextSegs = [];
+  (segs || []).forEach(([a, b]) => {
+    const na = remap.get(a);
+    const nb = remap.get(b);
+    if (na == null || nb == null || na === nb) return;
+    const ek = edgeKey(na, nb);
+    if (edgeSeen.has(ek)) return;
+    edgeSeen.add(ek);
+    nextSegs.push([na, nb]);
+  });
+  return { nodes: nextNodes, segs: nextSegs };
+};
+
+const projectGraphNodesToVoronoi = (nodes, segs, snappedCells, maxDist = 4) => {
+  if (!nodes?.length || !segs?.length || !snappedCells?.length) return { nodes, segs };
+  const zoneSegs = [];
+  (snappedCells || []).forEach((poly) => {
+    if (!poly || poly.length < 2) return;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i];
+      const b = poly[(i + 1) % poly.length];
+      if (!a || !b) continue;
+      zoneSegs.push([a, b]);
+    }
+  });
+  if (!zoneSegs.length) return { nodes, segs };
+  const nextNodes = nodes.map((n) => {
+    let best = [n.x, n.y];
+    let bestD2 = maxDist * maxDist;
+    zoneSegs.forEach(([a, b]) => {
+      const proj = projectPointToSegment([n.x, n.y], a, b);
+      if (!proj) return;
+      const dx = proj[0] - n.x;
+      const dy = proj[1] - n.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 <= bestD2) {
+        bestD2 = d2;
+        best = proj;
+      }
+    });
+    return { ...n, x: best[0], y: best[1] };
+  });
+  return dedupeGraphNodes(nextNodes, segs);
+};
+
 const segmentIntersect = (a1, a2, b1, b2) => {
   const x1 = a1[0], y1 = a1[1], x2 = a2[0], y2 = a2[1];
   const x3 = b1[0], y3 = b1[1], x4 = b2[0], y4 = b2[1];
@@ -823,6 +1005,102 @@ const buildZoneBoundaries = (polys, zoneId, snap = 0) => {
   return zoneBoundaries;
 };
 
+const buildSnapZoneSceneFromRegionScene = (data) => {
+  if (!data?.regions?.length) return null;
+  const regionCount = data.regions.length;
+  const snapRegionMap = data.snap_region_map || {};
+  const rawSnappedCells = data?.voronoi?.snapped_cells || [];
+  const zonePolys = rawSnappedCells
+    .map((poly) =>
+      (poly || [])
+        .map((p) =>
+          Array.isArray(p) && p.length >= 2 && Number.isFinite(p[0]) && Number.isFinite(p[1])
+            ? [Number(p[0]), Number(p[1])]
+            : null
+        )
+        .filter(Boolean)
+    )
+    .filter((poly) => poly.length >= 3);
+  const zoneOrder = Array.from({ length: zonePolys.length }, (_, i) => i);
+  const zoneId = Array.from({ length: regionCount }, () => -1);
+
+  Object.entries(snapRegionMap).forEach(([zidRaw, regionIds]) => {
+    const zid = parseInt(zidRaw, 10);
+    (regionIds || []).forEach((rid) => {
+      const idx = parseInt(rid, 10);
+      if (Number.isFinite(idx) && idx >= 0 && idx < regionCount) zoneId[idx] = zid;
+    });
+  });
+
+  if (zonePolys.length) {
+    const zoneCenters = zonePolys.map((poly) => {
+      const { cx, cy } = polyCentroid(poly);
+      return [cx, cy];
+    });
+    for (let i = 0; i < regionCount; i++) {
+      if (zoneId[i] >= 0) continue;
+      const { cx, cy } = polyCentroid(data.regions[i] || []);
+      let bestZid = 0;
+      let bestD2 = Infinity;
+      zoneCenters.forEach((pt, zid) => {
+        const dx = (pt?.[0] ?? 0) - cx;
+        const dy = (pt?.[1] ?? 0) - cy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          bestZid = zid;
+        }
+      });
+      zoneId[i] = bestZid;
+    }
+  } else {
+    for (let i = 0; i < regionCount; i++) {
+      if (zoneId[i] < 0) zoneId[i] = i;
+    }
+  }
+
+  const zoneBoundaries = zonePolys.length
+    ? Object.fromEntries(zonePolys.map((poly, zid) => [zid, [poly]]))
+    : buildZoneBoundaries(data.regions, zoneId, 0);
+  const zoneLabels = {};
+  const zoneLabelMap = {};
+  const labelIds = zonePolys.length ? zoneOrder : Array.from(new Set(zoneId)).sort((a, b) => a - b);
+  labelIds.forEach((zid, idx) => {
+    if (zonePolys.length) {
+      const { cx, cy } = polyCentroid(zonePolys[zid] || []);
+      zoneLabels[zid] = { x: cx, y: cy, label: idx + 1 };
+      zoneLabelMap[zid] = idx + 1;
+      return;
+    }
+    let sumArea = 0;
+    let sumX = 0;
+    let sumY = 0;
+    zoneId.forEach((ridZid, rid) => {
+      if (ridZid !== zid) return;
+      const poly = data.regions[rid] || [];
+      const { area, cx, cy } = polyCentroid(poly);
+      const w = Math.abs(area) || 1;
+      sumArea += w;
+      sumX += cx * w;
+      sumY += cy * w;
+    });
+    const x = sumArea > 0 ? sumX / sumArea : 0;
+    const y = sumArea > 0 ? sumY / sumArea : 0;
+    zoneLabels[zid] = { x, y, label: idx + 1 };
+    zoneLabelMap[zid] = idx + 1;
+  });
+
+  return {
+    ...data,
+    zone_id: zoneId,
+    zone_boundaries: zoneBoundaries,
+    zone_polys: zonePolys,
+    zone_order: zoneOrder,
+    zone_labels: zoneLabels,
+    zone_label_map: zoneLabelMap,
+  };
+};
+
 const polyAreaAndCentroid = (poly) => {
   if (!poly || poly.length < 3) return { area: 0, cx: 0, cy: 0 };
   let area = 0;
@@ -842,7 +1120,14 @@ const polyAreaAndCentroid = (poly) => {
   return { area, cx: cx / (6 * area), cy: cy / (6 * area) };
 };
 
+const PACK_PRESETS = {
+  fast: { label: "Fast", grid: 10, angle: 15, mode: "fast" },
+  balanced: { label: "Balanced", grid: 5, angle: 5, mode: "balanced" },
+  tight: { label: "Tight", grid: 2, angle: 2, mode: "tight" },
+};
+
 export default function App() {
+  const sourceOnlyMode = true;
   const [snap, setSnap] = useState(1);
   const [sourceScale, setSourceScale] = useState(1);
   const [scene, setScene] = useState(null);
@@ -854,6 +1139,7 @@ export default function App() {
   const [exportPdfInfo, setExportPdfInfo] = useState(null);
   const [exportHtmlInfo, setExportHtmlInfo] = useState([]);
   const [exportPdfLoading, setExportPdfLoading] = useState(false);
+  const [exportPdfTiming, setExportPdfTiming] = useState({ startTs: 0, elapsedMs: 0 });
   const [showSim, setShowSim] = useState(false);
   const [simPlaying, setSimPlaying] = useState(false);
   const [simProgress, setSimProgress] = useState(0);
@@ -868,6 +1154,7 @@ export default function App() {
   const [svgImage, setSvgImage] = useState(null);
   const [svgFallback, setSvgFallback] = useState([]);
   const [svgSize, setSvgSize] = useState({ w: 1000, h: 1000 });
+  const [sourceVoronoi, setSourceVoronoi] = useState({ mask: [], cells: [], snappedCells: [] });
   const stageRef = useRef(null);
   const leftRef = useRef(null);
   const overlayInputRef = useRef(null);
@@ -895,21 +1182,21 @@ export default function App() {
   const [zonePos, setZonePos] = useState({ x: 0, y: 0 });
   const [zoneStageSize, setZoneStageSize] = useState({ w: 300, h: 200 });
   const zoneClickCacheRef = useRef([]);
-  const [leftTab, setLeftTab] = useState("source");
-  const [rightTab, setRightTab] = useState("packed");
+  const [leftTab, setLeftTab] = useState("region");
+  const rightTab = "packed";
   const neighborSnap = 0.5;
   const regionAdj = useMemo(
     () => buildRegionAdjacencyMulti((zoneScene || scene)?.regions || [], [neighborSnap, 2]),
     [zoneScene, scene]
   );
   const [autoFit, setAutoFit] = useState(true);
-  const [showImages, setShowImages] = useState(false);
+  const [showImages, setShowImages] = useState(true);
   const [showStroke, setShowStroke] = useState(true);
   const [showLabels, setShowLabels] = useState(true);
   const [labelFontFamily, setLabelFontFamily] = useState("Arial");
   const [labelFontSize, setLabelFontSize] = useState(12);
-  const [packedImageSrc, setPackedImageSrc] = useState("/out/packed.svg");
-  const [packedImageSrc2, setPackedImageSrc2] = useState("/out/packed_page2.svg");
+  const [packedImageSrc, setPackedImageSrc] = useState("");
+  const [packedImageSrc2, setPackedImageSrc2] = useState("");
   const [packedFillPaths, setPackedFillPaths] = useState([]);
   const [packedBleedPaths, setPackedBleedPaths] = useState([]);
   const [packedBleedError, setPackedBleedError] = useState("");
@@ -923,19 +1210,79 @@ export default function App() {
   const [edgeCandidate, setEdgeCandidate] = useState(null);
   const [deleteEdgeCandidate, setDeleteEdgeCandidate] = useState(null);
   const [sceneLoading, setSceneLoading] = useState(true);
-  const [packPadding, setPackPadding] = useState(4);
+  const [packPadding, setPackPadding] = useState(5);
   const [packMarginX, setPackMarginX] = useState(30);
   const [packMarginY, setPackMarginY] = useState(30);
-  const [packBleed, setPackBleed] = useState(10);
+  const [packBleed, setPackBleed] = useState(3);
+  const [enableBleed, setEnableBleed] = useState(true);
+  const [showRasterTemp, setShowRasterTemp] = useState(false);
+  const [rasterTempSrc, setRasterTempSrc] = useState("");
+  const [computeBusy, setComputeBusy] = useState(false);
+  const [rasterBusy, setRasterBusy] = useState(false);
   const [drawScale, setDrawScale] = useState(0.5);
-  const [packGrid, setPackGrid] = useState(5);
-  const [packAngle, setPackAngle] = useState(5);
+  const [packGrid, setPackGrid] = useState(10);
+  const [packAngle, setPackAngle] = useState(15);
   const [packMode, setPackMode] = useState("fast");
+  const [packPreset, setPackPreset] = useState("fast");
   const [autoPack, setAutoPack] = useState(false);
   const [overlayItems, setOverlayItems] = useState([]);
   const [selectedOverlayId, setSelectedOverlayId] = useState(null);
   const [overlayFill, setOverlayFill] = useState("#000000");
   const [zoneClickLogs, setZoneClickLogs] = useState([]);
+  const [packedEditMode, setPackedEditMode] = useState("none"); // none | move | rotate
+  const [manualPackedEdits, setManualPackedEdits] = useState({});
+  const [packUiLog, setPackUiLog] = useState("");
+  const [packTiming, setPackTiming] = useState({
+    running: false,
+    startTs: 0,
+    elapsedMs: 0,
+    lastMs: null,
+    avgMs: null,
+    count: 0,
+  });
+  const [recentFiles, setRecentFiles] = useState(["convoi.svg", "chobenthanh.svg"]);
+  const [selectedSource, setSelectedSource] = useState("convoi.svg");
+  const [sourceUndoStack, setSourceUndoStack] = useState([]);
+  const [sourceRedoStack, setSourceRedoStack] = useState([]);
+  const packedEditSessionRef = useRef(null);
+  const manualPackedSaveTimerRef = useRef(null);
+  const sourceDragSnapshotRef = useRef(null);
+  const isPackLoading = !!packTiming.running;
+  const leftPanelLoading = sceneLoading && !isPackLoading;
+  const rightPanelLoading = sceneLoading;
+
+  useEffect(() => {
+    return () => {
+      if (manualPackedSaveTimerRef.current) {
+        clearTimeout(manualPackedSaveTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!exportPdfLoading || !exportPdfTiming.startTs) return undefined;
+    const id = window.setInterval(() => {
+      setExportPdfTiming((prev) => ({
+        ...prev,
+        elapsedMs: Math.max(0, performance.now() - prev.startTs),
+      }));
+    }, 100);
+    return () => window.clearInterval(id);
+  }, [exportPdfLoading, exportPdfTiming.startTs]);
+
+  useEffect(() => {
+    if (!packTiming.running || !packTiming.startTs) return undefined;
+    const tick = () => {
+      setPackTiming((prev) =>
+        prev.running && prev.startTs
+          ? { ...prev, elapsedMs: Math.max(0, performance.now() - prev.startTs) }
+          : prev
+      );
+    };
+    tick();
+    const timer = window.setInterval(tick, 100);
+    return () => window.clearInterval(timer);
+  }, [packTiming.running, packTiming.startTs]);
 
   const handleSourceScaleChange = (value) => {
     const next = parseFloat(value);
@@ -962,6 +1309,7 @@ export default function App() {
     setLabels((items) =>
       items.map((lbl) => ({ ...lbl, x: lbl.x * ratio, y: lbl.y * ratio }))
     );
+    setSourceVoronoi((data) => scaleVoronoiData(data, ratio));
     setPackedLabels((items) =>
       items.map((lbl) => ({ ...lbl, x: lbl.x * ratio, y: lbl.y * ratio }))
     );
@@ -978,7 +1326,7 @@ export default function App() {
         x: pt.x * ratio,
         y: pt.y * ratio,
       }));
-      fetch("/api/source_zone_click", {
+      fetch(`/api/source_zone_click?${sourceQuery(selectedSource)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ clicks: zoneClickCacheRef.current }),
@@ -986,10 +1334,159 @@ export default function App() {
     }
 
     const packedSource = nextZoneScene || nextScene;
-    if (packedSource) {
+    if (!sourceOnlyMode && leftTab !== "source" && packedSource) {
       const packedPolyData = buildPackedPolyData(packedSource);
       setPackedEmptyCells(buildPackedEmptyCells(packedSource, packedPolyData));
-      refreshPackedFromZoneScene(packedSource);
+      refreshPackedFromZoneScene(packedSource, enableBleed, selectedSource);
+    }
+  };
+
+  const sourceVoronoiGraph = useMemo(
+    () => buildVoronoiVertexGraph(sourceVoronoi?.snappedCells || []),
+    [sourceVoronoi]
+  );
+  const liveSnapRadius = Math.max(0, (snap || 0) * 0.35);
+  const greenToRedSnapRadius = 50;
+
+  const createSourceEditSnapshot = (
+    nextNodes = nodes,
+    nextSegs = segs,
+    nextVoronoi = sourceVoronoi
+  ) => ({
+    nodes: cloneSourceNodes(nextNodes),
+    segs: cloneSourceSegs(nextSegs),
+    voronoi: cloneSourceVoronoi(nextVoronoi),
+  });
+
+  const sourceSnapshotsEqual = (a, b) =>
+    JSON.stringify(a || null) === JSON.stringify(b || null);
+
+  const applySourceEditSnapshot = (snapshot) => {
+    if (!snapshot) return;
+    setNodes(cloneSourceNodes(snapshot.nodes));
+    setSegs(cloneSourceSegs(snapshot.segs));
+    setSourceVoronoi(cloneSourceVoronoi(snapshot.voronoi));
+  };
+
+  const pushSourceUndoSnapshot = (snapshot) => {
+    if (!snapshot) return;
+    setSourceUndoStack((prev) => {
+      const next = [...prev, snapshot];
+      return next.length > 100 ? next.slice(next.length - 100) : next;
+    });
+    setSourceRedoStack([]);
+  };
+
+  const commitSourceDragHistory = (
+    nextNodes = nodes,
+    nextSegs = segs,
+    nextVoronoi = sourceVoronoi
+  ) => {
+    const before = sourceDragSnapshotRef.current;
+    sourceDragSnapshotRef.current = null;
+    if (!before) return;
+    const after = createSourceEditSnapshot(nextNodes, nextSegs, nextVoronoi);
+    if (!sourceSnapshotsEqual(before, after)) {
+      pushSourceUndoSnapshot(before);
+    }
+  };
+
+  const resetSourceHistory = () => {
+    sourceDragSnapshotRef.current = null;
+    setSourceUndoStack([]);
+    setSourceRedoStack([]);
+  };
+
+  const undoSourceEdit = () => {
+    if (!sourceUndoStack.length) return;
+    const current = createSourceEditSnapshot();
+    const snapshot = sourceUndoStack[sourceUndoStack.length - 1];
+    setSourceUndoStack((prev) => prev.slice(0, -1));
+    setSourceRedoStack((prev) => {
+      const next = [...prev, current];
+      return next.length > 100 ? next.slice(next.length - 100) : next;
+    });
+    applySourceEditSnapshot(snapshot);
+  };
+
+  const redoSourceEdit = () => {
+    if (!sourceRedoStack.length) return;
+    const current = createSourceEditSnapshot();
+    const snapshot = sourceRedoStack[sourceRedoStack.length - 1];
+    setSourceRedoStack((prev) => prev.slice(0, -1));
+    setSourceUndoStack((prev) => {
+      const next = [...prev, current];
+      return next.length > 100 ? next.slice(next.length - 100) : next;
+    });
+    applySourceEditSnapshot(snapshot);
+  };
+
+  const resolveSourceSnapTarget = (x, y, options = {}) => {
+    const {
+      excludeNodeId = null,
+      excludeVoronoiId = null,
+      includeNodes = true,
+      includeVoronoi = true,
+      radius = liveSnapRadius,
+    } = options;
+    if (!(radius > 0)) return { x, y, kind: "none", id: null };
+    let best = null;
+    let bestD2 = radius * radius;
+    if (includeNodes) {
+      (nodes || []).forEach((n) => {
+        if (excludeNodeId != null && n.id === excludeNodeId) return;
+        const dx = n.x - x;
+        const dy = n.y - y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 <= bestD2) {
+          bestD2 = d2;
+          best = { x: n.x, y: n.y, kind: "node", id: n.id };
+        }
+      });
+    }
+    if (includeVoronoi) {
+      (sourceVoronoiGraph?.vertices || []).forEach((v) => {
+        if (excludeVoronoiId != null && v.id === excludeVoronoiId) return;
+        const dx = v.x - x;
+        const dy = v.y - y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 <= bestD2) {
+          bestD2 = d2;
+          best = { x: v.x, y: v.y, kind: "voronoi", id: v.id };
+        }
+      });
+    }
+    return best || { x, y, kind: "none", id: null };
+  };
+
+  const updateSourceVoronoiVertex = (vertexId, x, y, options = {}) => {
+    const { snapTarget = null } = options;
+    const target = snapTarget || { x, y, kind: "none", id: null };
+    const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
+    const graph = buildVoronoiVertexGraph(currentVoronoi?.snappedCells || []);
+    if (!graph.vertices[vertexId]) return target;
+    let nextVertices = graph.vertices.map((v) =>
+      v.id === vertexId ? { ...v, x: target.x, y: target.y } : { ...v }
+    );
+    const nextVoronoi = {
+      ...currentVoronoi,
+      snappedCells: rebuildVoronoiCellsFromGraph(nextVertices, graph.refs),
+    };
+    setSourceVoronoi(nextVoronoi);
+    return target;
+  };
+
+  const applyPackPreset = (name, rerender = false) => {
+    const key = String(name || "").toLowerCase();
+    const preset = PACK_PRESETS[key];
+    if (!preset) return;
+    clearManualPackedEdits();
+    setPackPreset(key);
+    setPackGrid(preset.grid);
+    setPackAngle(preset.angle);
+    setPackMode(preset.mode);
+    if (rerender) {
+      requestAnimationFrame(() => loadScene(false, true, true));
     }
   };
 
@@ -1057,6 +1554,22 @@ export default function App() {
     });
     return centers;
   }, [zoneScene, scene]);
+  const zoneAreaStats = useMemo(() => {
+    const source = zoneScene || scene;
+    const boundaries = source?.zone_boundaries || {};
+    const zoneAreas = [];
+    Object.values(boundaries).forEach((paths) => {
+      let zoneArea = 0;
+      (paths || []).forEach((p) => {
+        const { area } = polyAreaAndCentroid(p);
+        zoneArea += Math.abs(area || 0);
+      });
+      if (zoneArea > 0) zoneAreas.push(zoneArea);
+    });
+    const count = zoneAreas.length;
+    const avg = count ? zoneAreas.reduce((a, b) => a + b, 0) / count : 0;
+    return { count, avg };
+  }, [zoneScene, scene]);
   const simLocalFor = (idx) => {
     if (idx == null || idx < 0) return 0;
     const t = simProgress * simTotalSeconds - idx * simPerZone;
@@ -1083,27 +1596,21 @@ export default function App() {
             scaleY={fitScale}
             x={offsetX}
             y={offsetY}
-          >
-            <Layer>
-              <Rect
+          ><Layer><Rect
                 x={0}
                 y={0}
                 width={scene.canvas.w}
                 height={scene.canvas.h}
                 stroke="#ffffff"
                 strokeWidth={1}
-              />
-              <Rect
+              /><Rect
                 x={scene.canvas.w + gap}
                 y={0}
                 width={scene.canvas.w}
                 height={scene.canvas.h}
                 stroke="#ffffff"
                 strokeWidth={1}
-              />
-            </Layer>
-            <Layer>
-              {scene.region_colors
+              /></Layer><Layer>{scene.region_colors
                 ? scene.regions.map((poly, idx) => {
                     const zid = scene.zone_id?.[idx];
                     const zidKey = String(zid);
@@ -1127,8 +1634,7 @@ export default function App() {
                       />
                     );
                   })
-                : null}
-              {packedLabels.map((lbl) => {
+                : null}{packedLabels.map((lbl) => {
                 const zidKey = String(lbl.zid);
                 const zoneIdx = simZoneIndex[zidKey] ?? 0;
                 const local = simLocalFor(zoneIdx);
@@ -1150,10 +1656,7 @@ export default function App() {
                     offsetY={metrics.height / 2}
                   />
                 );
-              })}
-            </Layer>
-            <Layer>
-              {Object.values(scene.zone_labels || {}).map((lbl) => {
+              })}</Layer><Layer>{Object.values(scene.zone_labels || {}).map((lbl) => {
                 const size = Math.max(labelFontSize * 0.5, 6);
                 const metrics = measureText(lbl.label, size, labelFontFamily);
                 return (
@@ -1171,24 +1674,18 @@ export default function App() {
                     offsetY={metrics.height / 2}
                   />
                 );
-              })}
-            </Layer>
-            <Layer>
-              {simZoneIds.flatMap((zid) => {
+              })}</Layer><Layer>{simZoneIds.flatMap((zid) => {
                 const paths = scene.zone_boundaries?.[zid] || [];
                 return paths.map((p, i) => (
                   <Line
                     key={`sim-zone-${zid}-${i}`}
                     points={toPoints(offsetPoints(p, scene.canvas.w + gap, 0))}
-                    stroke="#f5f6ff"
+                    stroke="#ffffff"
                     strokeWidth={1}
                     closed
                   />
                 ));
-              })}
-            </Layer>
-            <Layer>
-              {scene.region_colors
+              })}</Layer><Layer>{scene.region_colors
                 ? scene.regions.map((poly, idx) => {
                     const zid = scene.zone_id?.[idx];
                     const zidKey = String(zid);
@@ -1222,15 +1719,27 @@ export default function App() {
                       />
                     );
                   })
-                : null}
-            </Layer>
-          </Stage>
+                : null}</Layer></Stage>
         );
       })()
     : null;
 
   useEffect(() => {
-    loadScene();
+    (async () => {
+      try {
+        const res = await fetch("/api/recent_sources");
+        if (res.ok) {
+          const data = await res.json();
+          const files = Array.isArray(data?.files) && data.files.length ? data.files : ["convoi.svg"];
+          const active = data?.active && files.includes(data.active) ? data.active : files[0];
+          setRecentFiles(files);
+          setSelectedSource(active);
+          await loadScene(true, false, false, false, active);
+          return;
+        }
+      } catch {}
+      await loadScene(true, false, false, false, "convoi.svg");
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1288,10 +1797,6 @@ export default function App() {
         const rect = region2WrapRef.current.getBoundingClientRect();
         setRegion2StageSize({ w: Math.max(200, rect.width), h: Math.max(200, rect.height) });
       }
-      if (leftTab === "zone" && zoneWrapRef.current) {
-        const rect = zoneWrapRef.current.getBoundingClientRect();
-        setZoneStageSize({ w: Math.max(200, rect.width), h: Math.max(200, rect.height) });
-      }
     });
     return () => cancelAnimationFrame(raf);
   }, [leftTab]);
@@ -1313,15 +1818,10 @@ export default function App() {
       const rect = leftRef.current?.getBoundingClientRect();
       viewW = rect?.width || stageSize.w;
       viewH = rect?.height || stageSize.h;
-    } else if (leftTab === "region") {
+    } else {
       const rect = region2WrapRef.current?.getBoundingClientRect();
       viewW = rect?.width || region2StageSize.w;
       viewH = rect?.height || region2StageSize.h;
-    } else {
-      // zone
-      const rect = zoneWrapRef.current?.getBoundingClientRect();
-      viewW = rect?.width || zoneStageSize.w;
-      viewH = rect?.height || zoneStageSize.h;
     }
 
     const w = bounds.maxx - bounds.minx;
@@ -1430,22 +1930,68 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [selectedOverlayId, nodes, segs, overlayItems]);
 
-  const loadScene = async (fit = true, updatePacked = true, updateZone = true) => {
+  const sourceOutPath = (name) => {
+    const safe = String(name || "convoi.svg").replace(/^\/+/, "");
+    const base = safe === "convoi.svg" ? "/out/convoi.svg" : `/out/sources/${encodeURIComponent(safe)}`;
+    return `${base}?t=${Date.now()}`;
+  };
+
+  const sourceQuery = useCallback(
+    (name) => `source=${encodeURIComponent(name || selectedSource || "convoi.svg")}`,
+    [selectedSource]
+  );
+
+  const [zoneVertices, setZoneVertices] = useState({});
+
+  useEffect(() => {
+    let active = true;
+    if (!selectedSource) {
+      setZoneVertices({});
+      return;
+    }
+    const query = sourceQuery(selectedSource);
+    fetch(`/api/zone_debug?${query}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (!active) return;
+        setZoneVertices(data.vertices || {});
+      })
+      .catch(() => {
+        if (!active) return;
+        setZoneVertices({});
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedSource, sourceQuery]);
+
+  const loadScene = async (
+    fit = true,
+    updatePacked = true,
+    updateZone = true,
+    forceCompute = false,
+    sourceOverride = null
+  ) => {
     try {
+      const sourceName = sourceOverride || selectedSource || "convoi.svg";
+      const sq = sourceQuery(sourceName);
       setError("");
       setAutoFit(fit);
       setSceneLoading(true);
       let savedView = null;
+      let savedState = {};
       try {
-        const stateRes = await fetch("/api/state");
+        const stateRes = await fetch(`/api/state?${sq}`);
         if (stateRes.ok) {
           const stateJson = await stateRes.json();
           savedView = stateJson?.view || null;
+          savedState = stateJson || {};
         }
       } catch {
         savedView = null;
+        savedState = {};
       }
-      const svgRes = await fetch("/out/convoi.svg");
+      const svgRes = await fetch(sourceOutPath(sourceName));
       if (!svgRes.ok) throw new Error(`svg fetch failed: ${svgRes.status}`);
       const svgText = await svgRes.text();
       const scaleRatio = sourceScale || 1;
@@ -1497,23 +2043,119 @@ export default function App() {
       setBorderSegments(borders);
       // no background rendering; keep only geometry
       setRawSegments(segments);
-      const nonBorder = segments.filter(
-        (seg) =>
-          !borders.some(
-            (b) =>
-              b[0][0] === seg[0][0] &&
-              b[0][1] === seg[0][1] &&
-              b[1][0] === seg[1][0] &&
-              b[1][1] === seg[1][1]
-          )
-      );
-      const splitSegments = splitAtIntersections(nonBorder);
-      const snapped = snapNodes(splitSegments, snap);
-      setNodes(snapped.nodes);
-      setSegs(snapped.segs);
+      const cachedNodesRaw = Array.isArray(savedState?.svg_nodes) ? savedState.svg_nodes : null;
+      const cachedSegsRaw = Array.isArray(savedState?.svg_segments) ? savedState.svg_segments : null;
+      const cachedVoronoiRaw = savedState?.source_voronoi && typeof savedState.source_voronoi === "object"
+        ? savedState.source_voronoi
+        : null;
+      let nextGraph = null;
+      if (cachedNodesRaw?.length && cachedSegsRaw?.length) {
+        nextGraph = {
+          nodes: cachedNodesRaw.map((n, idx) => ({
+            id: idx,
+            x: (Number(n?.x) || 0) * scaleRatio,
+            y: (Number(n?.y) || 0) * scaleRatio,
+          })),
+          segs: cachedSegsRaw
+            .map((seg) => [parseInt(seg?.[0], 10), parseInt(seg?.[1], 10)])
+            .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b)),
+        };
+      } else {
+        const nonBorder = segments.filter(
+          (seg) =>
+            !borders.some(
+              (b) =>
+                b[0][0] === seg[0][0] &&
+                b[0][1] === seg[0][1] &&
+                b[1][0] === seg[1][0] &&
+                b[1][1] === seg[1][1]
+            )
+        );
+        const splitSegments = splitAtIntersections(nonBorder);
+        nextGraph = snapNodes(splitSegments, snap);
+      }
+      if (cachedVoronoiRaw) {
+        const scaledVoronoi = scaleVoronoiData(
+          {
+            ...cachedVoronoiRaw,
+            snappedCells: cachedVoronoiRaw.snappedCells || cachedVoronoiRaw.snapped_cells || [],
+          },
+          scaleRatio
+        );
+        setSourceVoronoi({
+          mask: scaledVoronoi.mask || [],
+          cells: scaledVoronoi.cells || [],
+          snappedCells: scaledVoronoi.snappedCells || [],
+        });
+      } else {
+        try {
+          const voronoiRes = await fetch(`/api/source_voronoi?${sq}&count=120&relax=2&seed=7`);
+          if (!voronoiRes.ok) throw new Error(`source voronoi fetch failed: ${voronoiRes.status}`);
+          const voronoiData = await voronoiRes.json();
+          const scaledVoronoi = scaleVoronoiData(
+            {
+              ...voronoiData,
+              snappedCells: voronoiData.snapped_cells || [],
+            },
+            scaleRatio
+          );
+          setSourceVoronoi({
+            mask: scaledVoronoi.mask || [],
+            cells: scaledVoronoi.cells || [],
+            snappedCells: scaledVoronoi.snappedCells || [],
+          });
+        } catch {
+          setSourceVoronoi({ mask: [], cells: [], snappedCells: [] });
+        }
+      }
+      setNodes(nextGraph.nodes);
+      setSegs(nextGraph.segs);
+      resetSourceHistory();
+
+      if (!updatePacked && !updateZone) {
+        try {
+          const regionRes = await fetch(
+            `/api/source_region_scene?${sq}&count=120&relax=2&seed=7&_ts=${Date.now()}`,
+            { cache: "no-store" }
+          );
+          if (!regionRes.ok) throw new Error(`source region scene fetch failed: ${regionRes.status}`);
+          const regionData = await regionRes.json();
+          const scaledRegionData = scaleRatio === 1 ? regionData : scaleSceneData(regionData, scaleRatio);
+          setScene(scaledRegionData);
+        } catch {
+          setScene((prev) => ({
+            ...(prev || {}),
+            canvas: { w: scaledSize.w, h: scaledSize.h },
+            regions: [],
+            source_name: sourceName,
+          }));
+        }
+        if (savedView?.source?.scale && savedView?.source?.pos) {
+          setScale(savedView.source.scale);
+          setPos(savedView.source.pos);
+          setAutoFit(false);
+        }
+        if (fit && !(savedView?.source?.scale && savedView?.source?.pos)) {
+          const w = parsedSize.w || 1200;
+          const h = parsedSize.h || 800;
+          const viewW = stageSize.w;
+          const viewH = stageSize.h;
+          const fitScale = Math.min(viewW / w, viewH / h) * 0.95;
+          setScale(fitScale);
+          setPos({
+            x: (viewW - w * fitScale) / 2,
+            y: (viewH - h * fitScale) / 2,
+          });
+        }
+        setSceneLoading(false);
+        setSelectedSource(sourceName);
+        return;
+      }
 
       const res = await fetch(
-        `/api/scene?snap=${snap}&pack_padding=${packPadding}&pack_margin_x=${packMarginX}&pack_margin_y=${packMarginY}&draw_scale=${drawScale}&pack_grid=${packGrid}&pack_angle=${packAngle}&pack_mode=${packMode}`
+        `/api/scene?${sq}&snap=${snap}&pack_padding=${packPadding}&pack_margin_x=${packMarginX}&pack_margin_y=${packMarginY}&pack_bleed=${packBleed}&draw_scale=${drawScale}&pack_grid=${packGrid}&pack_angle=${packAngle}&pack_mode=${packMode}&force_compute=${
+          1
+        }`
       );
       if (!res.ok) {
         throw new Error(`scene fetch failed: ${res.status}`);
@@ -1522,26 +2164,11 @@ export default function App() {
       const scaledData = scaleRatio === 1 ? data : scaleSceneData(data, scaleRatio);
       setScene(scaledData);
       if (updateZone) {
-        let zoneData = scaledData;
-        try {
-          const clickRes = await fetch("/api/source_zone_click");
-          if (clickRes.ok) {
-            const clickJson = await clickRes.json();
-            const clicksRaw = normalizeClickCache(clickJson);
-            const clicks =
-              scaleRatio === 1
-                ? clicksRaw
-                : clicksRaw.map((pt) => ({ ...pt, x: pt.x * scaleRatio, y: pt.y * scaleRatio }));
-            zoneClickCacheRef.current = clicks;
-            if (clicks.length) {
-              zoneData = applyZoneClickCache(zoneData, clicks);
-            }
-          }
-        } catch {
-          zoneClickCacheRef.current = [];
-        }
+        const zoneData = scaledData;
+        zoneClickCacheRef.current = [];
+        setManualPackedEdits({});
         setZoneScene(zoneData);
-        await refreshPackedFromZoneScene(zoneData);
+        refreshPackedFromZoneScene(zoneData, enableBleed, sourceName).catch(() => {});
       }
       logPackedPreview(scaledData);
       if (typeof scaledData.draw_scale === "number") {
@@ -1555,14 +2182,12 @@ export default function App() {
         }));
         setLabels(initLabels);
         if (updatePacked) {
-          setPackedImageSrc(`/out/packed.svg?t=${Date.now()}`);
-          setPackedImageSrc2(`/out/packed_page2.svg?t=${Date.now()}`);
           const packedPolyData = buildPackedPolyData(scaledData);
           const emptyCells = buildPackedEmptyCells(scaledData, packedPolyData);
           setPackedEmptyCells(emptyCells);
           let cachedPacked = {};
           try {
-            const labelRes = await fetch("/api/packed_labels");
+            const labelRes = await fetch(`/api/packed_labels?${sq}`);
             if (labelRes.ok) {
               cachedPacked = (await labelRes.json()) || {};
             }
@@ -1672,6 +2297,7 @@ export default function App() {
         fitZoneToView(zoneBounds);
       }
       setSceneLoading(false);
+      setSelectedSource(sourceName);
     } catch (err) {
       setError(err.message || String(err));
       setSceneLoading(false);
@@ -1693,10 +2319,11 @@ export default function App() {
     }));
 
   const saveSvg = (nextNodes = nodes, nextSegs = segs, nextOverlays = overlayItems) =>
-    fetch("/api/save_svg", {
+    fetch(`/api/save_svg?${sourceQuery(selectedSource)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        source: selectedSource,
         nodes: nextNodes,
         segs: nextSegs,
         overlays: serializeOverlays(nextOverlays),
@@ -2101,6 +2728,18 @@ export default function App() {
     });
   };
 
+  const handleMainViewDragMove = (e) => {
+    const stage = e.target.getStage ? e.target.getStage() : e.target;
+    if (!stage) return;
+    setMainViewPos({ x: stage.x(), y: stage.y() });
+  };
+
+  const handleRegionDragMove = (e) => {
+    const stage = e.target.getStage ? e.target.getStage() : e.target;
+    if (!stage) return;
+    setRegionPos({ x: stage.x(), y: stage.y() });
+  };
+
   const segmentWouldIntersect = (aIdx, bIdx) => {
     if (!nodes[aIdx] || !nodes[bIdx]) return true;
     const a1 = [nodes[aIdx].x, nodes[aIdx].y];
@@ -2261,11 +2900,142 @@ export default function App() {
   }, [scene]);
 
   const packedSource = zoneScene || scene;
+  const hasManualPackedEdits = useMemo(
+    () => Object.keys(manualPackedEdits || {}).length > 0,
+    [manualPackedEdits]
+  );
+
+  const packedLiveFillItems = useMemo(() => {
+    if (!hasManualPackedEdits || !packedSource?.regions || !packedSource?.zone_id) return [];
+    const packedColors = packedSource.pack_region_colors || packedSource.region_colors || [];
+    const out = [];
+    packedSource.regions.forEach((poly, idx) => {
+      if (!poly || poly.length < 3) return;
+      const zidRaw = packedSource.zone_id?.[idx];
+      if (zidRaw == null) return;
+      const zid = String(zidRaw);
+      const shift =
+        packedSource.zone_shift?.[zid] ||
+        packedSource.zone_shift?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const rot =
+        packedSource.zone_rot?.[zid] ??
+        packedSource.zone_rot?.[parseInt(zid, 10)] ??
+        0;
+      const center =
+        packedSource.zone_center?.[zid] ||
+        packedSource.zone_center?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const moved = transformPath(poly, shift, rot, center);
+      if (!moved || moved.length < 3) return;
+      const bin =
+        packedSource?.placement_bin?.[zid] ??
+        packedSource?.placement_bin?.[parseInt(zid, 10)];
+      const page = bin === 1 ? 1 : 0;
+      const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
+      const fill = packedColors[idx] || "#808080";
+      out.push({
+        key: `pflive-${idx}`,
+        points: toPoints(offsetPoints(moved, xOffset, 0)),
+        fill,
+      });
+    });
+    return out;
+  }, [hasManualPackedEdits, packedSource]);
+
+  const packedZoneColorByZid = useMemo(() => {
+    const source = packedSource || scene;
+    const packedColors = source?.pack_region_colors || source?.region_colors || [];
+    const out = {};
+    if (!source?.zone_id || !packedColors.length) return out;
+    for (let i = 0; i < source.zone_id.length; i++) {
+      const zid = String(source.zone_id[i]);
+      if (out[zid]) continue;
+      out[zid] = packedColors[i] || "#808080";
+    }
+    return out;
+  }, [packedSource, scene]);
+
+  const packedLiveBleedItems = useMemo(() => {
+    if (!enableBleed) return [];
+    if (!hasManualPackedEdits || !packedSource?.zone_pack_polys || !packedSource?.zone_order) return [];
+    const out = [];
+    const zoneOrder = packedSource.zone_order || [];
+    zoneOrder.forEach((zidRaw, idx) => {
+      const zid = String(zidRaw);
+      const poly = packedSource.zone_pack_polys?.[idx];
+      if (!poly || poly.length < 3) return;
+      const shift =
+        packedSource.zone_shift?.[zid] ||
+        packedSource.zone_shift?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const rot =
+        packedSource.zone_rot?.[zid] ??
+        packedSource.zone_rot?.[parseInt(zid, 10)] ??
+        0;
+      const center =
+        packedSource.zone_center?.[zid] ||
+        packedSource.zone_center?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const moved = transformPath(poly, shift, rot, center);
+      if (!moved || moved.length < 3) return;
+      const bin =
+        packedSource?.placement_bin?.[zid] ??
+        packedSource?.placement_bin?.[parseInt(zid, 10)];
+      const page = bin === 1 ? 1 : 0;
+      const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
+      out.push({
+        key: `pblive-${zid}-${idx}`,
+        points: toPoints(offsetPoints(moved, xOffset, 0)),
+        fill: packedZoneColorByZid[zid] || "#808080",
+        stroke: "rgba(255,255,255,0.95)",
+      });
+    });
+    return out;
+  }, [enableBleed, hasManualPackedEdits, packedSource, packedZoneColorByZid]);
 
   const packedEmptyCellsDerived = useMemo(() => {
     if (!packedSource) return [];
     const packedPolyData = buildPackedPolyData(packedSource);
     return buildPackedEmptyCells(packedSource, packedPolyData);
+  }, [packedSource]);
+
+  const packedZoneOutlineItems = useMemo(() => {
+    if (!packedSource?.zone_polys || !packedSource?.zone_order) return [];
+    const out = [];
+    (packedSource.zone_order || []).forEach((zidRaw, idx) => {
+      const zid = String(zidRaw);
+      const poly = packedSource.zone_polys?.[idx];
+      if (!poly || poly.length < 3) return;
+      const shift =
+        packedSource.zone_shift?.[zid] ||
+        packedSource.zone_shift?.[parseInt(zid, 10)];
+      if (!shift) return;
+      const rot =
+        packedSource.zone_rot?.[zid] ??
+        packedSource.zone_rot?.[parseInt(zid, 10)] ??
+        0;
+      const center =
+        packedSource.zone_center?.[zid] ||
+        packedSource.zone_center?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const tpts = transformPath(poly, shift, rot, center);
+      if (!tpts || tpts.length < 3) return;
+      const bin =
+        packedSource?.placement_bin?.[zid] ??
+        packedSource?.placement_bin?.[parseInt(zid, 10)];
+      const page = bin === 1 ? 1 : 0;
+      const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
+      out.push({
+        zid,
+        idx,
+        page,
+        xOffset,
+        pts: tpts,
+        offsetPts: offsetPoints(tpts, xOffset, 0),
+      });
+    });
+    return out;
   }, [packedSource]);
 
   
@@ -2280,73 +3050,168 @@ export default function App() {
   }, [packedEmptyCellsDerived, packedSource]);
 
   const packedLabelSnappedAll = useMemo(() => {
-    if (!packedSource?.zone_boundaries) return [];
+    // Keep render deterministic: no extra snapping/adjustment after raster->vector conversion.
+    return [];
+  }, [packedSource]);
+
+  const packedIndexItems = useMemo(() => {
+    if (!packedSource) return [];
     const out = [];
-    const used = new Set();
-    const cellSize = 6;
-    const cellIndex = (x, y) => {
-      const gx = Math.round(x / cellSize);
-      const gy = Math.round(y / cellSize);
-      return { gx, gy };
-    };
-    const blockCell = (gx, gy) => {
-      for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          used.add(`${gx + dx}:${gy + dy}`);
-        }
-      }
-    };
-    Object.entries(packedSource.zone_boundaries || {}).forEach(([zid, paths]) => {
-      if (!paths || !paths.length) return;
+    const occupied = [];
+    const intersects = (a, b) =>
+      !(a.x + a.w < b.x || b.x + b.w < a.x || a.y + a.h < b.y || b.y + b.h < a.y);
+    const pageW = packedSource?.canvas?.w || 0;
+    const pageH = packedSource?.canvas?.h || 0;
+    Object.entries(packedSource.zone_labels || {}).forEach(([zid, lbl]) => {
+      if (!lbl) return;
       const shift =
         packedSource.zone_shift?.[zid] ?? packedSource.zone_shift?.[parseInt(zid, 10)];
+      if (!shift) return;
       const rot =
-        packedSource.zone_rot?.[zid] ?? packedSource.zone_rot?.[parseInt(zid, 10)] ?? 0;
+        packedSource.zone_rot?.[zid] ??
+        packedSource.zone_rot?.[parseInt(zid, 10)] ??
+        0;
       const center =
         packedSource.zone_center?.[zid] ??
         packedSource.zone_center?.[parseInt(zid, 10)] ??
         [0, 0];
-      let best = null;
-      (paths || []).forEach((p) => {
-        const tpts = transformPath(p, shift, rot, center);
-        if (!tpts || tpts.length < 3) return;
-        const { area, cx, cy } = polyAreaAndCentroid(tpts);
-        const absArea = Math.abs(area);
-        if (!best || absArea > best.absArea) best = { absArea, cx, cy };
-      });
-      if (!best) return;
+      const zonePoly = packedZoneOutlineItems.find((item) => String(item.zid) === String(zid));
+      if (!zonePoly?.pts?.length) return;
       const bin =
         packedSource?.placement_bin?.[zid] ??
         packedSource?.placement_bin?.[parseInt(zid, 10)];
       const page = bin === 1 ? 1 : 0;
-      const pageOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
-      const anchorX = best.cx + pageOffset;
-      const anchorY = best.cy;
-      const cells = packedCellsByBin[page] || [];
-      let bestCell = null;
-      let bestD = Infinity;
-      for (const cell of cells) {
-        const dx0 = cell[0] - anchorX;
-        const dy0 = cell[1] - anchorY;
-        const d = dx0 * dx0 + dy0 * dy0;
-        const { gx, gy } = cellIndex(cell[0], cell[1]);
-        if (used.has(`${gx}:${gy}`)) continue;
-        if (d < bestD) {
-          bestD = d;
-          bestCell = cell;
+      const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
+      const label = `${getZoneAlias(zid, packedSource)}`;
+      const size = Math.max(labelFontSize / Math.max(regionScale, 0.0001), 6 / Math.max(regionScale, 0.0001));
+      const metrics = measureText(label, size, labelFontFamily);
+      const halfW = metrics.width / 2;
+      const halfH = metrics.height / 2;
+
+      const bestPath = zonePoly.pts;
+      if (!bestPath || bestPath.length < 2) return;
+
+      const { area: polyArea } = polyAreaAndCentroid(bestPath);
+      const candidates = [];
+      for (let i = 0; i < bestPath.length; i++) {
+        const p0 = bestPath[i];
+        const p1 = bestPath[(i + 1) % bestPath.length];
+        const vx = p1[0] - p0[0];
+        const vy = p1[1] - p0[1];
+        const len = Math.hypot(vx, vy);
+        if (len < 1e-6) continue;
+        const nx = polyArea >= 0 ? vy / len : -vy / len;
+        const ny = polyArea >= 0 ? -vx / len : vx / len;
+        const tx = vx / len;
+        const ty = vy / len;
+        const mx = 0.5 * (p0[0] + p1[0]);
+        const my = 0.5 * (p0[1] + p1[1]);
+        for (const d of [7, 11, 15]) {
+          for (const s of [0, 6, -6, 12, -12]) {
+            candidates.push({ x: mx + tx * s + nx * d + xOffset, y: my + ty * s + ny * d, edgeLen: len });
+          }
         }
       }
-      const x = bestCell ? bestCell[0] : anchorX;
-      const y = bestCell ? bestCell[1] : anchorY;
-      if (bestCell) {
-        const { gx, gy } = cellIndex(bestCell[0], bestCell[1]);
-        blockCell(gx, gy);
+      candidates.sort((a, b) => b.edgeLen - a.edgeLen);
+
+      let chosen = null;
+      for (const c of candidates) {
+        if (c.x - halfW < 0 || c.x + halfW > pageW + (page === 1 ? pageW + 40 : 0)) continue;
+        if (c.y - halfH < 0 || c.y + halfH > pageH) continue;
+        const box = { x: c.x - halfW, y: c.y - halfH, w: metrics.width, h: metrics.height };
+        if (occupied.some((b) => intersects(box, b))) continue;
+        chosen = c;
+        occupied.push(box);
+        break;
       }
-      const label = getZoneAlias(zid, packedSource);
-      out.push({ zid, label, x, y, page });
+      if (!chosen) {
+        const [pt] = transformPath([[lbl.x, lbl.y]], shift, rot, center);
+        if (!pt) return;
+        chosen = { x: pt[0] + xOffset, y: pt[1] };
+      }
+      out.push({
+        zid: String(zid),
+        label,
+        x: chosen.x,
+        y: chosen.y,
+      });
     });
     return out;
-  }, [packedCellsByBin, packedSource]);
+  }, [packedSource, packedZoneOutlineItems, packedLabelSnappedAll, labelFontFamily, labelFontSize, regionScale]);
+
+  const packedLowAreaWarnings = useMemo(() => {
+    // Disable warning markers while validating raster->vector flow.
+    return [];
+    if (!packedSource?.zone_boundaries) return [];
+    const zoneCandidates = [];
+    Object.entries(packedSource.zone_boundaries || {}).forEach(([zid, paths]) => {
+      if (!paths || !paths.length) return;
+      let zoneArea = 0;
+      (paths || []).forEach((p) => {
+        const { area } = polyAreaAndCentroid(p);
+        zoneArea += Math.abs(area || 0);
+      });
+      if (!(zoneArea > 0)) return;
+      zoneCandidates.push({ zid, paths, zoneArea });
+    });
+    if (!zoneCandidates.length) return [];
+
+    const smallest = zoneCandidates
+      .sort((a, b) => a.zoneArea - b.zoneArea)
+      .slice(0, 10);
+
+    const avgArea = zoneAreaStats.avg || 0;
+    const out = [];
+    smallest.forEach(({ zid, paths, zoneArea }) => {
+      const shift =
+        packedSource.zone_shift?.[zid] || packedSource.zone_shift?.[parseInt(zid, 10)];
+      if (!shift) return;
+      const rot =
+        packedSource.zone_rot?.[zid] ??
+        packedSource.zone_rot?.[parseInt(zid, 10)] ??
+        0;
+      const center =
+        packedSource.zone_center?.[zid] ||
+        packedSource.zone_center?.[parseInt(zid, 10)] ||
+        [0, 0];
+      const bin =
+        packedSource?.placement_bin?.[zid] ??
+        packedSource?.placement_bin?.[parseInt(zid, 10)];
+      const page = bin === 1 ? 1 : 0;
+      const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
+
+      let minx = Infinity;
+      let miny = Infinity;
+      let maxx = -Infinity;
+      let maxy = -Infinity;
+      let found = false;
+      (paths || []).forEach((p) => {
+        const tpts = transformPath(p, shift, rot, center);
+        (tpts || []).forEach((pt) => {
+          found = true;
+          const x = pt[0] + xOffset;
+          const y = pt[1];
+          if (x < minx) minx = x;
+          if (x > maxx) maxx = x;
+          if (y < miny) miny = y;
+          if (y > maxy) maxy = y;
+        });
+      });
+      if (!found) return;
+
+      out.push({
+        zid: String(zid),
+        label: getZoneAlias(zid, packedSource),
+        ratio: avgArea > 0 ? zoneArea / avgArea : 0,
+        page,
+        minx,
+        miny,
+        maxx,
+        maxy,
+      });
+    });
+    return out;
+  }, [packedSource, zoneAreaStats.avg]);
 
 
   const findRegionAtPoint = (regions, pt) => {
@@ -2358,28 +3223,209 @@ export default function App() {
   };
 
   const normalizeClickCache = (payload) => {
-    if (Array.isArray(payload)) return payload;
-    if (payload && Array.isArray(payload.clicks)) return payload.clicks;
-    return [];
+    const raw = Array.isArray(payload) ? payload : payload && Array.isArray(payload.clicks) ? payload.clicks : [];
+    return raw.filter(
+      (item) =>
+        item &&
+        Number.isFinite(item.rid) &&
+        Number.isFinite(item.attach_to)
+    ).map((item) => ({
+      rid: Math.trunc(item.rid),
+      attach_to: Math.trunc(item.attach_to),
+      ...(Number.isFinite(item.x) && Number.isFinite(item.y)
+        ? { x: item.x, y: item.y }
+        : {}),
+    }));
   };
 
-  const refreshPackedFromZoneScene = async (source) => {
-    if (!source?.regions || !source?.zone_id || !source?.canvas) return;
+  const computePackedSignature = (source) => {
+    if (!source) return "none";
+    let h = 2166136261;
+    const mix = (n) => {
+      let x = Number.isFinite(n) ? Math.floor(n * 1000) : 0;
+      h ^= x >>> 0;
+      h = Math.imul(h, 16777619) >>> 0;
+    };
+    mix(source?.canvas?.w || 0);
+    mix(source?.canvas?.h || 0);
+    const regions = source?.regions || [];
+    const zid = source?.zone_id || [];
+    mix(regions.length);
+    mix(zid.length);
+    for (let i = 0; i < Math.min(64, zid.length); i++) mix(zid[i]);
+    for (let i = 0; i < Math.min(24, regions.length); i++) {
+      const r = regions[i] || [];
+      mix(r.length);
+      for (let j = 0; j < Math.min(3, r.length); j++) {
+        mix(r[j]?.[0]);
+        mix(r[j]?.[1]);
+      }
+    }
+    return `p${h.toString(16)}`;
+  };
+
+  const applyManualPackedEdits = (source, edits) => {
+    if (!source || !edits || !Object.keys(edits).length) return source;
+    const next = { ...source };
+    next.zone_shift = { ...(source.zone_shift || {}) };
+    next.zone_rot = { ...(source.zone_rot || {}) };
+    Object.entries(edits).forEach(([zid, v]) => {
+      if (!v) return;
+      if (Number.isFinite(v.dx) && Number.isFinite(v.dy)) {
+        next.zone_shift[zid] = [v.dx, v.dy];
+      }
+      if (Number.isFinite(v.rot)) {
+        next.zone_rot[zid] = v.rot;
+      }
+    });
+    return next;
+  };
+
+  const patchStateJson = async (patch, sourceName = selectedSource) => {
     try {
-      const res = await fetch("/api/pack_from_scene", {
+      let state = {};
+      try {
+        const r = await fetch(`/api/state?${sourceQuery(sourceName)}`);
+        if (r.ok) state = (await r.json()) || {};
+      } catch {}
+      const next = { ...(state || {}), ...(patch || {}) };
+      await fetch(`/api/state?${sourceQuery(sourceName)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next),
+      });
+    } catch {}
+  };
+
+  const persistSourceCacheNow = async (
+    nextNodes = nodes,
+    nextSegs = segs,
+    nextVoronoi = sourceVoronoi,
+    sourceName = selectedSource
+  ) => {
+    await patchStateJson(
+      {
+        svg_nodes: normalizeNodesForSave(nextNodes, sourceScale || 1),
+        svg_segments: (nextSegs || []).map(([a, b]) => [a, b]),
+        source_voronoi: normalizeVoronoiForSave(nextVoronoi, sourceScale || 1),
+      },
+      sourceName
+    );
+  };
+
+  const saveSourceEditsAndRefreshRegion = async (sourceName = selectedSource) => {
+    try {
+      setError("");
+      setSceneLoading(true);
+      await persistSourceCacheNow(nodes, segs, sourceVoronoi, sourceName);
+      const res = await fetch(
+        `/api/source_region_scene?${sourceQuery(sourceName)}&count=120&relax=2&seed=7&_ts=${Date.now()}`,
+        { cache: "no-store" }
+      );
+      if (!res.ok) {
+        throw new Error(`source region scene fetch failed: ${res.status}`);
+      }
+      const regionData = await res.json();
+      const scaledRegionData =
+        (sourceScale || 1) === 1 ? regionData : scaleSceneData(regionData, sourceScale || 1);
+      setScene(scaledRegionData);
+      const nextZoneScene = buildSnapZoneSceneFromRegionScene(scaledRegionData);
+      if (nextZoneScene?.zone_id?.length) {
+        setZoneScene(nextZoneScene);
+        setLeftTab("region");
+        clearManualPackedEdits(sourceName);
+        await refreshPackedFromZoneScene(nextZoneScene, enableBleed, sourceName);
+      }
+      setExportMsg("Saved Region + Zone");
+      setTimeout(() => setExportMsg(""), 2000);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setSceneLoading(false);
+    }
+  };
+
+  const resetSourceCacheAndReload = async (sourceName = selectedSource) => {
+    try {
+      setError("");
+      setSceneLoading(true);
+      const res = await fetch(`/api/reset_source_cache?${sourceQuery(sourceName)}`, {
+        method: "POST",
+      });
+      if (!res.ok) {
+        throw new Error(`reset source cache failed: ${res.status}`);
+      }
+      resetSourceHistory();
+      await loadScene(true, false, false, false, sourceName);
+      setExportMsg("Reset Source");
+      setTimeout(() => setExportMsg(""), 2000);
+    } catch (err) {
+      setError(err.message || String(err));
+      setSceneLoading(false);
+    }
+  };
+
+  const scheduleSaveManualPackedEdits = (edits, source, sourceName = selectedSource) => {
+    if (manualPackedSaveTimerRef.current) {
+      clearTimeout(manualPackedSaveTimerRef.current);
+    }
+    manualPackedSaveTimerRef.current = setTimeout(() => {
+      const payload = {
+        manual_packed: {
+          signature: computePackedSignature(source),
+          edits,
+        },
+      };
+      patchStateJson(payload, sourceName);
+    }, 180);
+  };
+
+  const clearManualPackedEdits = (sourceName = selectedSource) => {
+    setManualPackedEdits({});
+    patchStateJson({ manual_packed: null }, sourceName);
+  };
+
+  const refreshPackedFromZoneScene = async (
+    source,
+    bleedEnabled = enableBleed,
+    sourceName = selectedSource
+  ) => {
+    if (!source?.regions || !source?.zone_id || !source?.canvas) return;
+    const startTs = performance.now();
+    setPackTiming((prev) => ({
+      ...prev,
+      running: true,
+      startTs,
+      elapsedMs: 0,
+    }));
+    try {
+      const res = await fetch(`/api/pack_from_scene?${sourceQuery(sourceName)}&_ts=${Date.now()}`, {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          source: sourceName,
           canvas: source.canvas,
           regions: source.regions,
           zone_id: source.zone_id,
-          region_colors: source.region_colors || [],
+          zone_polys: source.zone_polys || [],
+          zone_order: source.zone_order || [],
+          region_colors: source.pack_region_colors || source.region_colors || [],
+          pack_padding: packPadding,
+          pack_margin_x: packMarginX,
+          pack_margin_y: packMarginY,
+          pack_bleed: packBleed,
+          draw_scale: drawScale,
+          pack_grid: packGrid,
+          pack_angle: packAngle,
+          pack_mode: packMode,
         }),
       });
       if (!res.ok) {
         throw new Error(`pack_from_scene failed: ${res.status}`);
       }
       const data = await res.json();
+      setShowRasterTemp(false);
       if (data?.packed_svg) {
         const parsed = parsePackedSvg(data.packed_svg);
         setPackedFillPaths(parsed.fillPaths);
@@ -2391,12 +3437,19 @@ export default function App() {
         setPackedFillPaths2(parsed2.fillPaths);
         setPackedBleedPaths2(parsed2.bleedPaths);
         setPackedBleedError2(parsed2.hasBleed ? "" : "packed_page2.svg missing bleed layer");
+      } else {
+        setPackedFillPaths2([]);
+        setPackedBleedPaths2([]);
+        setPackedBleedError2("");
       }
       if (data?.zone_shift || data?.zone_rot || data?.zone_center || data?.placement_bin) {
         setZoneScene((prev) =>
           prev
             ? {
                 ...prev,
+                zone_polys: data.zone_polys || prev.zone_polys,
+                zone_order: data.zone_order || prev.zone_order,
+                zone_pack_polys: data.zone_pack_polys || prev.zone_pack_polys,
                 zone_shift: data.zone_shift || prev.zone_shift,
                 zone_rot: data.zone_rot || prev.zone_rot,
                 zone_center: data.zone_center || prev.zone_center,
@@ -2405,8 +3458,154 @@ export default function App() {
             : prev
         );
       }
+      const tTotal = data?.timings_ms?.total;
+      if (data?.one_page_ok === true) {
+        setPackUiLog(
+          `Pack: One page OK${Number.isFinite(tTotal) ? ` (${Math.round(tTotal)} ms)` : ""}`
+        );
+      } else if (Number.isFinite(data?.unplaced_count) && data.unplaced_count > 0) {
+        setPackUiLog(
+          `Pack: WARNING overflow, unplaced=${data.unplaced_count}${
+            Number.isFinite(tTotal) ? ` (${Math.round(tTotal)} ms)` : ""
+          }`
+        );
+      } else if (Number.isFinite(tTotal)) {
+        setPackUiLog(`Pack: ${Math.round(tTotal)} ms`);
+      }
+      return data;
     } catch (err) {
       setPackedBleedError(err.message || String(err));
+      setPackUiLog(`Pack: failed (${err.message || String(err)})`);
+      return null;
+    } finally {
+      const durationMs = Math.max(0, performance.now() - startTs);
+      setPackTiming((prev) => {
+        const nextCount = prev.count + 1;
+        const nextAvg =
+          prev.avgMs == null ? durationMs : (prev.avgMs * prev.count + durationMs) / nextCount;
+        return {
+          ...prev,
+          running: false,
+          startTs: 0,
+          elapsedMs: durationMs,
+          lastMs: durationMs,
+          avgMs: nextAvg,
+          count: nextCount,
+        };
+      });
+    }
+  };
+
+  const getPackedSourceForCompute = async (sourceName = selectedSource) => {
+    // Always use the latest source_region_scene (option 1), then rebuild snap-zone scene from it.
+    const sq = sourceQuery(sourceName);
+    const regionRes = await fetch(
+      `/api/source_region_scene?${sq}&count=120&relax=2&seed=7&_ts=${Date.now()}`,
+      { cache: "no-store" }
+    );
+    if (!regionRes.ok) {
+      throw new Error(`source region scene fetch failed: ${regionRes.status}`);
+    }
+    const regionData = await regionRes.json();
+    const scaleRatio = sourceScale || 1;
+    const scaledRegion = scaleRatio === 1 ? regionData : scaleSceneData(regionData, scaleRatio);
+    setScene(scaledRegion);
+    const rebuilt = buildSnapZoneSceneFromRegionScene(scaledRegion);
+    if (!rebuilt?.regions?.length || !rebuilt?.zone_id?.length) {
+      throw new Error("snap zone scene missing from latest source_region_scene");
+    }
+    setZoneScene(rebuilt);
+    return rebuilt;
+  };
+
+  const repackCurrentPacked = async (bleedEnabled = enableBleed) => {
+    try {
+      const source = await getPackedSourceForCompute(selectedSource);
+      setError("");
+      setSceneLoading(true);
+      setShowRasterTemp(false);
+      clearManualPackedEdits(selectedSource);
+      await refreshPackedFromZoneScene(source, bleedEnabled, selectedSource);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setSceneLoading(false);
+    }
+  };
+
+  const computePackedFromCurrentZone = async () => {
+    if (computeBusy) return;
+    try {
+      const source = await getPackedSourceForCompute(selectedSource);
+      setError("");
+      setComputeBusy(true);
+      setShowRasterTemp(false);
+      await refreshPackedFromZoneScene(source, enableBleed, selectedSource);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setComputeBusy(false);
+    }
+  };
+
+  const packFromRegionSnap = async () => {
+    if (!scene?.regions?.length || !scene?.snap_region_map) return;
+    if (computeBusy) return;
+    try {
+      setError("");
+      setComputeBusy(true);
+      setSceneLoading(true);
+      setShowRasterTemp(false);
+      const source = buildSnapZoneSceneFromRegionScene(scene);
+      if (!source?.zone_id?.length) {
+        throw new Error("snap zone scene missing");
+      }
+      setZoneScene(source);
+      clearManualPackedEdits(selectedSource);
+      await refreshPackedFromZoneScene(source, enableBleed, selectedSource);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setSceneLoading(false);
+      setComputeBusy(false);
+    }
+  };
+
+  const showTempRasterFromCurrentZone = async () => {
+    if (rasterBusy) return;
+    try {
+      const source = await getPackedSourceForCompute(selectedSource);
+      setError("");
+      setRasterBusy(true);
+      const res = await fetch(`/api/pack_from_scene?${sourceQuery(selectedSource)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: selectedSource,
+          canvas: source.canvas,
+          regions: source.regions,
+          zone_id: source.zone_id,
+          region_colors: source.region_colors || [],
+          pack_padding: packPadding,
+          pack_margin_x: packMarginX,
+          pack_margin_y: packMarginY,
+          pack_bleed: packBleed,
+          draw_scale: drawScale,
+          pack_grid: packGrid,
+          pack_angle: packAngle,
+          pack_mode: packMode,
+          raster_only: true,
+        }),
+      });
+      if (!res.ok) throw new Error(`raster compute failed: ${res.status}`);
+      const data = await res.json();
+      const url = data?.raster_tmp_png_url || "/out/tmp_raster_pack.png";
+      setRasterTempSrc(`${url}?t=${Date.now()}`);
+      setShowRasterTemp(true);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setRasterBusy(false);
     }
   };
 
@@ -2421,12 +3620,23 @@ export default function App() {
     return { x, y };
   };
 
-  const saveZoneClickCache = async (pt) => {
-    if (!pt || !Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
-    const next = [...zoneClickCacheRef.current, { x: pt.x, y: pt.y }];
+  const saveZoneClickCache = async (entry) => {
+    if (!entry || typeof entry !== "object") return;
+    const row = {};
+    if (Number.isFinite(entry.x) && Number.isFinite(entry.y)) {
+      row.x = entry.x;
+      row.y = entry.y;
+    }
+    if (Number.isFinite(entry.rid)) row.rid = Math.trunc(entry.rid);
+    if (Number.isFinite(entry.attach_to)) row.attach_to = Math.trunc(entry.attach_to);
+    if (!Number.isFinite(row.rid) || !Number.isFinite(row.attach_to)) return;
+    const deterministic = (zoneClickCacheRef.current || []).filter(
+      (item) => Number.isFinite(item?.rid) && Number.isFinite(item?.attach_to)
+    );
+    const next = [...deterministic, row];
     zoneClickCacheRef.current = next;
     try {
-      await fetch("/api/source_zone_click", {
+      await fetch(`/api/source_zone_click?${sourceQuery(selectedSource)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ clicks: next }),
@@ -2477,25 +3687,27 @@ export default function App() {
     let nextSource = base;
     let lastTarget = null;
     clicks.forEach((pt, idx) => {
-      if (!pt || !Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
-      const rid = findRegionAtPoint(nextSource.regions, pt);
-      if (rid < 0) {
-        console.log(`[zone] replay ${idx} miss x=${pt.x} y=${pt.y}`);
-        return;
+      if (!pt) return;
+      if (Number.isFinite(pt.rid) && Number.isFinite(pt.attach_to)) {
+        const rid = Math.trunc(pt.rid);
+        const target = Math.trunc(pt.attach_to);
+        if (rid >= 0 && rid < (nextSource.zone_id || []).length) {
+          const cur = nextSource.zone_id[rid];
+          if (String(cur) !== String(target)) {
+            const nextZoneId = (nextSource.zone_id || []).slice();
+            nextZoneId[rid] = target;
+            const nextBoundaries = buildZoneBoundaries(nextSource.regions, nextZoneId, 0);
+            nextSource = { ...nextSource, zone_id: nextZoneId, zone_boundaries: nextBoundaries };
+            lastTarget = target;
+            return;
+          }
+        }
       }
+      if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
+      const rid = findRegionAtPoint(nextSource.regions, pt);
+      if (rid < 0) return;
       const res = applyZoneDetachAttach(nextSource, rid, adj, cursorMap);
       if (!res.changed) return;
-      const currentAlias = getZoneAlias(res.currentZid, nextSource);
-      const neighborAliases = (res.neighborZids || []).map((zid) =>
-        getZoneAlias(zid, nextSource)
-      );
-      console.log(
-        `[zone] replay ${idx} region=${rid} current=${currentAlias} neighbors=${neighborAliases.join(
-          ", "
-        )}`
-      );
-      const targetAlias = getZoneAlias(res.targetZid, nextSource);
-      console.log(`[zone] replay ${idx} region=${rid} attach=${targetAlias}`);
       nextSource = res.source;
       lastTarget = res.targetZid;
     });
@@ -2517,9 +3729,17 @@ export default function App() {
       <div className="zone-count">
         ZonePoly:
         {scene?.debug
-          ? ` empty=${(scene.debug.zones_empty || []).length} hull=${(scene.debug.zones_convex_hull || []).length}`
+          ? ` empty=${(scene.debug.zones_empty || []).length} hull=${(scene.debug.zones_convex_hull || []).length} avg_area=${zoneAreaStats.avg.toFixed(2)}`
           : " n/a"}
       </div>
+      {packTiming.count > 0 ? (
+        <div className="zone-count">
+          {`Pack avg=${((packTiming.avgMs || 0) / 1000).toFixed(2)}s last=${(
+            (packTiming.lastMs || 0) / 1000
+          ).toFixed(2)}s n=${packTiming.count}`}
+        </div>
+      ) : null}
+      {packUiLog ? <div className="zone-count">{packUiLog}</div> : null}
       {zoneClickLogs.slice(-4).map((line, idx) => (
         <div className="zone-count" key={`zlog-${idx}`}>
           {line}
@@ -2528,11 +3748,41 @@ export default function App() {
     </div>
   );
 
+  const renderLoadingOverlay = (panel = "right") => {
+    if (!sceneLoading) return null;
+    if (isPackLoading && panel !== "right") return null;
+    const elapsedSec = (packTiming.running ? packTiming.elapsedMs : 0) / 1000;
+    const remainingSec = Math.max(0, 80 - elapsedSec);
+    const avgSec =
+      packTiming.count > 0 && Number.isFinite(packTiming.avgMs)
+        ? (packTiming.avgMs / 1000).toFixed(2)
+        : null;
+    const lastSec =
+      packTiming.lastMs != null && Number.isFinite(packTiming.lastMs)
+        ? (packTiming.lastMs / 1000).toFixed(2)
+        : null;
+    return (
+      <div className="loading-overlay">
+        <div className="loading-overlay-card">
+          <div className="loading-overlay-title">
+            {packTiming.running ? `Packing... ${remainingSec.toFixed(1)}s` : "Loading..."}
+          </div>
+          {packTiming.running || avgSec || lastSec ? (
+            <div className="loading-overlay-meta">
+              {packTiming.running ? `Remaining ${remainingSec.toFixed(1)}s` : null}
+              {avgSec ? `Avg ${avgSec}s` : null}
+              {lastSec ? `Last ${lastSec}s` : null}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  };
+
   const handleZoneRegionClick = (rid, evt) => {
     const source = zoneScene || scene;
     if (!source) return;
     const clickPt = getZoneStageWorldPoint(evt);
-    if (clickPt) saveZoneClickCache(clickPt);
     const adjAll = buildRegionAdjacencyMulti(source.regions || [], [neighborSnap, 2]);
     const res = applyZoneDetachAttach(
       source,
@@ -2545,14 +3795,209 @@ export default function App() {
     const neighborAliases = (res.neighborZids || []).map((zid) => getZoneAlias(zid, source));
     const clickLine = `Click: ${currentAlias} -> [${neighborAliases.join(", ")}]`;
     setZoneClickLogs((logs) => [...logs.slice(-20), clickLine]);
-    console.log(
-      `[zone] region=${rid} current=${currentAlias} neighbors=${neighborAliases.join(", ")}`
-    );
-    const targetAlias = getZoneAlias(res.targetZid, source);
-    console.log(`[zone] region=${rid} attach=${targetAlias}`);
     setZoneScene(res.source);
     setSelectedZoneId(String(res.targetZid));
-    refreshPackedFromZoneScene(res.source);
+    saveZoneClickCache({
+      x: clickPt?.x,
+      y: clickPt?.y,
+      rid,
+      attach_to: res.targetZid,
+    });
+    refreshPackedFromZoneScene(res.source, enableBleed, selectedSource);
+  };
+
+  const centerRegionViewById = (zid) => {
+    const source = regionZoneScene;
+    if (!source?.zone_boundaries) return;
+    const zidKey = String(zid);
+    const zidNum = parseInt(zidKey, 10);
+    const paths = source.zone_boundaries?.[zidKey] || source.zone_boundaries?.[zidNum] || [];
+    if (!paths.length) return;
+    const bounds = calcBounds(paths);
+    const rect = region2WrapRef.current?.getBoundingClientRect();
+    const viewW = rect?.width || region2StageSize.w;
+    const viewH = rect?.height || region2StageSize.h;
+    const bw = Math.max(1, bounds.maxx - bounds.minx);
+    const bh = Math.max(1, bounds.maxy - bounds.miny);
+    const fitScale = Math.max(
+      0.4,
+      Math.min(8, Math.min((viewW * 0.72) / bw, (viewH * 0.72) / bh))
+    );
+    const cx = (bounds.minx + bounds.maxx) / 2;
+    const cy = (bounds.miny + bounds.maxy) / 2;
+    setMainViewScale(fitScale);
+    setMainViewPos({
+      x: viewW / 2 - cx * fitScale,
+      y: viewH / 2 - cy * fitScale,
+    });
+  };
+
+  const centerPackedViewById = (zid) => {
+    const source = packedSource || zoneScene || scene;
+    if (!source?.zone_boundaries) return;
+    const zidKey = String(zid);
+    const zidNum = parseInt(zidKey, 10);
+    const paths = source.zone_boundaries?.[zidKey] || source.zone_boundaries?.[zidNum] || [];
+    if (!paths.length) return;
+    const shift = source.zone_shift?.[zidKey] || source.zone_shift?.[zidNum] || [0, 0];
+    const rot = source.zone_rot?.[zidKey] ?? source.zone_rot?.[zidNum] ?? 0;
+    const center = source.zone_center?.[zidKey] || source.zone_center?.[zidNum] || [0, 0];
+    const transformedPaths = paths.map((p) => transformPath(p, shift, rot, center));
+    const bounds = calcBounds(transformedPaths);
+    const bin = source?.placement_bin?.[zidKey] ?? source?.placement_bin?.[zidNum];
+    const xOffset = bin === 1 ? (source?.canvas?.w || 0) + 40 : 0;
+    const rect = regionWrapRef.current?.getBoundingClientRect();
+    const viewW = rect?.width || regionStageSize.w;
+    const viewH = rect?.height || regionStageSize.h;
+    const bw = Math.max(1, bounds.maxx - bounds.minx);
+    const bh = Math.max(1, bounds.maxy - bounds.miny);
+    const fitScale = Math.max(
+      0.25,
+      Math.min(6, Math.min((viewW * 0.72) / bw, (viewH * 0.72) / bh))
+    );
+    const cx = (bounds.minx + bounds.maxx) / 2 + xOffset;
+    const cy = (bounds.miny + bounds.maxy) / 2;
+    setRegionScale(fitScale);
+    setRegionPos({
+      x: viewW / 2 - cx * fitScale,
+      y: viewH / 2 - cy * fitScale,
+    });
+  };
+
+  const handlePackedZoneSelect = (zid) => {
+    const next = String(zid);
+    setLeftTab("region");
+    setSelectedZoneId(next);
+    centerRegionViewById(next);
+  };
+
+  const getPackedStageWorldPoint = (evt) => {
+    const stage = evt?.target?.getStage?.() || regionRef.current;
+    if (!stage) return null;
+    const pointer = stage.getPointerPosition?.();
+    if (!pointer) return null;
+    const scale = stage.scaleX?.() || regionScale || 1;
+    return {
+      x: (pointer.x - stage.x()) / scale,
+      y: (pointer.y - stage.y()) / scale,
+    };
+  };
+
+  const updateManualZoneTransform = (zid, nextDx, nextDy, nextRot, persist = false) => {
+    const key = String(zid);
+    setZoneScene((prev) => {
+      if (!prev) return prev;
+      const zone_shift = { ...(prev.zone_shift || {}) };
+      const zone_rot = { ...(prev.zone_rot || {}) };
+      if (Number.isFinite(nextDx) && Number.isFinite(nextDy)) zone_shift[key] = [nextDx, nextDy];
+      if (Number.isFinite(nextRot)) zone_rot[key] = nextRot;
+      return { ...prev, zone_shift, zone_rot };
+    });
+    setManualPackedEdits((prev) => {
+      const next = { ...(prev || {}) };
+      next[key] = {
+        dx: Number.isFinite(nextDx) ? nextDx : prev?.[key]?.dx ?? 0,
+        dy: Number.isFinite(nextDy) ? nextDy : prev?.[key]?.dy ?? 0,
+        rot: Number.isFinite(nextRot) ? nextRot : prev?.[key]?.rot ?? 0,
+      };
+      if (persist) {
+        const source = zoneScene || scene;
+        if (source) scheduleSaveManualPackedEdits(next, source, selectedSource);
+      }
+      return next;
+    });
+  };
+
+  const beginPackedEdit = (zid, evt) => {
+    if (packedEditMode === "none") return;
+    const source = packedSource || scene;
+    if (!source) return;
+    const key = String(zid);
+    const shift =
+      source.zone_shift?.[key] ||
+      source.zone_shift?.[parseInt(key, 10)] ||
+      [0, 0];
+    const baseDx = Number.isFinite(shift?.[0]) ? shift[0] : 0;
+    const baseDy = Number.isFinite(shift?.[1]) ? shift[1] : 0;
+    const baseRot =
+      source.zone_rot?.[key] ??
+      source.zone_rot?.[parseInt(key, 10)] ??
+      0;
+    const center =
+      source.zone_center?.[key] ||
+      source.zone_center?.[parseInt(key, 10)] ||
+      [0, 0];
+    const pt = getPackedStageWorldPoint(evt);
+    if (!pt) return;
+    setSelectedZoneId(key);
+    centerZoneViewById(key);
+    if (packedEditMode === "move") {
+      packedEditSessionRef.current = {
+        type: "move",
+        zid: key,
+        startX: pt.x,
+        startY: pt.y,
+        baseDx,
+        baseDy,
+        baseRot,
+      };
+    } else if (packedEditMode === "rotate") {
+      const cx = (center?.[0] || 0) + baseDx;
+      const cy = (center?.[1] || 0) + baseDy;
+      packedEditSessionRef.current = {
+        type: "rotate",
+        zid: key,
+        cx,
+        cy,
+        startA: Math.atan2(pt.y - cy, pt.x - cx),
+        baseDx,
+        baseDy,
+        baseRot,
+      };
+    }
+    evt?.cancelBubble && (evt.cancelBubble = true);
+  };
+
+  const handlePackedStageMouseMove = (evt) => {
+    const s = packedEditSessionRef.current;
+    if (!s) return;
+    const pt = getPackedStageWorldPoint(evt);
+    if (!pt) return;
+    if (s.type === "move") {
+      const ndx = s.baseDx + (pt.x - s.startX);
+      const ndy = s.baseDy + (pt.y - s.startY);
+      updateManualZoneTransform(s.zid, ndx, ndy, s.baseRot, false);
+    } else if (s.type === "rotate") {
+      const a = Math.atan2(pt.y - s.cy, pt.x - s.cx);
+      let d = ((a - s.startA) * 180) / Math.PI;
+      while (d > 180) d -= 360;
+      while (d < -180) d += 360;
+      updateManualZoneTransform(s.zid, s.baseDx, s.baseDy, s.baseRot + d, false);
+    }
+  };
+
+  const handlePackedStageMouseUp = () => {
+    const s = packedEditSessionRef.current;
+    if (!s) return;
+    packedEditSessionRef.current = null;
+    const source = zoneScene || scene;
+    if (source) {
+      const currentShift =
+        source.zone_shift?.[s.zid] ||
+        source.zone_shift?.[parseInt(s.zid, 10)] ||
+        [s.baseDx, s.baseDy];
+      const currentRot =
+        source.zone_rot?.[s.zid] ??
+        source.zone_rot?.[parseInt(s.zid, 10)] ??
+        s.baseRot;
+      updateManualZoneTransform(
+        s.zid,
+        Number.isFinite(currentShift?.[0]) ? currentShift[0] : s.baseDx,
+        Number.isFinite(currentShift?.[1]) ? currentShift[1] : s.baseDy,
+        Number.isFinite(currentRot) ? currentRot : s.baseRot,
+        true
+      );
+    }
   };
 
   const transformOverlayToPacked = (item) => {
@@ -2574,15 +4019,16 @@ export default function App() {
 
   const saveState = async () => {
     if (!scene) return;
-    await fetch("/api/state", {
+    await fetch(`/api/state?${sourceQuery(selectedSource)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         canvas: scene.canvas,
         regions: scene.regions,
         zone_boundaries: scene.zone_boundaries,
-        svg_nodes: nodes,
+        svg_nodes: normalizeNodesForSave(nodes, sourceScale || 1),
         svg_segments: segs,
+        source_voronoi: normalizeVoronoiForSave(sourceVoronoi, sourceScale || 1),
         labels,
         snap,
         view: {
@@ -2597,38 +4043,104 @@ export default function App() {
     try {
       setError("");
       setExportMsg("");
-      if (!scene?.canvas) {
+      const exportStartTs = performance.now();
+      setExportPdfLoading(true);
+      setExportPdfTiming({ startTs: exportStartTs, elapsedMs: 0 });
+      setExportPdfInfo(null);
+      // Re-pack from latest source_region_scene before exporting.
+      const sourceForExport = await getPackedSourceForCompute(selectedSource);
+      await refreshPackedFromZoneScene(sourceForExport, enableBleed, selectedSource);
+      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      const activeScene = sourceForExport || scene;
+      if (!activeScene?.canvas) {
         throw new Error("canvas missing");
       }
-      setExportPdfLoading(true);
-      setExportPdfInfo(null);
-      const size = { w: scene.canvas.w, h: scene.canvas.h };
-      const zoneLabelsSvg = (svgText) =>
-        injectSvgLabels(svgText, scene.zone_labels, labelFontFamily, labelFontSize);
+      const size = { w: activeScene.canvas.w, h: activeScene.canvas.h };
+      const buildRegionFillSvg = () => {
+        const parts = [
+          `<svg xmlns="http://www.w3.org/2000/svg" width="${size.w}" height="${size.h}" viewBox="0 0 ${size.w} ${size.h}">`,
+        ];
+        (activeScene.regions || []).forEach((poly, idx) => {
+          if (!poly?.length) return;
+          const d = `M ${poly.map((p) => `${p[0]} ${p[1]}`).join(" L ")} Z`;
+          const fill = activeScene.region_colors?.[idx] || "#bbbbbb";
+          parts.push(`<path d="${d}" fill="${escapeXml(fill)}"/>`);
+        });
+        parts.push("</svg>");
+        return parts.join("");
+      };
+      const buildZoneOnlySvg = () => {
+        const source = regionZoneScene || buildSnapZoneSceneFromRegionScene(activeScene);
+        const parts = [
+          `<svg xmlns="http://www.w3.org/2000/svg" width="${size.w}" height="${size.h}" viewBox="0 0 ${size.w} ${size.h}">`,
+        ];
+        const zoneOrder = source?.zone_order || [];
+        const zonePolys = source?.zone_polys || [];
+        if (zoneOrder.length && zonePolys.length) {
+          zoneOrder.forEach((zidRaw, idx) => {
+            const poly = zonePolys[idx];
+            if (!poly?.length) return;
+            const zid = String(zidRaw);
+            const d = `M ${poly.map((p) => `${p[0]} ${p[1]}`).join(" L ")} Z`;
+            parts.push(
+              `<path d="${d}" fill="none" stroke="#000000" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>`
+            );
+            const lbl =
+              source?.zone_labels?.[zid] ||
+              source?.zone_labels?.[parseInt(zid, 10)];
+            if (!lbl) return;
+            const label =
+              source?.zone_label_map?.[zid] ??
+              source?.zone_label_map?.[parseInt(zid, 10)] ??
+              lbl.label ??
+              zid;
+            parts.push(
+              `<text x="${lbl.x}" y="${lbl.y}" fill="#000000" font-family="${escapeXml(
+                labelFontFamily
+              )}" font-size="${labelFontSize}" text-anchor="middle" dominant-baseline="middle">${escapeXml(
+                label
+              )}</text>`
+            );
+          });
+        } else {
+          Object.entries(source?.zone_boundaries || {}).forEach(([zid, paths]) => {
+            (paths || []).forEach((poly) => {
+              if (!poly?.length) return;
+              const d = `M ${poly.map((p) => `${p[0]} ${p[1]}`).join(" L ")} Z`;
+              parts.push(
+                `<path d="${d}" fill="none" stroke="#000000" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>`
+              );
+            });
+            const lbl =
+              source?.zone_labels?.[zid] ||
+              source?.zone_labels?.[parseInt(zid, 10)];
+            if (!lbl) return;
+            const label =
+              source?.zone_label_map?.[zid] ??
+              source?.zone_label_map?.[parseInt(zid, 10)] ??
+              lbl.label ??
+              zid;
+            parts.push(
+              `<text x="${lbl.x}" y="${lbl.y}" fill="#000000" font-family="${escapeXml(
+                labelFontFamily
+              )}" font-size="${labelFontSize}" text-anchor="middle" dominant-baseline="middle">${escapeXml(
+                label
+              )}</text>`
+            );
+          });
+        }
+        parts.push("</svg>");
+        return parts.join("");
+      };
       const pages = [
           {
-            name: "zone_image",
-            svg: zoneLabelsSvg(
-              captureStageSvg(zoneRef, size, {
-                "zone-image": true,
-                "zone-overlay": true,
-                "zone-stroke": true,
-                "zone-label": true,
-                "zone-hit": false,
-              })
-            ),
+            name: "region_fill_only",
+            svg: buildRegionFillSvg(),
           },
           {
-            name: "zone_noimage",
-            svg: zoneLabelsSvg(
-              captureStageSvg(zoneRef, size, {
-                "zone-image": false,
-                "zone-overlay": true,
-                "zone-stroke": true,
-                "zone-label": true,
-                "zone-hit": false,
-              })
-            ),
+            name: "zone_index_only",
+            svg: buildZoneOnlySvg(),
           },
           {
             name: "packed_image_nostroke",
@@ -2651,10 +4163,11 @@ export default function App() {
             }),
           },
       ];
-      const res = await fetch("/api/export_pdf", {
+      const res = await fetch(`/api/export_pdf?${sourceQuery(selectedSource)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          source: selectedSource,
           pages,
           fontName: labelFontFamily,
           fontSize: labelFontSize,
@@ -2673,7 +4186,7 @@ export default function App() {
           const baseName = data?.name
             ? data.name.replace(/\.pdf$/i, "")
             : "convoi";
-          const html0 = buildSimulateHtml(scene, packedLabels, labelFontFamily, labelFontSize);
+          const html0 = buildSimulateHtml(activeScene, packedLabels, labelFontFamily, labelFontSize);
           if (html0) {
             const name0 = `${baseName}_simulate.html`;
             await fetch("/api/save_html", {
@@ -2692,10 +4205,11 @@ export default function App() {
         setExportHtmlInfo(htmlNames);
         setExportMsg("Export PDF Done");
         setTimeout(() => setExportMsg(""), 3000);
-      } catch (err) {
+    } catch (err) {
       setError(err.message || String(err));
     } finally {
       setExportPdfLoading(false);
+      setExportPdfTiming((prev) => ({ ...prev, elapsedMs: 0, startTs: 0 }));
     }
   };
 
@@ -2720,10 +4234,22 @@ export default function App() {
   useEffect(() => {
     if (!autoPack) return;
     const id = setTimeout(() => {
-      loadScene(false);
+      repackCurrentPacked();
     }, 500);
     return () => clearTimeout(id);
-  }, [packPadding, packMarginX, packMarginY, packBleed, packGrid, packAngle, packMode, autoPack]);
+  }, [
+    packPadding,
+    packMarginX,
+    packMarginY,
+    packBleed,
+    enableBleed,
+    packGrid,
+    packAngle,
+    packMode,
+    autoPack,
+    zoneScene,
+    scene,
+  ]);
 
   const parsePackedSvg = (text) => {
     const doc = new DOMParser().parseFromString(text, "image/svg+xml");
@@ -2733,6 +4259,8 @@ export default function App() {
       Array.from(node?.querySelectorAll("path") || []).map((p) => ({
         d: p.getAttribute("d") || "",
         fill: p.getAttribute("fill") || "#000000",
+        stroke: p.getAttribute("stroke") || "",
+        strokeWidth: parseFloat(p.getAttribute("stroke-width") || "0") || 0,
       }));
     const fillPaths = parsePaths(fill).filter((p) => p.d);
     const bleedPaths = parsePaths(bleed).filter((p) => p.d);
@@ -2888,10 +4416,11 @@ export default function App() {
     if (simVideoLoading || !scene) return;
     setSimVideoLoading(true);
     try {
-      const res = await fetch("/api/export_sim_video", {
+      const res = await fetch(`/api/export_sim_video?${sourceQuery(selectedSource)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          source: selectedSource,
           scene,
           packedLabels,
           fontName: labelFontFamily,
@@ -3059,12 +4588,13 @@ export default function App() {
           key={`s-${idx}`}
           points={[p1.x, p1.y, p2.x, p2.y]}
           stroke="#f5f6ff"
-          strokeWidth={(1 / scale) * 2.5}
+          opacity={0.45}
+          strokeWidth={0.5 / mainViewScale}
           strokeScaleEnabled={false}
         />
       );
     });
-  }, [segs, nodes]);
+  }, [segs, nodes, mainViewScale]);
 
   const borderLayer = useMemo(() => {
     if (!borderSegments.length) return null;
@@ -3072,12 +4602,325 @@ export default function App() {
       <Line
         key={`b-${idx}`}
         points={toPoints(seg)}
-        stroke="#f5f6ff"
-        strokeWidth={(1 / scale) * 2.5}
+        stroke="#2f80ff"
+        opacity={0.45}
+        strokeWidth={0.5 / mainViewScale}
         strokeScaleEnabled={false}
       />
     ));
-  }, [borderSegments]);
+  }, [borderSegments, mainViewScale]);
+
+  const sourceVoronoiLayer = useMemo(() => {
+    if (!sourceVoronoi?.cells?.length) return null;
+    return sourceVoronoi.cells.map((poly, idx) => (
+      <Line
+        key={`sv-${idx}`}
+        points={toPoints(poly)}
+        closed
+        stroke="#ff5a36"
+        fill="rgba(255,90,54,0.22)"
+        opacity={0.9}
+        dash={[4 / mainViewScale, 2 / mainViewScale]}
+        strokeWidth={1.25 / mainViewScale}
+        strokeScaleEnabled={false}
+        listening={false}
+      />
+    ));
+  }, [sourceVoronoi, mainViewScale]);
+
+  const sourceSnapLayer = useMemo(() => {
+    if (!sourceVoronoiGraph?.refs?.length || !sourceVoronoiGraph?.vertices?.length) return null;
+    return sourceVoronoiGraph.refs.map((polyRefs, idx) => {
+      const poly = (polyRefs || [])
+        .map((vid) => sourceVoronoiGraph.vertices[vid])
+        .filter(Boolean)
+        .map((v) => [v.x, v.y]);
+      if (poly.length < 3) return null;
+      return (
+      <Line
+        key={`ss-${idx}`}
+        points={toPoints(poly)}
+        closed
+        stroke="#00d26a"
+        fill="rgba(0,210,106,0.38)"
+        opacity={1}
+        strokeWidth={2 / mainViewScale}
+        strokeScaleEnabled={false}
+        listening={false}
+      />
+      );
+    });
+  }, [sourceVoronoiGraph, mainViewScale]);
+
+  const sourceMaskBorderLayer = useMemo(() => {
+    if (!sourceVoronoi?.mask?.length) return null;
+    return (
+      <Line
+        key="source-mask-border"
+        points={toPoints(sourceVoronoi.mask)}
+        closed
+        stroke="#2f80ff"
+        opacity={1}
+        strokeWidth={2.5 / mainViewScale}
+        strokeScaleEnabled={false}
+        listening={false}
+      />
+    );
+  }, [sourceVoronoi, mainViewScale]);
+
+  const sourceMaskFillLayer = useMemo(() => {
+    if (!sourceVoronoi?.mask?.length) return null;
+    return (
+      <Line
+        key="source-mask-fill"
+        points={toPoints(sourceVoronoi.mask)}
+        closed
+        fill="rgba(0,210,106,0.18)"
+        opacity={1}
+        listening={false}
+      />
+    );
+  }, [sourceVoronoi]);
+
+  const sourceVoronoiDebugLayer = useMemo(() => {
+    const rawCount = sourceVoronoi?.cells?.length || 0;
+    const snapCount = sourceVoronoi?.snappedCells?.length || 0;
+    return (
+      <Text
+        x={12}
+        y={12}
+        text={`voronoi:${rawCount} snap:${snapCount}`}
+        fontSize={18 / mainViewScale}
+        fill="#7CFFB2"
+        stroke="#00112b"
+        strokeWidth={3 / mainViewScale}
+        listening={false}
+      />
+    );
+  }, [sourceVoronoi, mainViewScale]);
+
+  const sourceVoronoiVertexLayer = useMemo(() => {
+    if (!sourceVoronoiGraph?.vertices?.length) return null;
+    return sourceVoronoiGraph.vertices.map((v) => (
+      <Circle
+        key={`svh-${v.id}`}
+        x={v.x}
+        y={v.y}
+        radius={3.5 / mainViewScale}
+        fill="#00d26a"
+        stroke="#ffffff"
+        strokeWidth={1 / mainViewScale}
+        strokeScaleEnabled={false}
+        draggable={!edgeMode && !deleteEdgeMode && !addNodeMode}
+        onDragStart={() => {
+          sourceDragSnapshotRef.current = createSourceEditSnapshot();
+        }}
+        onDragMove={(e) => {
+          const target = resolveSourceSnapTarget(e.target.x(), e.target.y(), {
+            excludeVoronoiId: v.id,
+            includeNodes: true,
+            includeVoronoi: false,
+            radius: greenToRedSnapRadius,
+          });
+          const nextTarget =
+            target?.kind === "none"
+              ? { x: e.target.x(), y: e.target.y(), kind: "none", id: null }
+              : target;
+          updateSourceVoronoiVertex(v.id, nextTarget.x, nextTarget.y, {
+            snapTarget: nextTarget,
+          });
+          e.target.x(nextTarget.x);
+          e.target.y(nextTarget.y);
+        }}
+        onDragEnd={(e) => {
+          const target = resolveSourceSnapTarget(e.target.x(), e.target.y(), {
+            excludeVoronoiId: v.id,
+            includeNodes: true,
+            includeVoronoi: false,
+            radius: greenToRedSnapRadius,
+          });
+          const finalTarget =
+            target?.kind === "none"
+              ? { x: e.target.x(), y: e.target.y(), kind: "none", id: null }
+              : target;
+          const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
+          const graph = buildVoronoiVertexGraph(currentVoronoi?.snappedCells || []);
+          let nextVoronoi = currentVoronoi;
+          if (graph.vertices[v.id]) {
+            const nextVertices = graph.vertices.map((item) =>
+              item.id === v.id ? { ...item, x: finalTarget.x, y: finalTarget.y } : { ...item }
+            );
+            nextVoronoi = {
+              ...currentVoronoi,
+              snappedCells: rebuildVoronoiCellsFromGraph(nextVertices, graph.refs),
+            };
+          }
+          updateSourceVoronoiVertex(v.id, finalTarget.x, finalTarget.y, { snapTarget: finalTarget });
+          e.target.x(finalTarget.x);
+          e.target.y(finalTarget.y);
+          commitSourceDragHistory(nodes, segs, nextVoronoi);
+          void persistSourceCacheNow(nodes, segs, nextVoronoi, selectedSource);
+        }}
+      />
+    ));
+  }, [
+    sourceVoronoiGraph,
+    mainViewScale,
+    edgeMode,
+    deleteEdgeMode,
+    addNodeMode,
+    commitSourceDragHistory,
+    createSourceEditSnapshot,
+    greenToRedSnapRadius,
+    nodes,
+    persistSourceCacheNow,
+    resolveSourceSnapTarget,
+    segs,
+    selectedSource,
+    sourceVoronoi,
+    updateSourceVoronoiVertex,
+  ]);
+
+  const regionSnapOverlayLayer = useMemo(() => {
+    const snappedCells = scene?.voronoi?.snapped_cells || [];
+    if (!snappedCells.length) return null;
+    return snappedCells.map((poly, idx) => (
+      <Line
+        key={`region-snap-${idx}`}
+        points={toPoints(poly)}
+        closed
+        stroke="#ff2d55"
+        opacity={1}
+        strokeWidth={1 / mainViewScale}
+        strokeScaleEnabled={false}
+        listening={false}
+      />
+    ));
+  }, [scene, mainViewScale]);
+
+  const regionZoneScene = useMemo(() => buildSnapZoneSceneFromRegionScene(scene), [scene]);
+
+  const zoneVerticesLayer = useMemo(() => {
+    const radius = 10 / Math.max(mainViewScale, 0.1);
+    return Object.entries(zoneVertices || {}).flatMap(([zid, pts]) =>
+      (Array.isArray(pts) ? pts : []).map((pt, idx) => (
+        <Circle
+          key={`zone-vert-${zid}-${idx}`}
+          x={pt[0]}
+          y={pt[1]}
+          radius={radius}
+          fill="#ff3b30"
+          stroke="#ff3b30"
+          strokeWidth={1 / Math.max(mainViewScale, 0.1)}
+          listening={false}
+          opacity={0.9}
+        />
+      ))
+    );
+  }, [zoneVertices, mainViewScale]);
+
+  const regionZoneIndexLayer = useMemo(() => {
+    const snapMap = scene?.snap_region_map || {};
+    const regions = scene?.regions || [];
+    const items = Object.entries(snapMap).map(([zid, regionIds]) => {
+      let sumArea = 0;
+      let sumX = 0;
+      let sumY = 0;
+      (regionIds || []).forEach((ridRaw) => {
+        const rid = parseInt(ridRaw, 10);
+        const poly = regions[rid];
+        if (!poly?.length) return;
+        const { area, cx, cy } = polyCentroid(poly);
+        const w = Math.abs(area) || 1;
+        sumArea += w;
+        sumX += cx * w;
+        sumY += cy * w;
+      });
+      if (sumArea <= 0) return null;
+      return {
+        zid: String(zid),
+        x: sumX / sumArea,
+        y: sumY / sumArea,
+      };
+    }).filter(Boolean);
+    if (!items.length) return null;
+    return items.map((item) => {
+      const text = `${parseInt(item.zid, 10) + 1}`;
+      const size = Math.max(labelFontSize / mainViewScale, 6 / mainViewScale);
+      const metrics = measureText(text, size, labelFontFamily);
+      const isSelected = String(item.zid) === String(selectedZoneId);
+      return (
+        <Text
+          key={`region-zone-label-${item.zid}`}
+          x={item.x}
+          y={item.y}
+          text={text}
+          fill={isSelected ? "#ff3b30" : "#ffffff"}
+          stroke="rgba(0,0,0,0.5)"
+          strokeWidth={1 / mainViewScale}
+          fontSize={size}
+          fontFamily={labelFontFamily}
+          fontStyle="normal"
+          align="center"
+          verticalAlign="middle"
+          offsetX={metrics.width / 2}
+          offsetY={metrics.height / 2}
+          perfectDrawEnabled={false}
+          listening
+          hitStrokeWidth={10 / mainViewScale}
+          onClick={() => {
+            setSelectedZoneId(String(item.zid));
+            centerPackedViewById(String(item.zid));
+          }}
+          onTap={() => {
+            setSelectedZoneId(String(item.zid));
+            centerPackedViewById(String(item.zid));
+          }}
+          onMouseDown={() => {
+            setSelectedZoneId(String(item.zid));
+            centerPackedViewById(String(item.zid));
+          }}
+          onTouchStart={() => {
+            setSelectedZoneId(String(item.zid));
+            centerPackedViewById(String(item.zid));
+          }}
+        />
+      );
+    });
+  }, [scene, mainViewScale, labelFontFamily, labelFontSize, selectedZoneId]);
+
+  const regionSelectedZoneOutlineLayer = useMemo(() => {
+    if (!regionZoneScene?.zone_boundaries || selectedZoneId == null) return null;
+    const paths =
+      regionZoneScene.zone_boundaries?.[selectedZoneId] ||
+      regionZoneScene.zone_boundaries?.[parseInt(selectedZoneId, 10)] ||
+      [];
+    return (paths || []).map((p, idx) => (
+      <Line
+        key={`region-zone-selected-${idx}`}
+        points={toPoints(p)}
+        closed
+        stroke="#ffffff"
+        strokeWidth={20 / mainViewScale}
+        strokeScaleEnabled={false}
+        listening={false}
+      />
+    ));
+  }, [regionZoneScene, selectedZoneId, mainViewScale]);
+
+  const zoneOutlineLayer = useMemo(() => {
+    if (!borderSegments.length) return null;
+    return borderSegments.map((seg, idx) => (
+      <Line
+        key={`zb-outline-${idx}`}
+        points={toPoints(seg)}
+        stroke="#8b1e24"
+        strokeWidth={3 / mainViewScale}
+        strokeScaleEnabled={false}
+        listening={false}
+      />
+    ));
+  }, [borderSegments, mainViewScale]);
 
   function offsetPoints(pts, dx, dy) {
     return (pts || []).map((p) => [p[0] + dx, p[1] + dy]);
@@ -3099,8 +4942,6 @@ export default function App() {
     if (autoFit && (scene?.canvas || scene?.regions?.length)) {
       if (leftTab === 'region') {
         fitMainViewToView(calcBounds(scene.regions || []));
-      } else if (leftTab === 'zone') {
-        fitMainViewToView(calcBoundsFromLines(scene.zone_boundaries));
       } else {
         if (scene?.canvas) {
           fitMainViewToView({ minx: 0, miny: 0, maxx: scene.canvas.w, maxy: scene.canvas.h });
@@ -3122,8 +4963,7 @@ export default function App() {
     <div className="app">
       <div className="content">
         <div className="column-left">
-          <div className="panel toolbar">
-            <button onClick={loadScene}>Load</button>
+          <div className="panel toolbar pack-toolbar-right">
             <button onClick={exportPdf}>Export PDF</button>
             <button
               onClick={() => {
@@ -3134,6 +4974,29 @@ export default function App() {
             >
               Simulate
             </button>
+            <label className="mini-input">
+              Recent files
+              <select
+                value={selectedSource}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setSelectedSource(next);
+                  loadScene(
+                    true,
+                    sourceOnlyMode ? false : leftTab !== "source",
+                    sourceOnlyMode ? false : leftTab !== "source",
+                    false,
+                    next
+                  );
+                }}
+              >
+                {recentFiles.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            </label>
             <div className="toolbar-spacer" />
             {exportMsg ? <div className="meta">{exportMsg}</div> : null}
             {error ? <div className="error">{error}</div> : null}
@@ -3142,8 +5005,7 @@ export default function App() {
           <div className="view-tabs-row">
             <div className="panel view-tabs">
               <button className={leftTab === 'source' ? 'active' : ''} onClick={() => setLeftTab('source')}>Source</button>
-              <button className={leftTab === 'region' ? 'active' : ''} onClick={() => setLeftTab('region')}>Region</button>
-              <button className={leftTab === 'zone' ? 'active' : ''} onClick={() => setLeftTab('zone')}>Zone</button>
+              <button className={leftTab === 'region' ? 'active' : ''} onClick={() => setLeftTab('region')}>Region + Zone</button>
             </div>
             <div className="view-tabs-scale">
               <label htmlFor="source-scale">Scale</label>
@@ -3160,10 +5022,72 @@ export default function App() {
           </div>
 
           {leftTab === 'source' && (
-            <div className={`left ${sceneLoading ? "is-loading" : ""}`} ref={leftRef}>
+            <div className={`left ${leftPanelLoading ? "is-loading" : ""}`} ref={leftRef}>
               <div className="preview-header">
                 <div className="preview-title">Source (Konva)</div>
                 <div className="preview-controls">
+                  <button
+                    className="btn"
+                    onClick={() => saveSourceEditsAndRefreshRegion(selectedSource)}
+                  >
+                    Export
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => resetSourceCacheAndReload(selectedSource)}
+                  >
+                    Reset
+                  </button>
+                  <button
+                    className="icon-button"
+                    title="Undo"
+                    disabled={!sourceUndoStack.length}
+                    onClick={undoSourceEdit}
+                  >
+                    <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+                      <path
+                        d="M8 5 L3 10 L8 15"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                      <path
+                        d="M4 10 H11 C14.3 10 17 12.2 17 15"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </button>
+                  <button
+                    className="icon-button"
+                    title="Redo"
+                    disabled={!sourceRedoStack.length}
+                    onClick={redoSourceEdit}
+                  >
+                    <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+                      <path
+                        d="M12 5 L17 10 L12 15"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                      <path
+                        d="M16 10 H9 C5.7 10 3 12.2 3 15"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </button>
                   <button
                     className={`icon-button ${edgeMode ? "active" : ""}`}
                     title="Create Edge"
@@ -3259,6 +5183,8 @@ export default function App() {
                 x={mainViewPos.x}
                 y={mainViewPos.y}
                 onWheel={handleMainViewWheel}
+                onDragMove={handleMainViewDragMove}
+                onDragEnd={handleMainViewDragMove}
                 onMouseMove={() => {
                     const stage = stageRef.current;
                     const pointer = stage.getPointerPosition();
@@ -3297,12 +5223,14 @@ export default function App() {
                       const key = edgeKey(edgeCandidate.a, edgeCandidate.b);
                       const segSet = new Set(segs.map(([a, b]) => edgeKey(a, b)));
                       if (segSet.has(key)) return;
+                      pushSourceUndoSnapshot(createSourceEditSnapshot());
                       const nextSegs = [...segs, [edgeCandidate.a, edgeCandidate.b]];
                       setSegs(nextSegs);
                       return;
                     }
                     if (deleteEdgeMode) {
                       if (!deleteEdgeCandidate) return;
+                      pushSourceUndoSnapshot(createSourceEditSnapshot());
                       const nextSegs = segs.filter((_, idx) => idx !== deleteEdgeCandidate.idx);
                       const pruned = pruneIsolatedNodes(nodes, nextSegs);
                       setNodes(pruned.nodes);
@@ -3310,6 +5238,7 @@ export default function App() {
                       return;
                     }
                     if (addNodeMode) {
+                      pushSourceUndoSnapshot(createSourceEditSnapshot());
                       const nextNodes = [...nodes, { id: nodes.length, x: world.x, y: world.y }];
                       let nextSegs = [...segs];
                       if (nodes.length) {
@@ -3329,41 +5258,31 @@ export default function App() {
                     }
                   }}
                   ref={stageRef}
-                >
-            <Layer>
-              {scene?.canvas ? (
+                ><Layer>{scene?.canvas ? (
                 <Rect
                   x={0}
                   y={0}
                   width={scene.canvas.w}
                   height={scene.canvas.h}
                   stroke="#ffffff"
-                  strokeWidth={2 / mainViewScale}
+                  strokeWidth={0.5 / mainViewScale}
                   listening={false}
                 />
-              ) : null}
-            </Layer>
-              <Layer>{nodeLayer}</Layer>
-              <Layer>{borderLayer}</Layer>
-              {edgeCandidate ? (
-                <Layer>
-                  <Line
+              ) : null}</Layer><Layer>{nodeLayer}</Layer><Layer>{borderLayer}</Layer>{edgeCandidate ? (
+                <Layer><Line
                     points={[
                       nodes[edgeCandidate.a].x,
                       nodes[edgeCandidate.a].y,
                       nodes[edgeCandidate.b].x,
                       nodes[edgeCandidate.b].y,
                     ]}
-                    stroke="#cfd6ff"
-                    opacity={0.4}
-                    strokeWidth={(1 / mainViewScale) * 2.5}
+                  stroke="#cfd6ff"
+                  opacity={0.4}
+                    strokeWidth={0.5 / mainViewScale}
                     strokeScaleEnabled={false}
-                  />
-                </Layer>
-              ) : null}
-              {deleteEdgeCandidate ? (
-                <Layer>
-                  <Line
+                  /></Layer>
+              ) : null}{deleteEdgeCandidate ? (
+                <Layer><Line
                     points={[
                       nodes[deleteEdgeCandidate.a].x,
                       nodes[deleteEdgeCandidate.a].y,
@@ -3372,13 +5291,10 @@ export default function App() {
                     ]}
                     stroke="#ff3b30"
                     opacity={0.6}
-                    strokeWidth={(1 / mainViewScale) * 2.5}
+                    strokeWidth={0.5 / mainViewScale}
                     strokeScaleEnabled={false}
-                  />
-                </Layer>
-              ) : null}
-              <Layer name="source-overlay">
-                {overlayItems.map((item) =>
+                  /></Layer>
+              ) : null}<Layer name="source-overlay">{overlayItems.map((item) =>
                   item.img ? (
                     <Image
                       key={item.id}
@@ -3433,8 +5349,7 @@ export default function App() {
                       }}
                     />
                   ) : null
-                )}
-                <Transformer
+                )}<Transformer
                   ref={overlayTransformerRef}
                   rotateEnabled
                   enabledAnchors={[
@@ -3447,10 +5362,7 @@ export default function App() {
                     if (newBox.width < 10 || newBox.height < 10) return oldBox;
                     return newBox;
                   }}
-                />
-              </Layer>
-            <Layer>
-              {nodes.map((n) => (
+                /></Layer><Layer>{nodes.map((n) => (
                   <Circle
                     key={`n-${n.id}`}
                     x={n.x}
@@ -3459,44 +5371,59 @@ export default function App() {
                     fill="red"
                     strokeScaleEnabled={false}
                     draggable={!edgeMode && !deleteEdgeMode && !addNodeMode}
+                    onDragStart={() => {
+                      sourceDragSnapshotRef.current = createSourceEditSnapshot();
+                    }}
                     onDragMove={(e) => {
-                    const next = nodes.map((p) =>
-                      p.id === n.id ? { ...p, x: e.target.x(), y: e.target.y() } : p
-                    );
-                    setNodes(next);
-                  }}
-                    onDragEnd={(e) => {
+                      const target = resolveSourceSnapTarget(e.target.x(), e.target.y(), {
+                        excludeNodeId: n.id,
+                        includeNodes: true,
+                        includeVoronoi: false,
+                        radius: liveSnapRadius,
+                      });
+                      e.target.x(target.x);
+                      e.target.y(target.y);
                       const next = nodes.map((p) =>
-                        p.id === n.id ? { ...p, x: e.target.x(), y: e.target.y() } : p
+                        p.id === n.id ? { ...p, x: target.x, y: target.y } : p
                       );
-                      const merged = mergeNodesIfClose(next, segs, n.id, snap);
-                      setNodes(merged.nodes);
-                      setSegs(merged.segs);
+                      setNodes(next);
+                    }}
+                    onDragEnd={(e) => {
+                      const target = resolveSourceSnapTarget(e.target.x(), e.target.y(), {
+                        excludeNodeId: n.id,
+                        includeNodes: true,
+                        includeVoronoi: false,
+                        radius: liveSnapRadius,
+                      });
+                      e.target.x(target.x);
+                      e.target.y(target.y);
+                      const next = nodes.map((p) =>
+                        p.id === n.id ? { ...p, x: target.x, y: target.y } : p
+                      );
+                      setNodes(next);
+                      commitSourceDragHistory(next, segs, sourceVoronoi);
+                      void persistSourceCacheNow(next, segs, sourceVoronoi, selectedSource);
                     }}
                   />
-              ))}
-            </Layer>
-              </Stage>
-              {sceneLoading ? <div className="loading-overlay">Loading...</div> : null}
+              ))}</Layer><Layer name="source-mask-fill-top">{sourceMaskFillLayer}</Layer><Layer name="source-voronoi-top">{sourceVoronoiLayer}</Layer><Layer name="source-snap-top">{sourceSnapLayer}</Layer><Layer name="source-mask-border-top">{sourceMaskBorderLayer}</Layer><Layer name="source-voronoi-debug">{sourceVoronoiDebugLayer}</Layer><Layer name="source-voronoi-vertices">{sourceVoronoiVertexLayer}</Layer></Stage>
+              {renderLoadingOverlay("left")}
               {renderLeftDebug()}
             </div>
           )}
 
           {leftTab === 'region' && (
-            <div className={`preview half ${sceneLoading ? "is-loading" : ""}`} ref={region2WrapRef}>
+            <div className={`preview half ${leftPanelLoading ? "is-loading" : ""}`} ref={region2WrapRef}>
               <div className="preview-header">
-                <div className="preview-title">Region (Konva)</div>
+                <div className="preview-title">Region + Zone (Konva)</div>
                 <div className="preview-controls">
                   <button
                     className="btn"
                     onClick={() => {
-                      saveSvg(nodes, segs, overlayItems).then(async () => {
-                        await saveState();
-                        await loadScene(true, false, true);
-                      });
+                      packFromRegionSnap();
                     }}
+                    disabled={computeBusy}
                   >
-                    Save
+                    {computeBusy ? "Packing..." : "Pack"}
                   </button>
                   <button
                     className="icon-button"
@@ -3519,10 +5446,10 @@ export default function App() {
                   x={mainViewPos.x}
                   y={mainViewPos.y}
                   onWheel={handleMainViewWheel}
+                  onDragMove={handleMainViewDragMove}
+                  onDragEnd={handleMainViewDragMove}
                   ref={region2Ref}
-                >
-                  <Layer>
-                    {scene?.canvas ? (
+                  ><Layer>{scene?.canvas ? (
                       <Rect
                         x={0}
                         y={0}
@@ -3532,194 +5459,85 @@ export default function App() {
                         strokeWidth={2 / mainViewScale}
                         listening={false}
                       />
-                    ) : null}
-                  </Layer>
-                  <Layer>
-                    {scene.regions.map((poly, idx) => (
+                    ) : null}</Layer><Layer>{scene.regions.map((poly, idx) => (
                       <Line
                         key={`r2-${idx}`}
                         points={toPoints(poly)}
                         closed
-                        stroke="#f5f6ff"
-                        fill="#bbb"
+                        stroke="#ffffff"
+                        fill={scene.region_colors?.[idx] || "#bbb"}
                         strokeWidth={1 / mainViewScale}
                         strokeScaleEnabled={false}
                       />
-                    ))}
-                  </Layer>
-                </Stage>
+                    ))}</Layer><Layer name="zone-vertices">{zoneVerticesLayer}</Layer><Layer name="region-zone-index">{regionZoneIndexLayer}</Layer><Layer name="region-snap-overlay">{regionSnapOverlayLayer}</Layer><Layer name="region-zone-selected">{regionSelectedZoneOutlineLayer}</Layer></Stage>
               ) : null}
-              {sceneLoading ? <div className="loading-overlay">Loading...</div> : null}
-              {renderLeftDebug()}
-            </div>
-          )}
-
-          {leftTab === 'zone' && (
-            <div className={`preview half ${sceneLoading ? "is-loading" : ""}`} ref={zoneWrapRef}>
-              <div className="preview-header">
-              <div className="preview-title">Zone (Konva)</div>
-              <div className="preview-controls">
-                <button
-                  className="btn"
-                  onClick={() => loadScene(false, true, false)}
-                >
-                  Compute
-                </button>
-                <button
-                  className="icon-button"
-                  title="Download"
-                    onClick={() =>
-                      downloadStage(zoneRef, "zone-konva.svg", scene?.canvas || null)
-                    }
-                  >
-                    {"\u2193"}
-                  </button>
-                </div>
-              </div>
-              {zoneScene || scene ? (
-                <Stage
-                  width={zoneStageSize.w}
-                  height={zoneStageSize.h}
-                  draggable
-                  scaleX={mainViewScale}
-                  scaleY={mainViewScale}
-                  x={mainViewPos.x}
-                  y={mainViewPos.y}
-                  onWheel={handleMainViewWheel}
-                  ref={zoneRef}
-                >
-                  <Layer>
-              {zoneScene?.canvas || scene?.canvas ? (
-                  <Rect
-                    x={0}
-                    y={0}
-                    width={(zoneScene || scene).canvas.w}
-                    height={(zoneScene || scene).canvas.h}
-                    stroke="#ffffff"
-                    strokeWidth={2 / mainViewScale}
-                    listening={false}
-                  />
-                ) : null}
-              </Layer>
-              <Layer name="zone-image" visible={showImages}>
-                {(zoneScene || scene).region_colors
-                  ? (zoneScene || scene).regions.map((poly, idx) => (
-                      <Line
-                        key={`zf-${idx}`}
-                        points={toPoints(poly)}
-                        closed
-                        fill={(zoneScene || scene).region_colors[idx]}
-                        strokeScaleEnabled={false}
-                        onClick={(e) => handleZoneRegionClick(idx, e)}
-                        onTap={(e) => handleZoneRegionClick(idx, e)}
-                      />
-                    ))
-                  : null}
-              </Layer>
-              <Layer name="zone-overlay">
-                {overlayItems.map((item) =>
-                  item?.img ? (
-                    <Image
-                      key={`zo-${item.id}`}
-                      image={item.img}
-                          x={item.x}
-                          y={item.y}
-                          width={item.width}
-                          height={item.height}
-                          offsetX={item.width / 2}
-                          offsetY={item.height / 2}
-                          scaleX={item.scaleX}
-                          scaleY={item.scaleY}
-                          rotation={item.rotation}
-                          listening={false}
-                        />
-                      ) : null
-                    )}
-                  </Layer>
-                  <Layer name="zone-stroke">
-                    {Object.entries((zoneScene || scene).zone_boundaries || {}).flatMap(
-                      ([zid, paths]) =>
-                      paths.map((p, i) => (
-                        <Line
-                          key={`zb2-${zid}-${i}`}
-                          points={toPoints(p)}
-                          stroke={String(zid) === String(selectedZoneId) ? "#ff3b30" : "#f5f6ff"}
-                          strokeWidth={String(zid) === String(selectedZoneId) ? 6 : 2}
-                          strokeScaleEnabled={false}
-                        />
-                      ))
-                    )}
-                  </Layer>
-                  <Layer name="zone-label" visible={showLabels}>
-                    {Object.entries((zoneScene || scene).zone_labels || {}).map(([zid, lbl]) => {
-                      const center = zoneLabelCenters[String(zid)];
-                      const lx = center?.x ?? lbl.x;
-                      const ly = center?.y ?? lbl.y;
-                      const selectedShuffle =
-                        (zoneScene || scene)?.zone_label_map?.[selectedZoneId] ??
-                        (zoneScene || scene)?.zone_label_map?.[parseInt(selectedZoneId, 10)];
-                      const targetLabel = selectedShuffle != null ? selectedShuffle : selectedZoneId;
-                      const isSelected = String(lbl.label) === String(targetLabel);
-                      const size = Math.max(labelFontSize / mainViewScale, 6 / mainViewScale);
-                      const metrics = measureText(lbl.label, size, labelFontFamily);
-                        return (
-                          <Text
-                            key={`zl-${zid}`}
-                            x={lx}
-                            y={ly}
-                            text={`${lbl.label}`}
-                            fill={isSelected ? "#ff3b30" : "#ffffff"}
-                            fontSize={size}
-                            fontFamily={labelFontFamily}
-                            align="center"
-                            verticalAlign="middle"
-                            offsetX={metrics.width / 2}
-                            offsetY={metrics.height / 2}
-                            listening
-                            hitStrokeWidth={10 / mainViewScale}
-                            onClick={() => {
-                              setSelectedZoneId(String(zid));
-                            }}
-                            onTap={() => {
-                              setSelectedZoneId(String(zid));
-                            }}
-                            onMouseDown={() => {
-                              setSelectedZoneId(String(zid));
-                            }}
-                            onTouchStart={() => {
-                              setSelectedZoneId(String(zid));
-                            }}
-                          />
-                        );
-                    })}
-                  </Layer>
-                </Stage>
-              ) : null}
-              {sceneLoading ? <div className="loading-overlay">Loading...</div> : null}
+              {renderLoadingOverlay("left")}
               {renderLeftDebug()}
             </div>
           )}
         </div>
         <div className="right">
-          <div className="panel view-tabs">
-            <button
-              className={rightTab === "packed" ? "active" : ""}
-              onClick={() => setRightTab("packed")}
-            >
-              Packed
-            </button>
-            <button
-              className={rightTab === "box" ? "active" : ""}
-              onClick={() => setRightTab("box")}
-            >
-              Box
-            </button>
+          {!sourceOnlyMode ? (
+          <div className="panel toolbar">
+            <div className="toolbar-segmented">
+              {Object.entries(PACK_PRESETS).map(([key, cfg]) => (
+                <button
+                  key={key}
+                  className={packPreset === key ? "active" : ""}
+                  title={`Grid ${cfg.grid} | Angle ${cfg.angle}°`}
+                  onClick={() => applyPackPreset(key, true)}
+                >
+                  {cfg.label}
+                </button>
+              ))}
+            </div>
+            <label className="toolbar-mini-input">
+              Margin X
+              <input
+                type="number"
+                min="0"
+                step="1"
+                value={packMarginX}
+                onChange={(e) => setPackMarginX(Math.max(0, parseInt(e.target.value || "0", 10) || 0))}
+              />
+            </label>
+            <label className="toolbar-mini-input">
+              Margin Y
+              <input
+                type="number"
+                min="0"
+                step="1"
+                value={packMarginY}
+                onChange={(e) => setPackMarginY(Math.max(0, parseInt(e.target.value || "0", 10) || 0))}
+              />
+            </label>
+            <button onClick={() => repackCurrentPacked(enableBleed)}>Repack</button>
           </div>
-          <div className={`preview region-stage ${sceneLoading ? "is-loading" : ""}`} ref={regionWrapRef} style={{ height: '100%'}}>
+          ) : null}
+          <div className={`preview region-stage ${rightPanelLoading ? "is-loading" : ""}`} ref={regionWrapRef} style={{ height: '100%'}}>
             <div className="preview-header">
-              <div className="preview-title">
-                {rightTab === "packed" ? "Packed (Konva)" : "Packed (Box)"}
+              <div className="preview-title packed-title-row">
+                <span>Packed (Konva)</span>
+                {!sourceOnlyMode ? (
+                  <>
+                    <button
+                      className={`icon-button ${packedEditMode === "move" ? "active" : ""}`}
+                      onClick={() => setPackedEditMode((m) => (m === "move" ? "none" : "move"))}
+                      title="Move zone"
+                    >
+                      Move
+                    </button>
+                    <button
+                      className={`icon-button ${packedEditMode === "rotate" ? "active" : ""}`}
+                      onClick={() => setPackedEditMode((m) => (m === "rotate" ? "none" : "rotate"))}
+                      title="Rotate zone"
+                    >
+                      Rotate
+                    </button>
+                  </>
+                ) : null}
               </div>
+              {!sourceOnlyMode ? (
               <div className="preview-controls">
                 <label className="checkbox">
                   <input
@@ -3751,6 +5569,18 @@ export default function App() {
                   />
                   Label
                 </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={enableBleed}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setEnableBleed(checked);
+                      repackCurrentPacked(checked);
+                    }}
+                  />
+                  Bleed
+                </label>
                 <label className="mini-input">
                   Font
                   <select
@@ -3772,8 +5602,11 @@ export default function App() {
                     type="number"
                     min="4"
                     max="64"
-                    value={labelFontSize}
-                    onChange={(e) => setLabelFontSize(parseFloat(e.target.value || "12"))}
+                    value={toFinite(labelFontSize, 12)}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      setLabelFontSize(toFinite(v, 12));
+                    }}
                   />
                 </label>
                 <button
@@ -3782,7 +5615,7 @@ export default function App() {
                   onClick={() =>
                     downloadStage(
                       regionRef,
-                      rightTab === "box" ? "packed-bbox-konva.svg" : "packed-konva.svg",
+                      "packed-konva.svg",
                       scene?.canvas ? { w: scene.canvas.w, h: scene.canvas.h } : null
                     )
                   }
@@ -3790,21 +5623,43 @@ export default function App() {
                   {"\u2193"}
                 </button>
               </div>
+              ) : null}
             </div>
-            {packedSource ? (
+            {showRasterTemp ? (
+              <div
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  overflow: "hidden",
+                }}
+              >
+                <img
+                  src={rasterTempSrc || "/out/tmp_raster_pack.png"}
+                  alt="Raster temp"
+                  style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+                />
+              </div>
+            ) : packedSource ? (
               <Stage
                 width={regionStageSize.w}
                 height={regionStageSize.h}
-                  draggable
+                  draggable={packedEditMode === "none"}
                   scaleX={regionScale}
                   scaleY={regionScale}
                   x={regionPos.x}
                   y={regionPos.y}
                   onWheel={handleRegionWheel}
+                  onDragMove={handleRegionDragMove}
+                  onDragEnd={handleRegionDragMove}
+                  onMouseMove={handlePackedStageMouseMove}
+                  onMouseUp={handlePackedStageMouseUp}
+                  onTouchMove={handlePackedStageMouseMove}
+                  onTouchEnd={handlePackedStageMouseUp}
                 ref={regionRef}
-              >
-                <Layer>
-                  {packedSource?.canvas ? (
+              ><Layer>{packedSource?.canvas ? (
                     <>
                       <Rect
                         x={0}
@@ -3816,76 +5671,97 @@ export default function App() {
                         listening={false}
                       />
                     </>
-                  ) : null}
-                </Layer>
-                {rightTab === "packed" ? (
-                <Layer name="packed-image" visible={showImages}>
-                  <>
-                    <Group
-                      x={(packedSource?.canvas?.w || 0) / 2}
-                      y={(packedSource?.canvas?.h || 0) / 2}
-                      offsetX={(packedSource?.canvas?.w || 0) / 2}
-                      offsetY={(packedSource?.canvas?.h || 0) / 2}
-                    >
-                      {packedFillPaths.map((p, idx) => (
-                        <Path
-                          key={`fill-path-${idx}`}
-                          data={p.d}
-                          fill={p.fill}
+                  ) : null}</Layer>{rightTab === "packed" ? (
+                <Layer name="packed-image" visible={showImages}>{hasManualPackedEdits ? (
+                    <>
+                      {enableBleed &&
+                        packedLiveBleedItems.map((it) => (
+                        <Line
+                          key={it.key}
+                          points={it.points}
+                          closed
+                          fill={it.fill}
+                          opacity={0.42}
+                          listening={false}
+                        />
+                      ))}
+                      {packedLiveFillItems.map((it) => (
+                        <Line
+                          key={it.key}
+                          points={it.points}
+                          closed
+                          fill={it.fill}
                           strokeWidth={0}
                           listening={false}
                         />
                       ))}
-                      {packedBleedPaths.map((p, idx) => (
-                        <Path
-                          key={`bleed-path-${idx}`}
-                          data={p.d}
-                          fill={p.fill}
-                          strokeWidth={0}
-                          listening={false}
-                        />
-                      ))}
-                    </Group>
-                    <Group
-                      x={(packedSource?.canvas?.w || 0) / 2 + (packedSource?.canvas?.w || 0) + 40}
-                      y={(packedSource?.canvas?.h || 0) / 2}
-                      offsetX={(packedSource?.canvas?.w || 0) / 2}
-                      offsetY={(packedSource?.canvas?.h || 0) / 2}
-                    >
-                      {packedFillPaths2.map((p, idx) => (
-                        <Path
-                          key={`fill-path-2-${idx}`}
-                          data={p.d}
-                          fill={p.fill}
-                          strokeWidth={0}
-                          listening={false}
-                        />
-                      ))}
-                      {packedBleedPaths2.map((p, idx) => (
-                        <Path
-                          key={`bleed-path-2-${idx}`}
-                          data={p.d}
-                          fill={p.fill}
-                          strokeWidth={0}
-                          listening={false}
-                        />
-                      ))}
-                    </Group>
-                  </>
-                </Layer>
-                ) : null}
-                {rightTab === "packed" && packedLabelSnappedAll.length ? (
-                <Layer name="packed-label-snapped">
-                  {packedLabelSnappedAll.map((lbl) => {
+                    </>
+                  ) : (
+                    <>
+                      <Group
+                        x={(packedSource?.canvas?.w || 0) / 2}
+                        y={(packedSource?.canvas?.h || 0) / 2}
+                        offsetX={(packedSource?.canvas?.w || 0) / 2}
+                        offsetY={(packedSource?.canvas?.h || 0) / 2}
+                      >
+                        {packedFillPaths.map((p, idx) => (
+                          <Path
+                            key={`fill-path-${idx}`}
+                            data={p.d}
+                            fill={p.fill}
+                            strokeWidth={0}
+                            listening={false}
+                          />
+                        ))}
+                        {enableBleed &&
+                          packedBleedPaths.map((p, idx) => (
+                          <Path
+                            key={`bleed-path-${idx}`}
+                            data={p.d}
+                            fill={p.fill}
+                            listening={false}
+                          />
+                        ))}
+                      </Group>
+                      <Group
+                        x={(packedSource?.canvas?.w || 0) / 2 + (packedSource?.canvas?.w || 0) + 40}
+                        y={(packedSource?.canvas?.h || 0) / 2}
+                        offsetX={(packedSource?.canvas?.w || 0) / 2}
+                        offsetY={(packedSource?.canvas?.h || 0) / 2}
+                      >
+                        {packedFillPaths2.map((p, idx) => (
+                          <Path
+                            key={`fill-path2-${idx}`}
+                            data={p.d}
+                            fill={p.fill}
+                            strokeWidth={0}
+                            listening={false}
+                          />
+                        ))}
+                        {enableBleed &&
+                          packedBleedPaths2.map((p, idx) => (
+                          <Path
+                            key={`bleed-path2-${idx}`}
+                            data={p.d}
+                            fill={p.fill}
+                            listening={false}
+                          />
+                        ))}
+                      </Group>
+                    </>
+                  )}</Layer>
+                ) : null}{rightTab === "packed" && packedIndexItems.length ? (
+                <Layer name="packed-label-snapped" visible={showLabels}>{packedIndexItems.map((lbl) => {
                     const size = Math.max(labelFontSize / regionScale, 6 / regionScale);
                     const metrics = measureText(lbl.label, size, labelFontFamily);
+                    const isSelected = String(lbl.zid) === String(selectedZoneId);
                     return (
                       <Text
                         key={`psnap-${lbl.zid}`}
                         x={lbl.x}
                         y={lbl.y}
                         text={lbl.label}
-                        fill="#ffffff"
+                        fill={isSelected ? "#ff3b30" : "#ffffff"}
                         stroke="rgba(0,0,0,0.5)"
                         strokeWidth={1 / regionScale}
                         fontSize={size}
@@ -3894,15 +5770,17 @@ export default function App() {
                         verticalAlign="middle"
                         offsetX={metrics.width / 2}
                         offsetY={metrics.height / 2}
-                        listening={false}
+                        listening
+                        hitStrokeWidth={10 / regionScale}
+                        onClick={() => handlePackedZoneSelect(lbl.zid)}
+                        onTap={() => handlePackedZoneSelect(lbl.zid)}
+                        onMouseDown={() => handlePackedZoneSelect(lbl.zid)}
+                        onTouchStart={() => handlePackedZoneSelect(lbl.zid)}
                       />
                     );
-                  })}
-                </Layer>
-                ) : null}
-                {rightTab === "packed" ? (
-                <Layer name="packed-overlay">
-                  {overlayItems.map((item) => {
+                  })}</Layer>
+                ) : null}{rightTab === "packed" ? (
+                <Layer name="packed-overlay">{overlayItems.map((item) => {
                     if (!item?.img || item.zid == null) return null;
                     const packed = transformOverlayToPacked(item);
                     const bin =
@@ -3926,85 +5804,93 @@ export default function App() {
                         listening={false}
                       />
                     );
-                  })}
-                </Layer>
-                ) : null}
-                {rightTab === "packed" ? (
-                <Layer name="packed-stroke" visible={showStroke}>
-                  {Object.entries(packedSource.zone_boundaries || {}).flatMap(([zid, paths]) => {
-                    const bin =
-                      packedSource?.placement_bin?.[zid] ??
-                      packedSource?.placement_bin?.[parseInt(zid, 10)];
-                    const page = bin === 1 ? 1 : 0;
-                    const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
-                      return (paths || []).map((p, i) => {
-                        const shift =
-                          packedSource.zone_shift?.[zid] ||
-                          packedSource.zone_shift?.[parseInt(zid, 10)];
-                        if (!shift) return null;
-                        const rot =
-                          packedSource.zone_rot?.[zid] ??
-                          packedSource.zone_rot?.[parseInt(zid, 10)] ??
-                          0;
-                        const center =
-                          packedSource.zone_center?.[zid] ||
-                          packedSource.zone_center?.[parseInt(zid, 10)] ||
-                          [0, 0];
-                        const tpts = transformPath(p, shift, rot, center);
-                        const isSelected = String(zid) === String(selectedZoneId);
+                  })}</Layer>
+                ) : null}{rightTab === "packed" ? (
+                <Layer name="packed-stroke" visible={showStroke}>{packedZoneOutlineItems.map((item) => {
+                    const isSelected = String(item.zid) === String(selectedZoneId);
+                    return (
+                      <Line
+                        key={`pz-outline-${item.zid}-${item.idx}`}
+                        points={toPoints(item.offsetPts)}
+                        closed
+                        stroke={isSelected ? "#ff3b30" : "#ffffff"}
+                        strokeWidth={isSelected ? 3 : 1}
+                        strokeScaleEnabled={false}
+                        listening={false}
+                      />
+                    );
+                  })}</Layer>
+                ) : null}{rightTab === "packed" && packedLowAreaWarnings.length ? (
+                <Layer name="packed-warning">{packedLowAreaWarnings.map((w) => {
+                    const size = Math.max(28 / regionScale, 16 / regionScale);
+                    const pad = Math.max(2 / regionScale, 1 / regionScale);
+                    const triH = size * 0.8660254037844386;
+                    const cx = w.maxx - pad - size / 2;
+                    const cy = w.miny + pad + triH / 2;
+                    return (
+                      <React.Fragment key={`pw-${w.zid}`}>
+                        <Line
+                          points={[
+                            cx, cy - triH / 2,
+                            cx - size / 2, cy + triH / 2,
+                            cx + size / 2, cy + triH / 2,
+                          ]}
+                          closed
+                          fill="#ffd400"
+                          stroke="#5a4a00"
+                          strokeWidth={1 / regionScale}
+                          strokeScaleEnabled={false}
+                          listening={false}
+                        />
+                        <Text
+                          x={cx}
+                          y={cy + triH * 0.18}
+                          text="!"
+                          fill="#2a2100"
+                          fontSize={Math.max(10 / regionScale, 6 / regionScale)}
+                          fontFamily={labelFontFamily}
+                          align="center"
+                          verticalAlign="middle"
+                          offsetX={0}
+                          offsetY={0}
+                          listening={false}
+                        />
+                      </React.Fragment>
+                    );
+                  })}</Layer>
+                ) : null}{rightTab === "packed" ? (
+                <Layer name="packed-hit">{packedZoneOutlineItems.map((item) => (
+                    <Line
+                      key={`pz-hit-${item.zid}-${item.idx}`}
+                      points={toPoints(item.offsetPts)}
+                      closed
+                      fill="rgba(0,0,0,0)"
+                      stroke="rgba(0,0,0,0)"
+                      strokeWidth={8 / regionScale}
+                      strokeScaleEnabled={false}
+                      onClick={() => handlePackedZoneSelect(item.zid)}
+                      onTap={() => handlePackedZoneSelect(item.zid)}
+                      onMouseDown={(e) => beginPackedEdit(item.zid, e)}
+                      onTouchStart={(e) => beginPackedEdit(item.zid, e)}
+                    />
+                  ))}</Layer>
+                ) : null}{rightTab === "box" ? (
+                <Layer name="packed-bbox">{showStroke
+                    ? packedZoneOutlineItems.map((item) => {
+                        const isSelected = String(item.zid) === String(selectedZoneId);
                         return (
                           <Line
-                            key={`pz-outline-${zid}-${i}`}
-                            points={toPoints(offsetPoints(tpts, xOffset, 0))}
-                            stroke={isSelected ? "#ff3b30" : "#f5f6ff"}
+                            key={`pb-outline-${item.zid}-${item.idx}`}
+                            points={toPoints(item.offsetPts)}
+                            closed
+                            stroke={isSelected ? "#ff3b30" : "#ffffff"}
                             strokeWidth={isSelected ? 3 : 1}
                             strokeScaleEnabled={false}
                             listening={false}
                           />
                         );
-                      });
-                  })}
-                </Layer>
-                ) : null}
-                {rightTab === "packed" ? (
-                <Layer name="packed-hit">
-                  {Object.entries(packedSource.zone_boundaries || {}).flatMap(([zid, paths]) => {
-                    const bin =
-                      packedSource?.placement_bin?.[zid] ??
-                      packedSource?.placement_bin?.[parseInt(zid, 10)];
-                    const page = bin === 1 ? 1 : 0;
-                    const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
-                    return (paths || []).map((p, i) => {
-                      const shift =
-                        packedSource.zone_shift?.[zid] ||
-                        packedSource.zone_shift?.[parseInt(zid, 10)];
-                      if (!shift) return null;
-                      const rot =
-                        packedSource.zone_rot?.[zid] ??
-                        packedSource.zone_rot?.[parseInt(zid, 10)] ??
-                        0;
-                      const center =
-                        packedSource.zone_center?.[zid] ||
-                        packedSource.zone_center?.[parseInt(zid, 10)] ||
-                        [0, 0];
-                      const tpts = transformPath(p, shift, rot, center);
-                      return (
-                        <Line
-                          key={`pz-hit-${zid}-${i}`}
-                          points={toPoints(offsetPoints(tpts, xOffset, 0))}
-                          stroke="rgba(0,0,0,0)"
-                          strokeWidth={8 / regionScale}
-                          strokeScaleEnabled={false}
-                          onClick={() => setSelectedZoneId(String(zid))}
-                        />
-                      );
-                      });
-                  })}
-                </Layer>
-                ) : null}
-                {rightTab === "box" ? (
-                <Layer name="packed-bbox">
-                  {packedEmptyCellsDerived.map((cell, idx) => (
+                      })
+                    : null}{packedEmptyCellsDerived.map((cell, idx) => (
                     <Circle
                       key={`pcell-${idx}`}
                       x={cell[0]}
@@ -4015,8 +5901,7 @@ export default function App() {
                       fill="rgba(0,194,255,0.12)"
                       listening={false}
                     />
-                  ))}
-                  {packedBoxData.map((box) => {
+                  ))}{packedBoxData.map((box) => {
                     const w = Math.max(0, box.maxx - box.minx);
                     const h = Math.max(0, box.maxy - box.miny);
                     const size = Math.max(10 / regionScale, 6 / regionScale);
@@ -4051,14 +5936,12 @@ export default function App() {
                         ) : null}
                       </React.Fragment>
                     );
-                  })}
-                </Layer>
-                ) : null}
-              </Stage>
+                  })}</Layer>
+                ) : null}</Stage>
             ) : null}
-            {sceneLoading ? <div className="loading-overlay">Loading...</div> : null}
-            {packedBleedError ? <div className="error">{packedBleedError}</div> : null}
-            {packedBleedError2 ? <div className="error">{packedBleedError2}</div> : null}
+            {renderLoadingOverlay("right")}
+            {enableBleed && packedBleedError ? <div className="error">{packedBleedError}</div> : null}
+            {enableBleed && packedBleedError2 ? <div className="error">{packedBleedError2}</div> : null}
           </div>
         </div>
       </div>
@@ -4066,7 +5949,9 @@ export default function App() {
         <div className="modal-backdrop">
           <div className="modal">
             <div className="modal-title">
-              {exportPdfLoading ? "Creating PDF..." : "Successful created PDF !"}
+              {exportPdfLoading
+                ? `Creating PDF... ${Math.max(0, 60 - exportPdfTiming.elapsedMs / 1000).toFixed(1)}s`
+                : "Successful created PDF !"}
             </div>
             {!exportPdfLoading && exportPdfInfo ? (
               <div className="modal-actions">
@@ -4151,3 +6036,5 @@ export default function App() {
     </div>
   );
 }
+
+

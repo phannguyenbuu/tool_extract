@@ -1,32 +1,42 @@
 from __future__ import annotations
 
 import json
+import math
+import random
 from collections import defaultdict
 from typing import DefaultDict, Dict, List, Tuple
 
 import cv2
 import numpy as np
-from shapely.geometry import Polygon
+from scipy.spatial import Voronoi
+from shapely.geometry import MultiPolygon, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 from . import config
 
 
-def build_zones(polys: List[List[Tuple[float, float]]], target: int) -> List[int]:
-    if not polys:
-        return []
-    minx = min(p[0] for poly in polys for p in poly)
-    miny = min(p[1] for poly in polys for p in poly)
-    maxx = max(p[0] for poly in polys for p in poly)
-    maxy = max(p[1] for poly in polys for p in poly)
-    cell_w = (maxx - minx) / config.GRID_X
-    cell_h = (maxy - miny) / config.GRID_Y
+def _clean_polygon(poly: Polygon | BaseGeometry | None) -> Polygon | None:
+    if poly is None or poly.is_empty:
+        return None
+    geom = poly if poly.is_valid else poly.buffer(0)
+    if geom.is_empty:
+        return None
+    if isinstance(geom, MultiPolygon):
+        geom = max(geom.geoms, key=lambda g: g.area, default=None)
+    if geom is None or geom.is_empty:
+        return None
+    if not isinstance(geom, Polygon):
+        hull = geom.convex_hull
+        if hull.is_empty or not isinstance(hull, Polygon):
+            return None
+        geom = hull
+    if geom.area <= 1e-6:
+        return None
+    return geom
 
-    zones: List[List[int]] = []
-    zone_id = [-1] * len(polys)
-    poly_objs = [Polygon(p) for p in polys]
 
+def _build_region_adjacency(poly_objs: List[Polygon]) -> List[List[int]]:
     adj: List[List[int]] = [[] for _ in poly_objs]
     bounds = [p.bounds if not p.is_empty else (0.0, 0.0, 0.0, 0.0) for p in poly_objs]
     for i in range(len(poly_objs)):
@@ -47,32 +57,212 @@ def build_zones(polys: List[List[Tuple[float, float]]], target: int) -> List[int
             if inter.length > config.MIDPOINT_EPS:
                 adj[i].append(j)
                 adj[j].append(i)
+    return adj
 
-    for gy in range(config.GRID_Y):
-        for gx in range(config.GRID_X):
-            x0 = minx + gx * cell_w
-            y0 = miny + gy * cell_h
-            x1 = x0 + cell_w
-            y1 = y0 + cell_h
-            cell = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
-            members = []
-            for rid, poly in enumerate(poly_objs):
-                if zone_id[rid] != -1:
-                    continue
-                if poly.intersects(cell):
-                    members.append(rid)
-            if members:
-                zid = len(zones)
-                zones.append(members)
-                for rid in members:
-                    zone_id[rid] = zid
 
-    split_zones: List[List[int]] = []
-    for members in zones:
+def _generate_points_in_geom(boundary: BaseGeometry, count: int, rng: random.Random) -> List[Tuple[float, float]]:
+    minx, miny, maxx, maxy = boundary.bounds
+    pts: List[Tuple[float, float]] = []
+    attempts = 0
+    max_attempts = max(2000, count * 400)
+    while len(pts) < count and attempts < max_attempts:
+        attempts += 1
+        x = rng.uniform(minx, maxx)
+        y = rng.uniform(miny, maxy)
+        if boundary.covers(Point(x, y)):
+            pts.append((float(x), float(y)))
+    if len(pts) >= count:
+        return pts
+    centroids: List[Tuple[float, float]] = []
+    if isinstance(boundary, MultiPolygon):
+        parts = [p for p in boundary.geoms if not p.is_empty and p.area > 1e-6]
+    elif isinstance(boundary, Polygon):
+        parts = [boundary]
+    else:
+        parts = []
+    for part in parts:
+        c = part.representative_point()
+        centroids.append((float(c.x), float(c.y)))
+    for pt in centroids:
+        if len(pts) >= count:
+            break
+        pts.append(pt)
+    while len(pts) < count:
+        if centroids:
+            pts.append(centroids[len(pts) % len(centroids)])
+        else:
+            pts.append((float(minx), float(miny)))
+    return pts[:count]
+
+
+def _voronoi_finite_polygons_2d(vor: Voronoi, radius: float | None = None) -> Tuple[List[List[int]], np.ndarray]:
+    if vor.points.shape[1] != 2:
+        raise ValueError("Voronoi input must be 2D")
+    new_regions: List[List[int]] = []
+    new_vertices = vor.vertices.tolist()
+    center = vor.points.mean(axis=0)
+    if radius is None:
+        radius = float(np.ptp(vor.points, axis=0).max() * 2.0)
+
+    all_ridges: Dict[int, List[Tuple[int, int, int]]] = defaultdict(list)
+    for (p1, p2), (v1, v2) in zip(vor.ridge_points, vor.ridge_vertices):
+        all_ridges[p1].append((p2, v1, v2))
+        all_ridges[p2].append((p1, v1, v2))
+
+    for point_index, region_index in enumerate(vor.point_region):
+        region = vor.regions[region_index]
+        if not region:
+            new_regions.append([])
+            continue
+        if all(v >= 0 for v in region):
+            new_regions.append(region)
+            continue
+
+        ridges = all_ridges.get(point_index, [])
+        new_region = [v for v in region if v >= 0]
+        for neighbor_index, v1, v2 in ridges:
+            if v1 >= 0 and v2 >= 0:
+                continue
+            tangent = vor.points[neighbor_index] - vor.points[point_index]
+            norm = np.linalg.norm(tangent)
+            if norm == 0:
+                continue
+            tangent /= norm
+            normal = np.array([-tangent[1], tangent[0]])
+            midpoint = vor.points[[point_index, neighbor_index]].mean(axis=0)
+            direction = np.sign(np.dot(midpoint - center, normal)) * normal
+            finite_vertex = vor.vertices[v1 if v1 >= 0 else v2]
+            far_point = finite_vertex + direction * radius
+            new_vertices.append(far_point.tolist())
+            new_region.append(len(new_vertices) - 1)
+
+        vs = np.asarray([new_vertices[v] for v in new_region])
+        c = vs.mean(axis=0)
+        angles = np.arctan2(vs[:, 1] - c[1], vs[:, 0] - c[0])
+        new_region = [v for _, v in sorted(zip(angles, new_region))]
+        new_regions.append(new_region)
+
+    return new_regions, np.asarray(new_vertices)
+
+
+def _build_voronoi_cells(poly_objs: List[Polygon], target: int) -> List[Polygon]:
+    valid_polys = [p for p in poly_objs if not p.is_empty and p.area > 1e-6]
+    if not valid_polys:
+        return []
+    boundary = unary_union(valid_polys)
+    boundary = boundary.buffer(0)
+    if boundary.is_empty:
+        return []
+    seed_count = max(1, min(int(target), len(valid_polys)))
+    rng = random.Random(42)
+    best_cells: List[Polygon] = []
+    best_score = float("inf")
+    for _ in range(12):
+        seeds = _generate_points_in_geom(boundary, seed_count, rng)
+        if len(seeds) < 4:
+            break
+        try:
+            vor = Voronoi(np.asarray(seeds, dtype=float))
+            regions, vertices = _voronoi_finite_polygons_2d(vor)
+        except Exception:
+            continue
+        cells: List[Polygon] = []
+        for region in regions:
+            if not region:
+                continue
+            try:
+                clipped = Polygon(vertices[region]).buffer(0).intersection(boundary).buffer(0)
+            except Exception:
+                continue
+            cell = _clean_polygon(clipped)
+            if cell is not None:
+                cells.append(cell)
+        if not cells:
+            continue
+        areas = [c.area for c in cells if c.area > 1e-6]
+        if not areas:
+            continue
+        avg = float(sum(areas) / len(areas))
+        std = float(np.std(areas)) if len(areas) > 1 else 0.0
+        score = abs(len(cells) - seed_count) * 500.0 + std + abs(avg * len(cells) - boundary.area) * 0.01
+        if score < best_score:
+            best_score = score
+            best_cells = cells
+        if len(cells) == seed_count:
+            break
+    if best_cells:
+        return best_cells
+    centroid_cells: List[Polygon] = []
+    for poly in valid_polys[:seed_count]:
+        rep = poly.representative_point()
+        buf = rep.buffer(max(1.0, math.sqrt(max(poly.area, 1.0)) * 0.5))
+        cell = _clean_polygon(buf.intersection(boundary))
+        if cell is not None:
+            centroid_cells.append(cell)
+    return centroid_cells
+
+
+def _assign_regions_to_voronoi_cells(poly_objs: List[Polygon], cells: List[Polygon]) -> List[int]:
+    if not poly_objs:
+        return []
+    if not cells:
+        return list(range(len(poly_objs)))
+    zone_id = [-1] * len(poly_objs)
+    cell_centroids = [cell.representative_point() for cell in cells]
+    for rid, poly in enumerate(poly_objs):
+        if poly.is_empty:
+            continue
+        rp = poly.representative_point()
+        assigned = None
+        for zid, cell in enumerate(cells):
+            if cell.covers(rp):
+                assigned = zid
+                break
+        if assigned is None:
+            best_overlap = -1.0
+            for zid, cell in enumerate(cells):
+                try:
+                    overlap = poly.intersection(cell).area
+                except Exception:
+                    overlap = 0.0
+                if overlap > best_overlap + 1e-9:
+                    best_overlap = overlap
+                    assigned = zid
+        if assigned is None:
+            best_dist = float("inf")
+            for zid, pt in enumerate(cell_centroids):
+                dx = float(pt.x) - float(rp.x)
+                dy = float(pt.y) - float(rp.y)
+                dist = dx * dx + dy * dy
+                if dist < best_dist:
+                    best_dist = dist
+                    assigned = zid
+        zone_id[rid] = int(assigned if assigned is not None else rid)
+    return zone_id
+
+
+def build_zones(polys: List[List[Tuple[float, float]]], target: int) -> List[int]:
+    if not polys:
+        return []
+
+    poly_objs = [_clean_polygon(Polygon(p)) or Polygon() for p in polys]
+    adj = _build_region_adjacency(poly_objs)
+    voronoi_cells = _build_voronoi_cells(poly_objs, target)
+    zone_id = _assign_regions_to_voronoi_cells(poly_objs, voronoi_cells)
+
+    zones: List[List[int]] = []
+    grouped: Dict[int, List[int]] = {}
+    for rid, zid in enumerate(zone_id):
+        if zid < 0:
+            continue
+        grouped.setdefault(zid, []).append(rid)
+    for zid in sorted(grouped.keys()):
+        members = grouped[zid]
         if not members:
             continue
         member_set = set(members)
         seen: set[int] = set()
+        components: List[List[int]] = []
         for rid in members:
             if rid in seen:
                 continue
@@ -86,14 +276,22 @@ def build_zones(polys: List[List[Tuple[float, float]]], target: int) -> List[int
                     if nb in member_set and nb not in seen:
                         seen.add(nb)
                         stack.append(nb)
-            split_zones.append(comp)
-    zones = split_zones
+            components.append(comp)
+        if not components:
+            continue
+        components.sort(
+            key=lambda comp: sum(poly_objs[r].area for r in comp if not poly_objs[r].is_empty),
+            reverse=True,
+        )
+        for comp in components:
+            zones.append(comp)
+
     zone_id = [-1] * len(polys)
     for zid, members in enumerate(zones):
         for rid in members:
             zone_id[rid] = zid
 
-    remaining = [rid for rid, zid in enumerate(zone_id) if zid == -1]
+    remaining = [rid for rid, zid in enumerate(zone_id) if zid == -1 and not poly_objs[rid].is_empty]
     for rid in remaining:
         c = poly_objs[rid].centroid
         best = None
