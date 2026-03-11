@@ -18,6 +18,35 @@ BORDER_THICK = 20
 
 
 # ---------- helpers ----------
+def find_label_position_dt(group_mask, bbox):
+    """
+    Dung Distance Transform de tim 'Pole of Inaccessibility' (iem sau nhat).
+    Nhanh hon va chinh xac hon quet luoi vector.
+    """
+    xmin, ymin, xmax, ymax = bbox
+    # Crop mask de xu ly nhanh hon
+    x0, y0, x1, y1 = int(xmin), int(ymin), int(xmax), int(ymax)
+    h, w = group_mask.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    
+    crop = group_mask[y0:y1, x0:x1]
+    if crop.size == 0:
+        return (xmin + xmax) / 2, (ymin + ymax) / 2
+
+    # Distance Transform tren vung group
+    dist_map = cv2.distanceTransform(crop, cv2.DIST_L2, 5)
+    _, max_val, _, max_loc = cv2.minMaxLoc(dist_map)
+    
+    # Neu iem sau nhat co ban kinh > 2px, dung no
+    if max_val > 2.0:
+        return float(max_loc[0] + x0), float(max_loc[1] + y0)
+    
+    # Fallback: Neu ben trong qua hep, tim vung trong gan do nhat (ben ngoai)
+    # Nhung hien tai uu tien dung tam bbox cho an toan
+    return (xmin + xmax) / 2, (ymin + ymax) / 2
+
+
 def _build_group_patches(group_to_regions, max_width, max_height):
     group_patches = []
     
@@ -138,187 +167,100 @@ def build_layout_canvas(
 
     canvas_fill = np.full((canvas_h, canvas_w, 3), 255, np.uint8)
     canvas_line = np.full((canvas_h, canvas_w, 3), 255, np.uint8)
+    
+    # NEW: Raster toan bo truoc e lay Global Occupied Mask
+    global_occupied_mask = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    group_masks = {} # Luu lai mask tung group e dung sau
+
     bleed_contours_by_gid: Dict[int, List[np.ndarray]] = {}
     num_groups = len(scaled_patches)
     print(f"[layout] total groups: {num_groups}")
 
+    # --- PASS 1: Ve toan bo va build Global Mask ---
     for gidx, (gid, regs, sw, sh) in enumerate(scaled_patches):
-        if gid not in placements_map:
-            continue
-
-        print(f"[layout] group {gidx+1}/{num_groups} (gid={gid})")
+        if gid not in placements_map: continue
         x_off, y_off, bw, bh = placements_map[gid]
-        polys = []
-
-        # PASS 1: blend multiply len canvas_fill
-        for r in regs:
-            pts = r["pts"].copy()
-            pts[:, 0] += x_off
-            pts[:, 1] += y_off
-            pts = pts.astype(np.float64)
-
-            if len(pts) >= 3:
-                polys.append(Polygon(pts))
-
-        # PASS 2: fill phang + mask group
-        canvas_h, canvas_w = canvas_fill.shape[:2]
-        group_mask = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
-        group_label = None
-
+        
+        g_mask = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
         for r in regs:
             pts = r["pts"].astype(np.float64).copy()
             pts[:, 0] += x_off
             pts[:, 1] += y_off
-            color = tuple(map(int, r["color"]))
-
-            pts_int32 = np.array(pts, dtype=np.int32)
-
-            # Ve
-            # print(color)
-            cv2.fillPoly(canvas_fill, [pts_int32], color)
-            cv2.fillPoly(group_mask, [pts_int32], 255)
+            pts_i32 = pts.astype(np.int32)
             
-            # polygon vector data
-            pts_vec = r["pts"].astype(np.float32).copy()
-            pts_vec[:, 0] += x_off
-            pts_vec[:, 1] += y_off
-            pts_list = [[float(x), float(y)] for x, y in pts_vec]
-            color_list = [float(c) for c in r["color"]]
-
+            cv2.fillPoly(canvas_fill, [pts_i32], tuple(map(int, r["color"])))
+            cv2.fillPoly(g_mask, [pts_i32], 255)
+            cv2.fillPoly(global_occupied_mask, [pts_i32], 255)
+            
+            # Save vector polygons
             vector_elements.append({
                 "type": "polygon",
                 "gid": gid,
-                "pts": pts_list,
-                "color": color_list,
+                "pts": [[float(x), float(y)] for x, y in pts],
+                "color": [float(c) for c in r["color"]],
             })
+        group_masks[gid] = g_mask
 
-            if group_label is None:
-                group_label = str(r["label"])
+    # Distance Transform tren Global Background (optional, co the dung e tim vung trong)
+    # global_bg_dt = cv2.distanceTransform(255 - global_occupied_mask, cv2.DIST_L2, 5)
 
-        # BUILD BLEED tren cung canvas_fill
+    # --- PASS 2: Outlines, Bleeds va Labels ---
+    for gidx, (gid, regs, sw, sh) in enumerate(scaled_patches):
+        if gid not in placements_map: continue
+        x_off, y_off, bw, bh = placements_map[gid]
+        group_mask = group_masks[gid]
+
+        # BUILD BLEED
         bleed_mask, bleed_color_img = build_bleed(group_mask, canvas_fill)
         canvas_fill[:] = bleed_color_img
+        contours, _ = cv2.findContours(bleed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        bleed_contours_by_gid[gid] = [cnt.reshape(-1, 2) for cnt in contours]
 
-        contours, _ = cv2.findContours(
-            bleed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        bleed_contours = [cnt.reshape(-1, 2) for cnt in contours]
-        bleed_contours_by_gid[gid] = bleed_contours
-
-        # OUTLINE + LABEL  canvas_line + vector_elements (FIXED VERSION)
-        SMOOTH_EPS = 1.5
-        SIMPLIFY_EPS = 0.8
-        MIN_SEG_LEN = 1
+        # OUTLINE + LABEL
+        polys = []
+        for r in regs:
+            pts = r["pts"].astype(np.float64).copy()
+            pts[:, 0] += x_off
+            pts[:, 1] += y_off
+            if len(pts) >= 3: polys.append(Polygon(pts))
 
         if polys:
             try:
-                # 1. Validate tung polygon truoc khi union
-                valid_polys = []
-                for poly in polys:
-                    if poly.is_valid and not poly.is_empty:
-                        valid_polys.append(poly)
-                    else:
-                        # Fix invalid polygons
-                        fixed_poly = make_valid(poly)
-                        if not fixed_poly.is_empty:
-                            valid_polys.append(fixed_poly)
-
+                valid_polys = [make_valid(p) for p in polys if p.is_valid or not make_valid(p).is_empty]
                 if valid_polys:
-                    # 2. Safe unary_union voi error handling
                     merged = unary_union(valid_polys)
+                    if not merged.is_valid: merged = make_valid(merged)
                     
-                    if merged.is_empty:
-                        print(f"[layout] Empty merged geometry for gid={gid}")
-                        continue
-                    
-                    # 3. am bao valid sau union
-                    if not merged.is_valid:
-                        merged = make_valid(merged)
-                    
-                    if merged.is_empty:
-                        print(f"[layout] Empty after make_valid for gid={gid}")
-                        continue
-
-                    # 4. Smooth neu can (optional - uncomment neu muon)
-                    # merged = merged.buffer(SMOOTH_EPS).buffer(-SMOOTH_EPS)
-
-                    # 5. Simplify an toan
-                    if SIMPLIFY_EPS > 0:
-                        try:
-                            merged = merged.simplify(SIMPLIFY_EPS, preserve_topology=True)
-                        except GEOSException:
-                            print(f"[layout] Simplify failed for gid={gid}, skipping")
-
-                    # 6. Xu ly MultiPolygon
-                    if merged.geom_type == "Polygon":
-                        geoms = [merged]
-                    else:
-                        geoms = list(merged.geoms)
-
+                    # Simplify & Outline (giu logic cu)
+                    merged = merged.simplify(0.8, preserve_topology=True)
+                    geoms = [merged] if merged.geom_type == "Polygon" else list(merged.geoms)
                     for g_poly in geoms:
-                        if g_poly.is_empty or not g_poly.is_valid:
-                            continue
-
-                        try:
-                            # Clean repeated points
-                            ring = remove_repeated_points(
-                                g_poly.exterior, tolerance=MIN_SEG_LEN
-                            )
-                            
-                            coords = np.array(ring.coords, dtype=np.float32)
-
-                            # cv2.polylines(
-                            #     canvas_line, [coords_int], True, (0, 0, 0), 2, cv2.LINE_AA
-                            # )
-
-                            coords_list = [[float(x), float(y)] for x, y in coords]
-                            vector_elements.append({
-                                "type": "outline",
-                                "gid": gid,
-                                "coords": coords_list,
-                            })
-                        except Exception as e:
-                            print(f"[layout] Outline drawing failed for gid={gid}: {e}")
-                            continue
-
-                    if group_label is not None:
-                        if merged.geom_type == "Polygon":
-                            label_poly = merged
-                        else:
-                            label_poly = max(merged.geoms, key=lambda g: g.area)
-
-                        bbox = label_poly.bounds
-                        text_x, text_y = find_text_position(label_poly, bbox)
-                        
-                        label = str(group_label)
-                        font = cv2.FONT_HERSHEY_SIMPLEX
-                        fs = 0.4
-                        (tw, th), _ = cv2.getTextSize(label, font, fs, 1)
-                        
-                        org_x = int(text_x - tw / 2)
-                        org_y = int(text_y + th / 2)
-                        cv2.putText(canvas_line, label, (org_x, org_y), font, fs, (0, 0, 0), 1, cv2.LINE_AA)
-                        
+                        ring = remove_repeated_points(g_poly.exterior, tolerance=1)
                         vector_elements.append({
-                            'type': 'label',
-                            'gid': gid,
-                            'text': label,
-                            'x': text_x,
-                            'y': text_y
+                            "type": "outline",
+                            "gid": gid,
+                            "coords": [[float(x), float(y)] for x, y in ring.coords],
                         })
-                        
-                else:
-                    print(f"[layout] No valid polygons for gid={gid}")
 
-            except GEOSException as e:
-                print(f"[layout] GEOSException for gid={gid}: {e}")
-                # Fallback: dung polygon au tien
-                if polys:
-                    first_poly = make_valid(polys[0])
-                    if not first_poly.is_empty:
-                        # Ve outline cho first_poly...
-                        pass
+                    # LABEL logic moi: Distance Transform
+                    label_poly = merged if merged.geom_type == "Polygon" else max(merged.geoms, key=lambda g: g.area)
+                    group_label = str(regs[0]["label"]) # Lay label tu reg au tien
+                    
+                    text_x, text_y = find_label_position_dt(group_mask, label_poly.bounds)
+                    
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    fs = 0.4
+                    (tw, th), _ = cv2.getTextSize(group_label, font, fs, 1)
+                    org_x, org_y = int(text_x - tw / 2), int(text_y + th / 2)
+                    cv2.putText(canvas_line, group_label, (org_x, org_y), font, fs, (0, 0, 0), 1, cv2.LINE_AA)
+                    
+                    vector_elements.append({
+                        'type': 'label', 'gid': gid, 'text': group_label,
+                        'x': text_x, 'y': text_y
+                    })
             except Exception as e:
-                print(f"[layout] Unexpected error for gid={gid}: {e}")
+                print(f"[layout] Error gid={gid}: {e}")
+
+    return canvas_fill, canvas_line, vector_elements, bleed_contours_by_gid
 
     return canvas_fill, canvas_line, vector_elements, bleed_contours_by_gid

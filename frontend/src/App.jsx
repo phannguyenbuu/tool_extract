@@ -137,39 +137,26 @@ const buildPackedPolyData = (data) => {
 
 const buildPackedEmptyCells = (data, packedPolyData) => {
   if (!data?.canvas || !packedPolyData?.length) return [];
-  const cellSize = 6;
-  const radius = 3;
+  const cellSize = 4;
+  const radius = 6;
   const pts = [];
   const w = data.canvas.w;
   const h = data.canvas.h;
   for (let y = cellSize; y + cellSize <= h; y += cellSize) {
     for (let x = cellSize; x + cellSize <= w; x += cellSize) {
-      const cx = x + radius;
-      const cy = y + radius;
+      const cx = x + cellSize / 2;
+      const cy = y + cellSize / 2;
       if (cx < radius || cy < radius || cx > w - radius || cy > h - radius) continue;
-      const corners = [
-        [x, y],
-        [x + cellSize, y],
-        [x + cellSize, y + cellSize],
-        [x, y + cellSize],
-        [cx, cy],
-      ];
+      
       let inside = false;
       for (const poly of packedPolyData) {
         const bb = poly.bbox;
         if (!bb) continue;
-        const minx = bb.minx - radius;
-        const maxx = bb.maxx + radius;
-        const miny = bb.miny - radius;
-        const maxy = bb.maxy + radius;
-        if (x > maxx || x + cellSize < minx || y > maxy || y + cellSize < miny) continue;
-        for (const pt of corners) {
-          if (pointInPolyWithOffset(pt, poly.pts, radius)) {
-            inside = true;
-            break;
-          }
+        if (cx > bb.maxx + radius || cx < bb.minx - radius || cy > bb.maxy + radius || cy < bb.miny - radius) continue;
+        if (pointInPolyWithOffset([cx, cy], poly.pts, radius)) {
+          inside = true;
+          break;
         }
-        if (inside) break;
       }
       if (!inside) pts.push([cx, cy]);
     }
@@ -1232,13 +1219,24 @@ export default function App() {
   const [packedEditMode, setPackedEditMode] = useState("none"); // none | move | rotate
   const [manualPackedEdits, setManualPackedEdits] = useState({});
   const [packUiLog, setPackUiLog] = useState("");
-  const [packTiming, setPackTiming] = useState({
-    running: false,
-    startTs: 0,
-    elapsedMs: 0,
-    lastMs: null,
-    avgMs: null,
-    count: 0,
+  const [packTiming, setPackTiming] = useState(() => {
+    const saved = localStorage.getItem("lastPackDuration");
+    return {
+      running: false,
+      startTs: 0,
+      elapsedMs: 0,
+      lastMs: null,
+      avgMs: saved ? parseInt(saved, 10) : null,
+      count: 0,
+    };
+  });
+  const [exportPdfTiming, setExportPdfTiming] = useState(() => {
+    const saved = localStorage.getItem("lastPdfDuration");
+    return {
+      startTs: 0,
+      elapsedMs: 0,
+      estimatedMs: saved ? parseInt(saved, 10) : 30000,
+    };
   });
   const [recentFiles, setRecentFiles] = useState(["convoi.svg", "chobenthanh.svg"]);
   const [selectedSource, setSelectedSource] = useState("convoi.svg");
@@ -2228,10 +2226,10 @@ export default function App() {
           let bestScore = Infinity;
           const lx = Math.round(tx / 10);
           const ly = Math.round(ty / 10);
-          const minCx = lx - 10;
-          const maxCx = lx + 10;
-          const minCy = ly - 10;
-          const maxCy = ly + 10;
+          const minCx = lx - 100;
+          const maxCx = lx + 100;
+          const minCy = ly - 100;
+          const maxCy = ly + 100;
           for (const cell of emptyCells) {
             const idx = cellIndex(cell);
             if (usedCell.has(idx)) continue;
@@ -3065,87 +3063,63 @@ export default function App() {
   const packedIndexItems = useMemo(() => {
     if (!packedSource) return [];
     const out = [];
-    const occupied = [];
-    const intersects = (a, b) =>
-      !(a.x + a.w < b.x || b.x + b.w < a.x || a.y + a.h < b.y || b.y + b.h < a.y);
-    const pageW = packedSource?.canvas?.w || 0;
-    const pageH = packedSource?.canvas?.h || 0;
+    const usedCells = new Set();
+    const cellStep = 5; // Match cell size or slightly more for collision
+    const getCellKey = (x, y) => `${Math.round(x / cellStep)}:${Math.round(y / cellStep)}`;
+
     Object.entries(packedSource.zone_labels || {}).forEach(([zid, lbl]) => {
       if (!lbl) return;
-      const shift =
-        packedSource.zone_shift?.[zid] ?? packedSource.zone_shift?.[parseInt(zid, 10)];
+      const shift = packedSource.zone_shift?.[zid] ?? packedSource.zone_shift?.[parseInt(zid, 10)];
       if (!shift) return;
-      const rot =
-        packedSource.zone_rot?.[zid] ??
-        packedSource.zone_rot?.[parseInt(zid, 10)] ??
-        0;
-      const center =
-        packedSource.zone_center?.[zid] ??
-        packedSource.zone_center?.[parseInt(zid, 10)] ??
-        [0, 0];
-      const zonePoly = packedZoneOutlineItems.find((item) => String(item.zid) === String(zid));
-      if (!zonePoly?.pts?.length) return;
-      const bin =
-        packedSource?.placement_bin?.[zid] ??
-        packedSource?.placement_bin?.[parseInt(zid, 10)];
+      const rot = packedSource.zone_rot?.[zid] ?? packedSource.zone_rot?.[parseInt(zid, 10)] ?? 0;
+      const center = packedSource.zone_center?.[zid] ?? packedSource.zone_center?.[parseInt(zid, 10)] ?? [0, 0];
+      const bin = packedSource?.placement_bin?.[zid] ?? packedSource?.placement_bin?.[parseInt(zid, 10)];
       const page = bin === 1 ? 1 : 0;
       const xOffset = page === 1 ? (packedSource?.canvas?.w || 0) + 40 : 0;
       const label = `${getZoneAlias(zid, packedSource)}`;
-      const size = Math.max(labelFontSize / Math.max(regionScale, 0.0001), 6 / Math.max(regionScale, 0.0001));
-      const metrics = measureText(label, size, labelFontFamily);
-      const halfW = metrics.width / 2;
-      const halfH = metrics.height / 2;
 
-      const bestPath = zonePoly.pts;
-      if (!bestPath || bestPath.length < 2) return;
+      let tx = lbl.x, ty = lbl.y;
+      const [pt] = transformPath([[lbl.x, lbl.y]], shift, rot, center);
+      if (pt) { tx = pt[0] + xOffset; ty = pt[1]; }
 
-      const { area: polyArea } = polyAreaAndCentroid(bestPath);
-      const candidates = [];
-      for (let i = 0; i < bestPath.length; i++) {
-        const p0 = bestPath[i];
-        const p1 = bestPath[(i + 1) % bestPath.length];
-        const vx = p1[0] - p0[0];
-        const vy = p1[1] - p0[1];
-        const len = Math.hypot(vx, vy);
-        if (len < 1e-6) continue;
-        const nx = polyArea >= 0 ? vy / len : -vy / len;
-        const ny = polyArea >= 0 ? -vx / len : vx / len;
-        const tx = vx / len;
-        const ty = vy / len;
-        const mx = 0.5 * (p0[0] + p1[0]);
-        const my = 0.5 * (p0[1] + p1[1]);
-        for (const d of [7, 11, 15]) {
-          for (const s of [0, 6, -6, 12, -12]) {
-            candidates.push({ x: mx + tx * s + nx * d + xOffset, y: my + ty * s + ny * d, edgeLen: len });
-          }
+      const cells = packedCellsByBin[page] || [];
+      let best = null, bestScore = Infinity;
+      const lx = tx, ly = ty;
+
+      for (const cell of cells) {
+        const cx = cell[0], cy = cell[1];
+        if (usedCells.has(getCellKey(cx, cy))) continue;
+        
+        // Search range +/- 150px
+        if (Math.abs(cx - lx) > 150 || Math.abs(cy - ly) > 150) continue;
+        
+        const score = Math.abs(cx - lx) + Math.abs(cy - ly);
+        if (score < bestScore) {
+          bestScore = score;
+          best = cell;
         }
       }
-      candidates.sort((a, b) => b.edgeLen - a.edgeLen);
 
-      let chosen = null;
-      for (const c of candidates) {
-        if (c.x - halfW < 0 || c.x + halfW > pageW + (page === 1 ? pageW + 40 : 0)) continue;
-        if (c.y - halfH < 0 || c.y + halfH > pageH) continue;
-        const box = { x: c.x - halfW, y: c.y - halfH, w: metrics.width, h: metrics.height };
-        if (occupied.some((b) => intersects(box, b))) continue;
-        chosen = c;
-        occupied.push(box);
-        break;
+      let px, py;
+      if (best) {
+        px = best[0]; py = best[1];
+        // Mark a rectangle around the label as used to prevent overlap
+        // Labels are wider than tall, typically ~10-20px wide
+        const rw = label.length * 8 + 4; // horizontal safety
+        const rh = 12; // vertical safety
+        for (let dx = -rw; dx <= rw; dx += cellStep) {
+          for (let dy = -rh; dy <= rh; dy += cellStep) {
+            usedCells.add(getCellKey(px + dx, py + dy));
+          }
+        }
+      } else {
+        px = tx; py = ty;
       }
-      if (!chosen) {
-        const [pt] = transformPath([[lbl.x, lbl.y]], shift, rot, center);
-        if (!pt) return;
-        chosen = { x: pt[0] + xOffset, y: pt[1] };
-      }
-      out.push({
-        zid: String(zid),
-        label,
-        x: chosen.x,
-        y: chosen.y,
-      });
+
+      out.push({ zid: String(zid), label, x: px, y: py });
     });
     return out;
-  }, [packedSource, packedZoneOutlineItems, packedLabelSnappedAll, labelFontFamily, labelFontSize, regionScale]);
+  }, [packedSource, packedCellsByBin, labelFontFamily, labelFontSize, regionScale]);
 
   const packedLowAreaWarnings = useMemo(() => {
     // Disable warning markers while validating raster->vector flow.
@@ -3474,9 +3448,10 @@ export default function App() {
             Number.isFinite(tTotal) ? ` (${Math.round(tTotal)} ms)` : ""
           }`
         );
-      } else if (Number.isFinite(tTotal)) {
+      if (Number.isFinite(tTotal)) {
         setPackUiLog(`Pack: ${Math.round(tTotal)} ms`);
       }
+      localStorage.setItem("lastPackDuration", Math.round(durationMs).toString());
     } catch (err) {
       setPackedBleedError(err.message || String(err));
       setPackUiLog(`Pack: failed (${err.message || String(err)})`);
