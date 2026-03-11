@@ -2277,209 +2277,228 @@ def write_pack_svg(
     parts.append("</g>")
     parts.append('<g id="bleed">')
     if include_bleed and bleed_canvas > 0:
-        zone_boundaries = zones.build_zone_boundaries(polys, zone_id)
+        # Projection-grid pipeline (same family as zone_0_projection_grid.svg):
+        # region vertices near zone boundary -> projection -> weld/merge in boundary order -> bleed polygons.
+        projection_threshold = float(bleed_canvas)
+        weld_threshold = 1.0
+        merge_threshold = 0.5
         zone_regions: Dict[int, List[int]] = {}
+        zone_poly_by_zid: Dict[int, List[Tuple[float, float]]] = {}
         for rid, zid in enumerate(zone_id):
-            zone_regions.setdefault(zid, []).append(rid)
-        region_traps: Dict[int, List[List[Tuple[float, float]]]] = {}
-        debug_free_pts: List[Tuple[float, float]] = []
-        for zid, paths in zone_boundaries.items():
+            zone_regions.setdefault(int(zid), []).append(rid)
+        for idx, zid in enumerate(zone_order):
+            if idx < len(zone_polys):
+                zone_poly_by_zid[int(zid)] = list(zone_polys[idx])
+
+        for zid, rid_list in zone_regions.items():
             if zid not in zone_shift:
                 continue
-            # determine boundary edges for regions in this zone (packed coords)
-            edge_counts: Dict[Tuple[Tuple[int, int], Tuple[int, int]], int] = {}
-            for rid in zone_regions.get(zid, []):
-                pts = polys[rid] if rid < len(polys) else []
-                dx, dy = zone_shift[zid]
-                ang = zone_rot.get(zid, 0.0)
-                cx, cy = zone_center.get(zid, (0.0, 0.0))
-                tpts = [(p[0] + dx, p[1] + dy) for p in _rotate_pts(pts, ang, cx, cy)]
-                n = len(tpts)
+            src_zone = zone_poly_by_zid.get(zid) or []
+            if len(src_zone) < 3:
+                continue
+            zone_base = src_zone[:-1] if len(src_zone) > 1 and src_zone[0] == src_zone[-1] else src_zone
+            if len(zone_base) < 3:
+                continue
+
+            dx, dy = zone_shift[zid]
+            ang = zone_rot.get(zid, 0.0)
+            cx, cy = zone_center.get(zid, (0.0, 0.0))
+            boundary = [(p[0] + dx, p[1] + dy) for p in _rotate_pts(zone_base, ang, cx, cy)]
+            if len(boundary) < 3:
+                continue
+            boundary_off = _offset_outline_same_vertices(boundary, bleed_canvas)
+            if len(boundary_off) != len(boundary):
+                continue
+
+            n = len(boundary)
+            edge_len: List[float] = []
+            cum = [0.0]
+            for i in range(n):
+                a = boundary[i]
+                b = boundary[(i + 1) % n]
+                ll = float(np.hypot(b[0] - a[0], b[1] - a[1]))
+                edge_len.append(ll)
+                cum.append(cum[-1] + ll)
+            perimeter = cum[-1]
+            if perimeter <= 1e-6:
+                continue
+
+            def _pt_at(edge_idx: int, t: float, seq: List[Tuple[float, float]]) -> Tuple[float, float]:
+                i0 = max(0, min(n - 1, int(edge_idx)))
+                i1 = (i0 + 1) % n
+                tt = max(0.0, min(1.0, float(t)))
+                p0 = seq[i0]
+                p1 = seq[i1]
+                return (p0[0] + (p1[0] - p0[0]) * tt, p0[1] + (p1[1] - p0[1]) * tt)
+
+            def _project_param(pt: Tuple[float, float]):
+                best = None
+                best_d2 = None
                 for i in range(n):
-                    p1 = tpts[i]
-                    p2 = tpts[(i + 1) % n]
-                    k1 = _snap_key_local(p1, config.EDGE_EPS)
-                    k2 = _snap_key_local(p2, config.EDGE_EPS)
-                    if k1 == k2:
+                    a = boundary[i]
+                    b = boundary[(i + 1) % n]
+                    vx = b[0] - a[0]
+                    vy = b[1] - a[1]
+                    ll2 = vx * vx + vy * vy
+                    if ll2 <= 1e-12:
                         continue
-                    ek = (k1, k2) if k1 < k2 else (k2, k1)
-                    edge_counts[ek] = edge_counts.get(ek, 0) + 1
-            dx, dy = zone_shift[zid]
-            ang = zone_rot.get(zid, 0.0)
-            cx, cy = zone_center.get(zid, (0.0, 0.0))
-            for pts in paths or []:
-                tpts = [(p[0] + dx, p[1] + dy) for p in _rotate_pts(pts, ang, cx, cy)]
-                if len(tpts) < 3:
+                    t = ((pt[0] - a[0]) * vx + (pt[1] - a[1]) * vy) / ll2
+                    t = max(0.0, min(1.0, t))
+                    px = a[0] + vx * t
+                    py = a[1] + vy * t
+                    ddx = px - pt[0]
+                    ddy = py - pt[1]
+                    d2 = ddx * ddx + ddy * ddy
+                    if best_d2 is None or d2 < best_d2:
+                        s = cum[i] + edge_len[i] * t
+                        best = {"x": px, "y": py, "edge": i, "t": t, "s": s, "d2": d2}
+                        best_d2 = d2
+                return best
+
+            def _param_from_s(s: float):
+                ss = float(s) % perimeter
+                i = 0
+                while i + 1 < len(cum) and cum[i + 1] < ss - 1e-9:
+                    i += 1
+                i = min(i, n - 1)
+                ll = edge_len[i]
+                t = 0.0 if ll <= 1e-9 else (ss - cum[i]) / ll
+                return i, max(0.0, min(1.0, t)), ss
+
+            region_items: List[Tuple[int, Polygon, List[Tuple[float, float]]]] = []
+            for rid in rid_list:
+                if rid >= len(polys):
                     continue
-                closed = (abs(tpts[0][0] - tpts[-1][0]) < 1e-6 and abs(tpts[0][1] - tpts[-1][1]) < 1e-6)
-                if closed:
-                    tpoly = tpts[:-1] if len(tpts) > 1 else tpts
+                src = polys[rid]
+                if len(src) < 3:
+                    continue
+                moved = [(p[0] + dx, p[1] + dy) for p in _rotate_pts(src, ang, cx, cy)]
+                try:
+                    rp = Polygon(moved)
+                    if rp.is_empty:
+                        continue
+                    if not rp.is_valid:
+                        rp = make_valid(rp)
+                    if rp.is_empty or not isinstance(rp, Polygon):
+                        continue
+                except Exception:
+                    continue
+                region_items.append((rid, rp, moved))
+            if not region_items:
+                continue
+
+            vertices = [{"kind": "v", "edge": i, "t": 0.0, "s": cum[i], "x": boundary[i][0], "y": boundary[i][1]} for i in range(n)]
+            projections = []
+            for rid, _rp, moved in region_items:
+                for p in moved:
+                    pr = _project_param(p)
+                    if pr is None:
+                        continue
+                    if pr["d2"] > projection_threshold * projection_threshold + 1e-9:
+                        continue
+                    pr["kind"] = "p"
+                    pr["rid"] = rid
+                    projections.append(pr)
+            if not projections:
+                continue
+
+            # Weld projection points to zone vertices first.
+            for pr in projections:
+                snap_vi = None
+                snap_d2 = weld_threshold * weld_threshold
+                for vi in range(n):
+                    vx, vy = boundary[vi]
+                    ddx = pr["x"] - vx
+                    ddy = pr["y"] - vy
+                    d2 = ddx * ddx + ddy * ddy
+                    if d2 <= snap_d2:
+                        snap_d2 = d2
+                        snap_vi = vi
+                if snap_vi is not None:
+                    pr["edge"] = snap_vi
+                    pr["t"] = 0.0
+                    pr["s"] = cum[snap_vi]
+                    pr["x"] = boundary[snap_vi][0]
+                    pr["y"] = boundary[snap_vi][1]
+
+            projections = sorted(projections, key=lambda e: e["s"])
+            welded = []
+            for pr in projections:
+                if not welded:
+                    welded.append(dict(pr))
+                    continue
+                last = welded[-1]
+                ds = abs(float(pr["s"]) - float(last["s"]))
+                dxy = float(np.hypot(float(pr["x"]) - float(last["x"]), float(pr["y"]) - float(last["y"])))
+                if ds <= weld_threshold or dxy <= weld_threshold:
+                    s_new = 0.5 * (float(pr["s"]) + float(last["s"]))
+                    ei, tt, ss = _param_from_s(s_new)
+                    px, py = _pt_at(ei, tt, boundary)
+                    last["edge"] = ei
+                    last["t"] = tt
+                    last["s"] = ss
+                    last["x"] = px
+                    last["y"] = py
                 else:
-                    tpoly = tpts
-                npts = len(tpoly)
-                if npts < 2:
+                    welded.append(dict(pr))
+
+            ordered = vertices + welded
+            ordered = sorted(ordered, key=lambda e: e["s"])
+            merged = []
+            for item in ordered:
+                if not merged:
+                    merged.append(dict(item))
                     continue
-                ocoords = None
-                if closed and npts >= 3:
-                    ocoords = _offset_outline_same_vertices(tpoly, bleed_canvas)
-                    if len(ocoords) < len(tpoly):
-                        ocoords = None
-                edge_count = npts if closed else npts - 1
-                for i in range(edge_count):
-                    p0 = tpoly[i]
-                    p1 = tpoly[(i + 1) % npts] if closed else tpoly[i + 1]
-                    if ocoords is not None:
-                        p0o = ocoords[i]
-                        p1o = ocoords[(i + 1) % npts]
-                    else:
-                        vx = p1[0] - p0[0]
-                        vy = p1[1] - p0[1]
-                        vlen = float(np.hypot(vx, vy))
-                        if vlen <= 1e-6:
-                            continue
-                        nx = vy / vlen
-                        ny = -vx / vlen
-                        mx0 = 0.5 * (p0[0] + p1[0])
-                        my0 = 0.5 * (p0[1] + p1[1])
-                        if closed and _point_in_poly((mx0 + nx * bleed_canvas * 0.1, my0 + ny * bleed_canvas * 0.1), tpoly):
-                            nx = -nx
-                            ny = -ny
-                        p0o = (p0[0] + nx * bleed_canvas, p0[1] + ny * bleed_canvas)
-                        p1o = (p1[0] + nx * bleed_canvas, p1[1] + ny * bleed_canvas)
-                    # pick color from nearest region edge within this zone
-                    mx = 0.5 * (p0[0] + p1[0])
-                    my = 0.5 * (p0[1] + p1[1])
-                    best_rid = None
-                    best_d2 = None
-                    for rid in zone_regions.get(zid, []):
-                        if rid >= len(polys):
-                            continue
-                        rpts = [(p[0] + dx, p[1] + dy) for p in _rotate_pts(polys[rid], ang, cx, cy)]
-                        if len(rpts) < 2:
-                            continue
-                        for j in range(len(rpts)):
-                            a = rpts[j]
-                            bpt = rpts[(j + 1) % len(rpts)]
-                            vx = bpt[0] - a[0]
-                            vy = bpt[1] - a[1]
-                            if vx == 0 and vy == 0:
-                                continue
-                            t = ((mx - a[0]) * vx + (my - a[1]) * vy) / (vx * vx + vy * vy)
-                            t = max(0.0, min(1.0, t))
-                            px = a[0] + vx * t
-                            py = a[1] + vy * t
-                            d2 = (mx - px) * (mx - px) + (my - py) * (my - py)
-                            if best_d2 is None or d2 < best_d2:
-                                best_d2 = d2
-                                best_rid = rid
-                    if best_rid is not None and best_rid < len(colors):
-                        # Build bleed polygon A-A2-A1-B1-B2-B
-                        ax, ay = p0
-                        bx, by = p1
-                        aox, aoy = p0o
-                        box, boy = p1o
-                        abx = box - aox
-                        aby = boy - aoy
-                        ab_len2 = abx * abx + aby * aby
-                        if ab_len2 <= 1e-8:
-                            continue
-                        # A1/B1 = projection of A/B onto A'B'
-                        t_a = ((ax - aox) * abx + (ay - aoy) * aby) / ab_len2
-                        t_b = ((bx - aox) * abx + (by - aoy) * aby) / ab_len2
-                        t_a = max(0.0, min(1.0, t_a))
-                        t_b = max(0.0, min(1.0, t_b))
-                        a1x = aox + t_a * abx
-                        a1y = aoy + t_a * aby
-                        b1x = aox + t_b * abx
-                        b1y = aoy + t_b * aby
-                        # A2/B2 = points on AA' / BB' with distance PACK_BLEED from A/B
-                        dax = aox - ax
-                        day = aoy - ay
-                        dbx = box - bx
-                        dby = boy - by
-                        da_len = float(np.hypot(dax, day))
-                        db_len = float(np.hypot(dbx, dby))
-                        if da_len > 1e-6:
-                            s = min(1.0, bleed_canvas / da_len)
-                            a2x = ax + dax * s
-                            a2y = ay + day * s
-                        else:
-                            a2x, a2y = ax, ay
-                        if db_len > 1e-6:
-                            s = min(1.0, bleed_canvas / db_len)
-                            b2x = bx + dbx * s
-                            b2y = by + dby * s
-                        else:
-                            b2x, b2y = bx, by
-                        quad_pts = [
-                            (ax, ay),
-                            (a2x, a2y),
-                            (a1x, a1y),
-                            (b1x, b1y),
-                            (b2x, b2y),
-                            (bx, by),
-                        ]
-                        region_traps.setdefault(best_rid, []).append(quad_pts)
-        snap = float(config.EDGE_EPS)
-        zone_outlines: Dict[int, List[List[Tuple[float, float]]]] = {}
-        for rid, pts in enumerate(polys):
-            if rid >= len(zone_id):
+                prev = merged[-1]
+                ds = abs(float(item["s"]) - float(prev["s"]))
+                dxy = float(np.hypot(float(item["x"]) - float(prev["x"]), float(item["y"]) - float(prev["y"])))
+                if ds <= merge_threshold or dxy <= merge_threshold:
+                    if prev.get("kind") != "v" and item.get("kind") == "v":
+                        merged[-1] = dict(item)
+                else:
+                    merged.append(dict(item))
+            if len(merged) < 2:
                 continue
-            zid = zone_id[rid]
-            if zid not in zone_shift:
-                continue
-            dx, dy = zone_shift[zid]
-            ang = zone_rot.get(zid, 0.0)
-            cx, cy = zone_center.get(zid, (0.0, 0.0))
-            moved = [(p[0] + dx, p[1] + dy) for p in _rotate_pts(pts, ang, cx, cy)]
-            parts_polys = [moved]
-            parts_polys.extend(region_traps.get(rid, []))
-            outlines = _build_boundary_from_polys(parts_polys, snap)
-            if outlines:
-                zone_outlines.setdefault(zid, []).extend([(rid, o) for o in outlines])
-        for zid, items in zone_outlines.items():
-            outlines_only = [o for _, o in items]
-            edge_counts = _edge_counts_from_outlines(outlines_only, snap)
-            for rid, polyline in items:
-                if len(polyline) < 3:
+
+            for i in range(len(merged)):
+                a = merged[i]
+                b = merged[(i + 1) % len(merged)]
+                sa = float(a["s"])
+                sb = float(b["s"])
+                ds = sb - sa
+                if ds <= 0:
+                    ds += perimeter
+                if ds <= 1e-6:
                     continue
-                free_keys = _free_keys_for_outline(polyline, edge_counts, snap)
-                if free_keys:
-                    for p in polyline:
-                        if _snap_key_local(p, snap) in free_keys:
-                            debug_free_pts.append(p)
-                # Bevel disabled for drawn polygons.
-                if False and float(config.PACK_BLEED) > 0:
-                    orig_poly = [(p[0] + zone_shift[zid][0], p[1] + zone_shift[zid][1])
-                                 for p in _rotate_pts(polys[rid], zone_rot.get(zid, 0.0),
-                                                      zone_center.get(zid, (0.0, 0.0))[0],
-                                                      zone_center.get(zid, (0.0, 0.0))[1])]
-                    orig_area = _poly_area_abs(orig_poly)
-                    out_area = _poly_area_abs(polyline)
-                    orig_max = _max_edge_len(orig_poly)
-                    out_max = _max_edge_len(polyline)
-                    r_eff = float(config.PACK_BLEED)
-                    angle_thresh = 360.0
-                    polyline, dbg = _bevel_outline_by_angle(
-                        polyline,
-                        r_eff,
-                        angle_thresh=angle_thresh,
-                        free_keys=free_keys,
-                        snap=snap,
-                    )
-                    debug_free_pts.extend(dbg)
-                b, g, r = colors[rid] if rid < len(colors) else (200, 200, 200)
-                d = "M " + " L ".join(f"{p[0]} {p[1]}" for p in polyline) + " Z"
-                parts.append(f'<path d="{d}" fill="rgb({r},{g},{b})" stroke="none"/>')
-        if debug_free_pts:
-            parts.append('<g id="debug_free_corners">')
-            rdot = max(1.5, bleed_canvas * 0.2)
-            for x, y in debug_free_pts:
-                parts.append(
-                    f'<circle cx="{x}" cy="{y}" r="{rdot:.3f}" '
-                    f'fill="none" stroke="#ff0000" stroke-width="1"/>'
-                )
-            parts.append("</g>")
+                ax, ay = float(a["x"]), float(a["y"])
+                bx, by = float(b["x"]), float(b["y"])
+                aox, aoy = _pt_at(int(a["edge"]), float(a["t"]), boundary_off)
+                box, boy = _pt_at(int(b["edge"]), float(b["t"]), boundary_off)
+                bleed_poly = [(ax, ay), (aox, aoy), (box, boy), (bx, by)]
+                try:
+                    pg = Polygon(bleed_poly)
+                except Exception:
+                    continue
+                if pg.is_empty or float(pg.area) <= 1e-8:
+                    continue
+
+                mx = 0.5 * (ax + bx)
+                my = 0.5 * (ay + by)
+                mid = Point(mx, my)
+                best_rid = None
+                best_d = None
+                for rid, rp, _ in region_items:
+                    try:
+                        d = float(rp.boundary.distance(mid))
+                    except Exception:
+                        continue
+                    if best_d is None or d < best_d:
+                        best_d = d
+                        best_rid = rid
+                bgr = colors[best_rid] if best_rid is not None and best_rid < len(colors) else (200, 200, 200)
+                bb, bg, br = bgr
+                d = "M " + " L ".join(f"{p[0]} {p[1]}" for p in bleed_poly) + " Z"
+                parts.append(f'<path d="{d}" fill="rgb({br},{bg},{bb})" stroke="none"/>')
     parts.append("</g>")
     parts.append("</g></svg>")
     out_svg = out_path if out_path is not None else config.OUT_PACK_SVG

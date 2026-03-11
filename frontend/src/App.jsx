@@ -2113,22 +2113,30 @@ export default function App() {
       resetSourceHistory();
 
       if (!updatePacked && !updateZone) {
-        try {
-          const regionRes = await fetch(
-            `/api/source_region_scene?${sq}&count=120&relax=2&seed=7&_ts=${Date.now()}`,
-            { cache: "no-store" }
-          );
-          if (!regionRes.ok) throw new Error(`source region scene fetch failed: ${regionRes.status}`);
-          const regionData = await regionRes.json();
-          const scaledRegionData = scaleRatio === 1 ? regionData : scaleSceneData(regionData, scaleRatio);
+        const cachedRegionSceneRaw =
+          savedState?.source_region_scene_cache && typeof savedState.source_region_scene_cache === "object"
+            ? savedState.source_region_scene_cache
+            : null;
+        if (cachedRegionSceneRaw?.canvas && Array.isArray(cachedRegionSceneRaw?.regions)) {
+          const scaledRegionData =
+            scaleRatio === 1 ? cachedRegionSceneRaw : scaleSceneData(cachedRegionSceneRaw, scaleRatio);
           setScene(scaledRegionData);
-        } catch {
-          setScene((prev) => ({
-            ...(prev || {}),
-            canvas: { w: scaledSize.w, h: scaledSize.h },
-            regions: [],
-            source_name: sourceName,
-          }));
+        } else {
+          try {
+            const regionRes = await fetch(`/api/source_region_scene?${sq}&count=120&relax=2&seed=7`);
+            if (!regionRes.ok) throw new Error(`source region scene fetch failed: ${regionRes.status}`);
+            const regionData = await regionRes.json();
+            void patchStateJson({ source_region_scene_cache: regionData }, sourceName);
+            const scaledRegionData = scaleRatio === 1 ? regionData : scaleSceneData(regionData, scaleRatio);
+            setScene(scaledRegionData);
+          } catch {
+            setScene((prev) => ({
+              ...(prev || {}),
+              canvas: { w: scaledSize.w, h: scaledSize.h },
+              regions: [],
+              source_name: sourceName,
+            }));
+          }
         }
         if (savedView?.source?.scale && savedView?.source?.pos) {
           setScale(savedView.source.scale);
@@ -3318,10 +3326,7 @@ export default function App() {
       setError("");
       setSceneLoading(true);
       await persistSourceCacheNow(nodes, segs, sourceVoronoi, sourceName);
-      const res = await fetch(
-        `/api/source_region_scene?${sourceQuery(sourceName)}&count=120&relax=2&seed=7&_ts=${Date.now()}`,
-        { cache: "no-store" }
-      );
+      const res = await fetch(`/api/source_region_scene?${sourceQuery(sourceName)}&count=120&relax=2&seed=7`);
       if (!res.ok) {
         throw new Error(`source region scene fetch failed: ${res.status}`);
       }
@@ -3329,6 +3334,7 @@ export default function App() {
       const scaledRegionData =
         (sourceScale || 1) === 1 ? regionData : scaleSceneData(regionData, sourceScale || 1);
       setScene(scaledRegionData);
+      await patchStateJson({ source_region_scene_cache: regionData }, sourceName);
       const nextZoneScene = buildSnapZoneSceneFromRegionScene(scaledRegionData);
       if (nextZoneScene?.zone_id?.length) {
         setZoneScene(nextZoneScene);
@@ -3399,9 +3405,8 @@ export default function App() {
       elapsedMs: 0,
     }));
     try {
-      const res = await fetch(`/api/pack_from_scene?${sourceQuery(sourceName)}&_ts=${Date.now()}`, {
+      const res = await fetch(`/api/pack_from_scene?${sourceQuery(sourceName)}`, {
         method: "POST",
-        cache: "no-store",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           source: sourceName,
@@ -3472,11 +3477,9 @@ export default function App() {
       } else if (Number.isFinite(tTotal)) {
         setPackUiLog(`Pack: ${Math.round(tTotal)} ms`);
       }
-      return data;
     } catch (err) {
       setPackedBleedError(err.message || String(err));
       setPackUiLog(`Pack: failed (${err.message || String(err)})`);
-      return null;
     } finally {
       const durationMs = Math.max(0, performance.now() - startTs);
       setPackTiming((prev) => {
@@ -3497,25 +3500,20 @@ export default function App() {
   };
 
   const getPackedSourceForCompute = async (sourceName = selectedSource) => {
-    // Always use the latest source_region_scene (option 1), then rebuild snap-zone scene from it.
-    const sq = sourceQuery(sourceName);
-    const regionRes = await fetch(
-      `/api/source_region_scene?${sq}&count=120&relax=2&seed=7&_ts=${Date.now()}`,
-      { cache: "no-store" }
-    );
-    if (!regionRes.ok) {
-      throw new Error(`source region scene fetch failed: ${regionRes.status}`);
+    const current = zoneScene || scene;
+    if (current?.regions && current?.zone_id && current?.canvas) {
+      return current;
     }
-    const regionData = await regionRes.json();
+    const res = await fetch(`/api/scene?${sourceQuery(sourceName)}&force_compute=1`);
+    if (!res.ok) {
+      throw new Error(`scene cache fetch failed: ${res.status}`);
+    }
+    const data = await res.json();
     const scaleRatio = sourceScale || 1;
-    const scaledRegion = scaleRatio === 1 ? regionData : scaleSceneData(regionData, scaleRatio);
-    setScene(scaledRegion);
-    const rebuilt = buildSnapZoneSceneFromRegionScene(scaledRegion);
-    if (!rebuilt?.regions?.length || !rebuilt?.zone_id?.length) {
-      throw new Error("snap zone scene missing from latest source_region_scene");
-    }
-    setZoneScene(rebuilt);
-    return rebuilt;
+    const next = scaleRatio === 1 ? data : scaleSceneData(data, scaleRatio);
+    setScene(next);
+    setZoneScene(next);
+    return next;
   };
 
   const repackCurrentPacked = async (bleedEnabled = enableBleed) => {
@@ -4043,35 +4041,29 @@ export default function App() {
     try {
       setError("");
       setExportMsg("");
+      if (!scene?.canvas) {
+        throw new Error("canvas missing");
+      }
       const exportStartTs = performance.now();
       setExportPdfLoading(true);
       setExportPdfTiming({ startTs: exportStartTs, elapsedMs: 0 });
       setExportPdfInfo(null);
-      // Re-pack from latest source_region_scene before exporting.
-      const sourceForExport = await getPackedSourceForCompute(selectedSource);
-      await refreshPackedFromZoneScene(sourceForExport, enableBleed, selectedSource);
-      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
-      await new Promise((resolve) => requestAnimationFrame(() => resolve()));
-      const activeScene = sourceForExport || scene;
-      if (!activeScene?.canvas) {
-        throw new Error("canvas missing");
-      }
-      const size = { w: activeScene.canvas.w, h: activeScene.canvas.h };
+      const size = { w: scene.canvas.w, h: scene.canvas.h };
       const buildRegionFillSvg = () => {
         const parts = [
           `<svg xmlns="http://www.w3.org/2000/svg" width="${size.w}" height="${size.h}" viewBox="0 0 ${size.w} ${size.h}">`,
         ];
-        (activeScene.regions || []).forEach((poly, idx) => {
+        (scene.regions || []).forEach((poly, idx) => {
           if (!poly?.length) return;
           const d = `M ${poly.map((p) => `${p[0]} ${p[1]}`).join(" L ")} Z`;
-          const fill = activeScene.region_colors?.[idx] || "#bbbbbb";
+          const fill = scene.region_colors?.[idx] || "#bbbbbb";
           parts.push(`<path d="${d}" fill="${escapeXml(fill)}"/>`);
         });
         parts.push("</svg>");
         return parts.join("");
       };
       const buildZoneOnlySvg = () => {
-        const source = regionZoneScene || buildSnapZoneSceneFromRegionScene(activeScene);
+        const source = regionZoneScene || buildSnapZoneSceneFromRegionScene(scene);
         const parts = [
           `<svg xmlns="http://www.w3.org/2000/svg" width="${size.w}" height="${size.h}" viewBox="0 0 ${size.w} ${size.h}">`,
         ];
@@ -4186,7 +4178,7 @@ export default function App() {
           const baseName = data?.name
             ? data.name.replace(/\.pdf$/i, "")
             : "convoi";
-          const html0 = buildSimulateHtml(activeScene, packedLabels, labelFontFamily, labelFontSize);
+          const html0 = buildSimulateHtml(scene, packedLabels, labelFontFamily, labelFontSize);
           if (html0) {
             const name0 = `${baseName}_simulate.html`;
             await fetch("/api/save_html", {

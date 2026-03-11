@@ -1,0 +1,8 @@
+[2m5:48:40 AM[22m [31m[1m[vite][22m[39m [31mhttp proxy error: /api/state?source=chobenthanh.svg[39m
+AggregateError [ECONNREFUSED]: 
+    at internalConnectMultiple (node:net:1118:18)
+    at afterConnectMultiple (node:net:1685:7)
+[2m5:48:40 AM[22m [31m[1m[vite][22m[39m [31mhttp proxy error: /api/state?source=chobenthanh.svg[39m
+AggregateError [ECONNREFUSED]: 
+    at internalConnectMultiple (node:net:1118:18)
+    at afterConnectMultiple (node:net:1685:7)

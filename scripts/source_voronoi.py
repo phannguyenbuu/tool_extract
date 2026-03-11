@@ -1099,211 +1099,6 @@ def _project_point_to_segment(
     return (ax + t * dx, ay + t * dy)
 
 
-def _project_point_to_segment_clamped(
-    pt: tuple[float, float], a: tuple[float, float], b: tuple[float, float]
-) -> tuple[float, float] | None:
-    ax, ay = a
-    bx, by = b
-    px, py = pt
-    dx = bx - ax
-    dy = by - ay
-    ll = dx * dx + dy * dy
-    if ll <= 1e-9:
-        return None
-    t = ((px - ax) * dx + (py - ay) * dy) / ll
-    t = max(0.0, min(1.0, t))
-    return (ax + t * dx, ay + t * dy)
-
-
-def _dedupe_poly_pts(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    if not pts:
-        return []
-    out: list[tuple[float, float]] = []
-    for p in pts:
-        if not out or abs(p[0] - out[-1][0]) > 1e-9 or abs(p[1] - out[-1][1]) > 1e-9:
-            out.append(p)
-    if len(out) > 1 and abs(out[0][0] - out[-1][0]) < 1e-9 and abs(out[0][1] - out[-1][1]) < 1e-9:
-        out = out[:-1]
-    return out
-
-
-def _project_region_vertices_to_zone_boundary(
-    regions: list[list[list[float]]],
-    snapped_cells: list[list[list[float]]],
-    snap_region_map: dict[str, list[int]],
-    radius: float,
-    min_area: float,
-) -> list[list[list[float]]]:
-    if radius <= 0 or not regions or not snapped_cells or not snap_region_map:
-        return regions
-
-    out: list[list[list[float]]] = []
-    for rid, raw_pts in enumerate(regions):
-        pts = [(float(x), float(y)) for x, y in raw_pts]
-        zid: int | None = None
-        for k, ids in snap_region_map.items():
-            if rid in ids:
-                try:
-                    zid = int(k)
-                except Exception:
-                    zid = None
-                break
-        if zid is None or zid < 0 or zid >= len(snapped_cells):
-            out.append([[float(x), float(y)] for x, y in pts])
-            continue
-
-        zone = snapped_cells[zid]
-        if not zone or len(zone) < 3:
-            out.append([[float(x), float(y)] for x, y in pts])
-            continue
-        zpts = [(float(x), float(y)) for x, y in zone]
-        segs = list(zip(zpts, zpts[1:] + zpts[:1]))
-
-        moved: list[tuple[float, float]] = []
-        r2 = radius * radius
-        for p in pts:
-            best = p
-            best_d2 = r2
-            found = False
-            for a, b in segs:
-                proj = _project_point_to_segment_clamped(p, a, b)
-                if proj is None:
-                    continue
-                dx = proj[0] - p[0]
-                dy = proj[1] - p[1]
-                d2 = dx * dx + dy * dy
-                if d2 <= best_d2:
-                    best_d2 = d2
-                    best = proj
-                    found = True
-            moved.append(best if found else p)
-
-        moved = _dedupe_poly_pts(moved)
-        if len(moved) < 3:
-            continue
-        poly = _coerce_polygon(Polygon(moved), allow_largest=True)
-        if poly is None or poly.area < min_area:
-            continue
-        coords = list(poly.exterior.coords)
-        if len(coords) > 1 and coords[0] == coords[-1]:
-            coords = coords[:-1]
-        out.append([[float(x), float(y)] for x, y in coords])
-    return out
-
-
-def _polygon_min_width(poly: Polygon) -> float:
-    try:
-        rect = poly.minimum_rotated_rectangle
-        coords = list(rect.exterior.coords)
-    except Exception:
-        return float("inf")
-    if len(coords) < 4:
-        return float("inf")
-    lengths: list[float] = []
-    for a, b in zip(coords, coords[1:]):
-        lengths.append(math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1])))
-    return min(lengths) if lengths else float("inf")
-
-
-def _merge_thin_regions_exact(
-    regions: list[list[list[float]]],
-    snap_region_map: dict[str, list[int]],
-    snapped_cells: list[list[list[float]]],
-    max_width: float,
-    max_area: float,
-    *,
-    require_boundary_touch: bool,
-) -> list[list[list[float]]]:
-    if not regions or not snap_region_map or not snapped_cells:
-        return regions
-
-    polys: list[Polygon | None] = []
-    for pts in regions:
-        try:
-            p = _coerce_polygon(Polygon([(float(x), float(y)) for x, y in pts]), allow_largest=True)
-        except Exception:
-            p = None
-        polys.append(p)
-
-    for zid_str, rid_list in snap_region_map.items():
-        try:
-            zid = int(zid_str)
-        except Exception:
-            continue
-        if zid < 0 or zid >= len(snapped_cells):
-            continue
-        zpts = [(float(x), float(y)) for x, y in snapped_cells[zid]]
-        if len(zpts) < 3:
-            continue
-        zline = LineString(zpts + [zpts[0]])
-        zone_ids = [int(rid) for rid in rid_list if 0 <= int(rid) < len(polys)]
-        if len(zone_ids) < 2:
-            continue
-
-        changed = True
-        while changed:
-            changed = False
-            for rid in list(zone_ids):
-                rp = polys[rid]
-                if rp is None:
-                    continue
-                try:
-                    touch_len = float(rp.boundary.intersection(zline).length)
-                except Exception:
-                    touch_len = 0.0
-                if require_boundary_touch and touch_len <= 1e-7:
-                    continue
-                width = _polygon_min_width(rp)
-                if not (rp.area <= max_area or width <= max_width):
-                    continue
-
-                best_nid = None
-                best_shared = 0.0
-                for nid in zone_ids:
-                    if nid == rid:
-                        continue
-                    npoly = polys[nid]
-                    if npoly is None:
-                        continue
-                    try:
-                        shared = float(rp.boundary.intersection(npoly.boundary).length)
-                    except Exception:
-                        shared = 0.0
-                    if shared > best_shared:
-                        best_shared = shared
-                        best_nid = nid
-                if best_nid is None or best_shared <= 1e-7:
-                    continue
-
-                npoly = polys[best_nid]
-                if npoly is None:
-                    continue
-                try:
-                    # Exact topological union, no buffer approximation.
-                    merged_geom = npoly.union(rp)
-                except Exception:
-                    continue
-                merged_poly = _coerce_polygon(merged_geom, allow_largest=True)
-                if merged_poly is None:
-                    continue
-                polys[best_nid] = merged_poly
-                polys[rid] = None
-                changed = True
-                break
-
-    out: list[list[list[float]]] = []
-    for p in polys:
-        if p is None or p.is_empty or p.area <= 1e-6:
-            continue
-        coords = list(p.exterior.coords)
-        if len(coords) > 1 and coords[0] == coords[-1]:
-            coords = coords[:-1]
-        if len(coords) < 3:
-            continue
-        out.append([[float(x), float(y)] for x, y in coords])
-    return out
-
-
 def _snap_source_vertices_to_zone_segments(
     source_lines: list[LineString],
     snapped_cells: list[list[list[float]]],
@@ -1428,9 +1223,8 @@ def build_source_region_scene(
         source_lines, canvas = _load_cached_source_segments(source_path, cached_nodes, cached_segments)
     else:
         source_lines, canvas = _load_source_segments(source_path)
-    snapped_cells = voronoi.get("snapped_cells", [])
     snap_lines: list[LineString] = []
-    for poly in snapped_cells:
+    for poly in voronoi.get("snapped_cells", []):
         if not poly or len(poly) < 3:
             continue
         pts = [(float(x), float(y)) for x, y in poly]
@@ -1438,28 +1232,8 @@ def build_source_region_scene(
             if abs(a[0] - b[0]) < 1e-9 and abs(a[1] - b[1]) < 1e-9:
                 continue
             snap_lines.append(LineString([a, b]))
-    # Snap near-boundary source vertices onto zone boundary before polygonize.
-    # This suppresses ultra-thin sliver regions that would otherwise block bleed.
-    snap_threshold = max(0.0, float(config.PACK_BLEED))
-    merged_lines: list[LineString]
-    if snap_threshold > 0.0 and snapped_cells:
-        snapped_source_lines, snapped_snap_lines = _snap_source_vertices_to_zone_segments(
-            source_lines,
-            snapped_cells,
-            max_dist=snap_threshold,
-        )
-        if snapped_source_lines:
-            merged_lines = list(snapped_source_lines)
-            if snapped_snap_lines:
-                merged_lines.extend(snapped_snap_lines)
-            else:
-                merged_lines.extend(snap_lines)
-        else:
-            merged_lines = list(source_lines)
-            merged_lines.extend(snap_lines)
-    else:
-        merged_lines = list(source_lines)
-        merged_lines.extend(snap_lines)
+    merged_lines = list(source_lines)
+    merged_lines.extend(snap_lines)
 
     merged = unary_union(merged_lines)
     poly_pts, _border_pts = polygonize_full(merged)[:2]
@@ -1493,62 +1267,6 @@ def build_source_region_scene(
             poly = None
         region_polys.append(poly)
     snap_region_map = _assign_regions_to_snapped_cells(region_polys, snapped_polys)
-
-    # Project near-boundary region vertices onto zone boundary, then drop tiny slivers.
-    projection_radius = max(0.0, float(config.PACK_BLEED))
-    if projection_radius > 0.0:
-        min_area = max(1e-3, projection_radius * projection_radius * 0.05)
-        regions = _project_region_vertices_to_zone_boundary(
-            regions,
-            voronoi.get("snapped_cells", []) or [],
-            snap_region_map,
-            projection_radius,
-            min_area,
-        )
-        region_polys = []
-        for pts in regions:
-            try:
-                poly = _coerce_polygon(Polygon([(float(x), float(y)) for x, y in pts]), allow_largest=True)
-            except Exception:
-                poly = None
-            region_polys.append(poly)
-        snap_region_map = _assign_regions_to_snapped_cells(region_polys, snapped_polys)
-        # Pass 1: merge very thin slivers touching zone boundary.
-        regions = _merge_thin_regions_exact(
-            regions,
-            snap_region_map,
-            voronoi.get("snapped_cells", []) or [],
-            max_width=max(0.5, projection_radius * 0.9),
-            max_area=max(1e-3, projection_radius * projection_radius * 0.08),
-            require_boundary_touch=True,
-        )
-        region_polys = []
-        for pts in regions:
-            try:
-                poly = _coerce_polygon(Polygon([(float(x), float(y)) for x, y in pts]), allow_largest=True)
-            except Exception:
-                poly = None
-            region_polys.append(poly)
-        snap_region_map = _assign_regions_to_snapped_cells(region_polys, snapped_polys)
-
-        # Pass 2: merge remaining ultra-thin internal slivers via exact union.
-        regions = _merge_thin_regions_exact(
-            regions,
-            snap_region_map,
-            voronoi.get("snapped_cells", []) or [],
-            max_width=max(0.45, projection_radius * 0.65),
-            max_area=max(1e-3, projection_radius * projection_radius * 0.05),
-            require_boundary_touch=False,
-        )
-        region_polys = []
-        for pts in regions:
-            try:
-                poly = _coerce_polygon(Polygon([(float(x), float(y)) for x, y in pts]), allow_largest=True)
-            except Exception:
-                poly = None
-            region_polys.append(poly)
-        snap_region_map = _assign_regions_to_snapped_cells(region_polys, snapped_polys)
-
     colors_bgr, _ = geometry.compute_region_colors(
         [[(float(x), float(y)) for x, y in pts] for pts in regions],
         canvas,

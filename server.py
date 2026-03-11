@@ -12,7 +12,6 @@ from typing import Any, Dict
 from flask import Flask, jsonify, request, send_from_directory
 import xml.etree.ElementTree as ET
 from PIL import Image, ImageDraw, ImageFont
-from shapely.geometry import LineString, Point
 
 import new_toy
 from scripts import packing, zones, config, source_voronoi
@@ -39,125 +38,6 @@ EXPORT_DIR = ROOT / "export"
 PACKED_INCLUDE_BLEED = True
 
 app = Flask(__name__, static_folder=None)
-
-
-def _merge_ordered_boundary_points(
-    ordered: list[tuple[float, tuple[float, float]]],
-    threshold: float,
-) -> list[tuple[float, float]]:
-    if not ordered:
-        return []
-    if threshold <= 0:
-        return [pt for _s, pt in ordered]
-    out: list[tuple[float, float]] = []
-    i = 0
-    while i < len(ordered):
-        cluster = [ordered[i][1]]
-        j = i + 1
-        prev = ordered[i][1]
-        while j < len(ordered):
-            cur = ordered[j][1]
-            if math.hypot(cur[0] - prev[0], cur[1] - prev[1]) > threshold:
-                break
-            cluster.append(cur)
-            prev = cur
-            j += 1
-        cx = sum(p[0] for p in cluster) / len(cluster)
-        cy = sum(p[1] for p in cluster) / len(cluster)
-        out.append((cx, cy))
-        i = j
-    return out
-
-
-def _weld_projected_points(
-    ordered: list[tuple[float, tuple[float, float]]],
-    zone_outline: list[tuple[float, float]],
-    weld_threshold: float = 1.0,
-    vertex_snap_threshold: float = 1.0,
-) -> list[tuple[float, float]]:
-    if not ordered:
-        return []
-    welded = _merge_ordered_boundary_points(ordered, weld_threshold)
-    if not welded:
-        return []
-    snapped: list[tuple[float, float]] = []
-    v2 = vertex_snap_threshold * vertex_snap_threshold
-    for p in welded:
-        best = p
-        best_d2 = v2
-        for v in zone_outline:
-            dx = p[0] - v[0]
-            dy = p[1] - v[1]
-            d2 = dx * dx + dy * dy
-            if d2 <= best_d2:
-                best_d2 = d2
-                best = (float(v[0]), float(v[1]))
-        snapped.append(best)
-    deduped: list[tuple[float, float]] = []
-    for p in snapped:
-        if not deduped or math.hypot(p[0] - deduped[-1][0], p[1] - deduped[-1][1]) > 1e-9:
-            deduped.append(p)
-    if len(deduped) > 1 and math.hypot(deduped[0][0] - deduped[-1][0], deduped[0][1] - deduped[-1][1]) <= 1e-9:
-        deduped = deduped[:-1]
-    return deduped
-
-
-def _build_zone_polys_svg_bleed_logic(
-    polys: list[list[tuple[float, float]]],
-    zone_id: list,
-    bleed_radius: float,
-) -> tuple[list[list[tuple[float, float]]], list[int]]:
-    # Mirror SVG bleed debug logic: take near-boundary region vertices, project to boundary,
-    # weld/snap, then use this outline as zone_poly.
-    zone_to_regions: dict[int, list[list[tuple[float, float]]]] = {}
-    for rid, poly in enumerate(polys):
-        if rid >= len(zone_id) or len(poly) < 3:
-            continue
-        try:
-            zid = int(zone_id[rid])
-        except Exception:
-            continue
-        zone_to_regions.setdefault(zid, []).append(poly)
-
-    zone_order = sorted(zone_to_regions.keys())
-    zone_polys: list[list[tuple[float, float]]] = []
-    out_order: list[int] = []
-    for zid in zone_order:
-        zone_region_pts = zone_to_regions.get(zid, [])
-        if not zone_region_pts:
-            continue
-        zone_outline_map = zones.build_zone_boundaries(zone_region_pts, [0] * len(zone_region_pts))
-        outline = (zone_outline_map.get(0) or [[]])[0]
-        if len(outline) < 3:
-            continue
-        outline = [(float(x), float(y)) for x, y in outline]
-        boundary = LineString(outline + [outline[0]])
-        ordered: list[tuple[float, tuple[float, float]]] = []
-        for poly in zone_region_pts:
-            for p in poly:
-                pt = (float(p[0]), float(p[1]))
-                if float(boundary.distance(Point(pt))) > bleed_radius + 1e-9:
-                    continue
-                s = float(boundary.project(Point(pt)))
-                pi = boundary.interpolate(s)
-                ordered.append((s, (float(pi.x), float(pi.y))))
-        if not ordered:
-            zone_polys.append(outline)
-            out_order.append(zid)
-            continue
-        ordered.sort(key=lambda x: x[0])
-        welded = _weld_projected_points(
-            ordered,
-            outline,
-            weld_threshold=1.0,
-            vertex_snap_threshold=1.0,
-        )
-        final_outline = _merge_ordered_boundary_points([(float(i), p) for i, p in enumerate(welded)], 0.5)
-        if len(final_outline) < 3:
-            final_outline = outline
-        zone_polys.append(final_outline)
-        out_order.append(zid)
-    return zone_polys, out_order
 
 
 def _cache_file(prefix: str, source_name: str, ext: str = ".json") -> Path:
@@ -704,15 +584,31 @@ def api_pack_from_scene():
                 continue
         polys.append(pts if pts else [])
     _mark("normalize_regions")
-    # Always derive zone_polys from the same logic used by SVG bleed debug
-    # (near-boundary vertices -> projection -> weld/snap), so packed flow matches debug flow.
-    zone_polys, zone_order = _build_zone_polys_svg_bleed_logic(
-        polys,
-        zone_id,
-        float(getattr(config, "PACK_BLEED", 0.0) or 0.0),
-    )
-    explicit_zone_polys = False
-    if not zone_polys:
+    zone_polys_payload = payload.get("zone_polys") or []
+    zone_order_payload = payload.get("zone_order") or []
+    zone_polys: list[list[tuple[float, float]]] = []
+    for poly in zone_polys_payload:
+        pts = []
+        for p in poly or []:
+            if not isinstance(p, (list, tuple)) or len(p) < 2:
+                continue
+            try:
+                pts.append((float(p[0]), float(p[1])))
+            except Exception:
+                continue
+        if len(pts) >= 3:
+            zone_polys.append(pts)
+    explicit_zone_polys = bool(zone_polys)
+    if explicit_zone_polys:
+        zone_order = []
+        for idx, zid in enumerate(zone_order_payload):
+            try:
+                zone_order.append(int(zid))
+            except Exception:
+                zone_order.append(idx)
+        if len(zone_order) != len(zone_polys):
+            zone_order = list(range(len(zone_polys)))
+    else:
         zone_polys, zone_order, _zone_poly_debug = zones.build_zone_polys(polys, zone_id)
     print(
         f"[pack_from_scene] zone_polys built={len(zone_polys)} zone_order={len(zone_order)} "
