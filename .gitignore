@@ -12,3 +12,6 @@ packed_missing.txt
 scene_cache.json
 zone_labels.json
 zones_cache.json
+
+# Archives
+*.zip
