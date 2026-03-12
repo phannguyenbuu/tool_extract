@@ -1,3 +1,0 @@
-zones_total=120
-placed=120
-missing=0

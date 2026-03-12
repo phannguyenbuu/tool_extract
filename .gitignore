@@ -15,3 +15,8 @@ zones_cache.json
 
 # Archives
 *.zip
+
+frontend/node_modules/
+.vite/
+.venv/
+__pycache__/

@@ -307,6 +307,123 @@ const parsePoints = (str) => {
   return pts;
 };
 
+const parsePath = (d) => {
+  if (!d) return [];
+  const tokenRe = /([MLHVCSQTAZmlhvcsqtaz])|(-?\d*\.?\d+(?:[eE][-+]?[0-9]+)?)/g;
+  const tokens = [];
+  let match;
+  while ((match = tokenRe.exec(d)) !== null) {
+    tokens.push(match[1] ? { type: "cmd", val: match[1] } : { type: "num", val: parseFloat(match[2]) });
+  }
+
+  const paths = [];
+  let currentPath = [];
+  let currX = 0, currY = 0;
+  let startX = 0, startY = 0;
+  let i = 0;
+  let cmd = "";
+
+  const getNums = (count) => {
+    const res = [];
+    for (let j = 0; j < count; j++) {
+      if (i < tokens.length && tokens[i].type === "num") {
+        res.push(tokens[i++].val);
+      } else {
+        break;
+      }
+    }
+    return res;
+  };
+
+  while (i < tokens.length) {
+    if (tokens[i].type === "cmd") {
+      cmd = tokens[i++].val;
+    } else {
+      if (cmd.toUpperCase() === "M") {
+        cmd = cmd === "M" ? "L" : "l";
+      }
+    }
+
+    if (!cmd) { i++; continue; }
+    const uCmd = cmd.toUpperCase();
+    const rel = cmd === cmd.toLowerCase();
+
+    if (uCmd === "M") {
+      if (currentPath.length) paths.push(currentPath);
+      const pts = getNums(2);
+      if (pts.length === 2) {
+        currX = rel ? currX + pts[0] : pts[0];
+        currY = rel ? currY + pts[1] : pts[1];
+        currentPath = [[currX, currY]];
+        startX = currX; startY = currY;
+      }
+    } else if (uCmd === "L") {
+      const pts = getNums(2);
+      if (pts.length === 2) {
+        currX = rel ? currX + pts[0] : pts[0];
+        currY = rel ? currY + pts[1] : pts[1];
+        currentPath.push([currX, currY]);
+      }
+    } else if (uCmd === "H") {
+      const pts = getNums(1);
+      if (pts.length === 1) {
+        currX = rel ? currX + pts[0] : pts[0];
+        currentPath.push([currX, currY]);
+      }
+    } else if (uCmd === "V") {
+      const pts = getNums(1);
+      if (pts.length === 1) {
+        currY = rel ? currY + pts[0] : pts[0];
+        currentPath.push([currX, currY]);
+      }
+    } else if (uCmd === "C") {
+      const pts = getNums(6);
+      if (pts.length === 6) {
+        currX = rel ? currX + pts[4] : pts[4];
+        currY = rel ? currY + pts[5] : pts[5];
+        currentPath.push([currX, currY]);
+      }
+    } else if (uCmd === "S") {
+      const pts = getNums(4);
+      if (pts.length === 4) {
+        currX = rel ? currX + pts[2] : pts[2];
+        currY = rel ? currY + pts[3] : pts[3];
+        currentPath.push([currX, currY]);
+      }
+    } else if (uCmd === "Q") {
+      const pts = getNums(4);
+      if (pts.length === 4) {
+        currX = rel ? currX + pts[2] : pts[2];
+        currY = rel ? currY + pts[3] : pts[3];
+        currentPath.push([currX, currY]);
+      }
+    } else if (uCmd === "T") {
+      const pts = getNums(2);
+      if (pts.length === 2) {
+        currX = rel ? currX + pts[0] : pts[0];
+        currY = rel ? currY + pts[1] : pts[1];
+        currentPath.push([currX, currY]);
+      }
+    } else if (uCmd === "A") {
+      const pts = getNums(7);
+      if (pts.length === 7) {
+        currX = rel ? currX + pts[5] : pts[5];
+        currY = rel ? currY + pts[6] : pts[6];
+        currentPath.push([currX, currY]);
+      }
+    } else if (uCmd === "Z") {
+      if (currentPath.length) {
+        currentPath.push([startX, startY]);
+        currX = startX; currY = startY;
+      }
+    } else {
+      while (i < tokens.length && tokens[i].type === "num") i++;
+    }
+  }
+  if (currentPath.length) paths.push(currentPath);
+  return paths;
+};
+
 const parseSvgSize = (svgText) => {
   const doc = new DOMParser().parseFromString(svgText, "image/svg+xml");
   const svg = doc.querySelector("svg");
@@ -458,6 +575,19 @@ const buildSegmentsFromSvg = (svgText) => {
       segments.push(seg);
       if (isBorder) borderSegments.push(seg);
     }
+  });
+  doc.querySelectorAll("path").forEach((el) => {
+    const d = el.getAttribute("d");
+    if (!d) return;
+    const paths = parsePath(d);
+    paths.forEach((pts) => {
+      const isBorder = isOuterBorder(pts);
+      for (let i = 0; i + 1 < pts.length; i++) {
+        const seg = [pts[i], pts[i + 1]];
+        segments.push(seg);
+        if (isBorder) borderSegments.push(seg);
+      }
+    });
   });
   return { segments, borderSegments };
 };
@@ -1126,7 +1256,6 @@ export default function App() {
   const [exportPdfInfo, setExportPdfInfo] = useState(null);
   const [exportHtmlInfo, setExportHtmlInfo] = useState([]);
   const [exportPdfLoading, setExportPdfLoading] = useState(false);
-  const [exportPdfTiming, setExportPdfTiming] = useState({ startTs: 0, elapsedMs: 0 });
   const [showSim, setShowSim] = useState(false);
   const [simPlaying, setSimPlaying] = useState(false);
   const [simProgress, setSimProgress] = useState(0);
@@ -3448,10 +3577,11 @@ export default function App() {
             Number.isFinite(tTotal) ? ` (${Math.round(tTotal)} ms)` : ""
           }`
         );
+      }
       if (Number.isFinite(tTotal)) {
         setPackUiLog(`Pack: ${Math.round(tTotal)} ms`);
+        localStorage.setItem("lastPackDuration", Math.round(tTotal).toString());
       }
-      localStorage.setItem("lastPackDuration", Math.round(durationMs).toString());
     } catch (err) {
       setPackedBleedError(err.message || String(err));
       setPackUiLog(`Pack: failed (${err.message || String(err)})`);

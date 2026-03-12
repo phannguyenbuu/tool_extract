@@ -1,11 +1,11 @@
 @echo off
-cd /d d:\Dropbox\_Documents\_Vlance_2026\rtoy\tool_extract
-set SERVER_DEBUG=0
-set SERVER_RELOADER=0
-if exist d:\Dropbox\_Documents\_Vlance_2026\rtoy\venv\Scripts\python.exe (
-  d:\Dropbox\_Documents\_Vlance_2026\rtoy\venv\Scripts\python.exe server.py 1>server.out.log 2>server.err.log
-) else if exist d:\Dropbox\_Documents\_Vlance_2026\rtoy\.venv\Scripts\python.exe (
-  d:\Dropbox\_Documents\_Vlance_2026\rtoy\.venv\Scripts\python.exe server.py 1>server.out.log 2>server.err.log
+set SERVER_DEBUG=1
+set SERVER_RELOADER=1
+set PYTHONUNBUFFERED=1
+if exist venv\Scripts\python.exe (
+  venv\Scripts\python.exe backend\server.py
+) else if exist .venv\Scripts\python.exe (
+  .venv\Scripts\python.exe backend\server.py
 ) else (
-  python server.py 1>server.out.log 2>server.err.log
+  python backend\server.py
 )
