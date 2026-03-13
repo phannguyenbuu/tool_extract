@@ -556,6 +556,15 @@ def api_pack_from_scene():
         return jsonify({"ok": False, "error": "regions/zone_id missing"}), 400
     config._apply_pack_env()
     unique_zone_count = len({int(z) for z in zone_id if isinstance(z, (int, float, str))})
+    
+    # Cleanup temp files to prevent stale reads
+    for p in [RASTER_PACK_TMP_JSON, config.OUT_PACK_SVG, config.OUT_PACK_SVG_PAGE2]:
+        try:
+            if p.exists():
+                os.remove(p)
+        except Exception:
+            pass
+
     print(
         "[pack_from_scene] input "
         f"canvas={w}x{h} regions={len(regions)} zones={unique_zone_count} "
@@ -563,7 +572,6 @@ def api_pack_from_scene():
         f"grid={getattr(config, 'PACK_GRID_STEP', 0)} angle={getattr(config, 'PACK_ANGLE_STEP', 0)} "
         f"mode={getattr(config, 'PACK_MODE', 'fast')}"
     )
-    print("[pack_from_scene] scene_cache reuse=yes recompute_scene=no")
     _mark("init_validate")
     grid_step = max(1.0, float(getattr(config, "PACK_GRID_STEP", 5.0) or 5.0))
     # Fixed margin as requested.
@@ -776,14 +784,8 @@ def api_pack_from_scene():
         "placements": [[float(a), float(b), int(c), int(d), bool(e)] for (a, b, c, d, e) in placements],
         "rot_info": rot_info,
     }
-    try:
-        RASTER_PACK_TMP_JSON.write_text(
-            json.dumps(tmp_payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        print(f"[pack_from_scene] write tmp_json path={RASTER_PACK_TMP_JSON}")
-    except Exception:
-        pass
-    _mark("write_tmp_json")
+    # Removed RASTER_PACK_TMP_JSON generation
+    _mark("skip_tmp_json")
     try:
         img = Image.new("RGB", (max(1, int(w)), max(1, int(h))), (6, 14, 46))
         draw = ImageDraw.Draw(img, "RGBA")

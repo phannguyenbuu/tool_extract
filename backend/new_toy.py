@@ -16,13 +16,8 @@ from geometry import (
 from packing import (
     _log_step,
     _rotate_pts,
-    build_bleed,
     compute_scene,
-    main,
     pack_regions,
-    write_pack_log,
-    write_pack_outline_png,
-    write_pack_png,
     write_pack_svg,
 )
 from svg_utils import (
@@ -58,4 +53,4 @@ from zones import (
 
 
 if __name__ == "__main__":
-    main()
+    pass
