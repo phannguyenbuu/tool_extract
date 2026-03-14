@@ -231,7 +231,7 @@ def api_scene():
         if val is not None:
             os.environ[env_key] = str(val)
 
-    data = new_toy.compute_scene(source_path, snap, render_packed_png=False)
+    data = new_toy.compute_scene(source_path, snap, include_packed=False)
     data["source_name"] = source_name
     try:
         scene_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -308,20 +308,21 @@ def api_source_region_scene():
         cached_voronoi=source_edit.get("source_voronoi"),
     )
     data["source_name"] = source_name
-    try:
-        _source_snap_region_map_path(source_name).write_text(
-            json.dumps(
-                {
-                    "source_name": source_name,
-                    "snap_region_map": data.get("snap_region_map", {}),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
+    if getattr(config, "WRITE_DEBUG_ARTIFACTS", False):
+        try:
+            _source_snap_region_map_path(source_name).write_text(
+                json.dumps(
+                    {
+                        "source_name": source_name,
+                        "snap_region_map": data.get("snap_region_map", {}),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
     return jsonify(data)
 
 
@@ -623,7 +624,7 @@ def api_pack_from_scene():
     _mark("build_zone_polys")
     # Bleed is applied before raster nest via inflated zone polygons.
     zone_pack_polys = packing._build_zone_pack_polys(
-        zone_polys, float(config.PACK_BLEED), bevel_angle=60.0
+        zone_polys, float(config.PACK_BLEED)
     )
     print(
         "[pack_from_scene] bleed_polys "
@@ -786,57 +787,60 @@ def api_pack_from_scene():
     }
     # Removed RASTER_PACK_TMP_JSON generation
     _mark("skip_tmp_json")
-    try:
-        img = Image.new("RGB", (max(1, int(w)), max(1, int(h))), (6, 14, 46))
-        draw = ImageDraw.Draw(img, "RGBA")
-        overlap_ids = set()
-        for pair in raster_report.get("pairs", []) or []:
-            try:
-                overlap_ids.add(int(pair[0]))
-                overlap_ids.add(int(pair[1]))
-            except Exception:
-                continue
-        for rid, pts in enumerate(zone_pack_polys):
-            if rid >= len(placements) or rid >= len(rot_info) or not pts:
-                continue
-            dx, dy, bw, bh, _ = placements[rid]
-            if bw <= 0 or bh <= 0:
-                continue
-            info = rot_info[rid]
-            bin_idx = int(info.get("bin", 0))
-            if bin_idx != 0:
-                continue
-            try:
-                ang = float(info.get("angle", 0.0))
-                cx = float(info.get("cx", 0.0))
-                cy = float(info.get("cy", 0.0))
-            except Exception:
-                continue
-            tpts = []
-            for p in packing._rotate_pts(pts, ang, cx, cy):
-                x = float(p[0]) + float(dx)
-                y = float(p[1]) + float(dy)
-                if not (math.isfinite(x) and math.isfinite(y)):
-                    tpts = []
-                    break
-                tpts.append((x, y))
-            if len(tpts) < 3:
-                continue
-            r = (rid * 67) % 180 + 60
-            g = (rid * 41) % 180 + 60
-            b = (rid * 23) % 180 + 60
-            try:
-                draw.polygon(tpts, fill=(r, g, b, 130))
-                if rid in overlap_ids:
-                    draw.line(tpts + [tpts[0]], fill=(255, 64, 64, 255), width=3)
-                else:
-                    draw.line(tpts + [tpts[0]], fill=(255, 255, 255, 220), width=1)
-            except Exception:
-                continue
-        img.save(RASTER_PACK_TMP_PNG)
-        print(f"[pack_from_scene] write tmp_png path={RASTER_PACK_TMP_PNG}")
-    except Exception:
-        pass
+    wrote_tmp_png = False
+    if raster_only or getattr(config, "WRITE_DEBUG_ARTIFACTS", False):
+        try:
+            img = Image.new("RGB", (max(1, int(w)), max(1, int(h))), (6, 14, 46))
+            draw = ImageDraw.Draw(img, "RGBA")
+            overlap_ids = set()
+            for pair in raster_report.get("pairs", []) or []:
+                try:
+                    overlap_ids.add(int(pair[0]))
+                    overlap_ids.add(int(pair[1]))
+                except Exception:
+                    continue
+            for rid, pts in enumerate(zone_pack_polys):
+                if rid >= len(placements) or rid >= len(rot_info) or not pts:
+                    continue
+                dx, dy, bw, bh, _ = placements[rid]
+                if bw <= 0 or bh <= 0:
+                    continue
+                info = rot_info[rid]
+                bin_idx = int(info.get("bin", 0))
+                if bin_idx != 0:
+                    continue
+                try:
+                    ang = float(info.get("angle", 0.0))
+                    cx = float(info.get("cx", 0.0))
+                    cy = float(info.get("cy", 0.0))
+                except Exception:
+                    continue
+                tpts = []
+                for p in packing._rotate_pts(pts, ang, cx, cy):
+                    x = float(p[0]) + float(dx)
+                    y = float(p[1]) + float(dy)
+                    if not (math.isfinite(x) and math.isfinite(y)):
+                        tpts = []
+                        break
+                    tpts.append((x, y))
+                if len(tpts) < 3:
+                    continue
+                r = (rid * 67) % 180 + 60
+                g = (rid * 41) % 180 + 60
+                b = (rid * 23) % 180 + 60
+                try:
+                    draw.polygon(tpts, fill=(r, g, b, 130))
+                    if rid in overlap_ids:
+                        draw.line(tpts + [tpts[0]], fill=(255, 64, 64, 255), width=3)
+                    else:
+                        draw.line(tpts + [tpts[0]], fill=(255, 255, 255, 220), width=1)
+                except Exception:
+                    continue
+            img.save(RASTER_PACK_TMP_PNG)
+            wrote_tmp_png = True
+            print(f"[pack_from_scene] write tmp_png path={RASTER_PACK_TMP_PNG}")
+        except Exception:
+            pass
     _mark("write_tmp_png")
     placement_bin = [int(info.get("bin", -1)) for info in rot_info]
     placement_bin_by_zid = {}
@@ -882,7 +886,7 @@ def api_pack_from_scene():
     for i in range(len(polys)):
         c = colors_raw[i] if i < len(colors_raw) else None
         colors.append(_color_to_bgr(c))
-    packing.write_pack_svg(
+    packed_svg_text = packing.write_pack_svg(
         polys,
         zone_id,
         zone_order,
@@ -894,12 +898,13 @@ def api_pack_from_scene():
         placement_bin=placement_bin,
         placement_bin_by_zid=placement_bin_by_zid,
         page_idx=0,
-        out_path=PACKED_ZONE_SCENE_SVG,
+        out_path=None,
         include_bleed=PACKED_INCLUDE_BLEED,
+        write_file=False,
     )
     print(
         "[pack_from_scene] write_svg "
-        f"path={PACKED_ZONE_SCENE_SVG} include_bleed={int(bool(PACKED_INCLUDE_BLEED))}"
+        f"path=in_memory include_bleed={int(bool(PACKED_INCLUDE_BLEED))}"
     )
     _mark("write_svg_page1")
     timings_ms["total"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
@@ -911,7 +916,7 @@ def api_pack_from_scene():
     result = {
         "ok": True,
         "source_name": source_name,
-        "packed_svg": PACKED_ZONE_SCENE_SVG.read_text(encoding="utf-8"),
+        "packed_svg": packed_svg_text,
         "packed_svg_page2": "",
         "zone_polys": zone_polys,
         "zone_order": zone_order,
@@ -920,9 +925,9 @@ def api_pack_from_scene():
         "zone_rot": zone_rot,
         "zone_center": zone_center,
         "placement_bin": placement_bin_by_zid,
-        "raster_tmp_path": str(RASTER_PACK_TMP_PNG),
-        "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG),
-        "raster_tmp_png_url": "/out/tmp_raster_pack.png",
+        "raster_tmp_path": str(RASTER_PACK_TMP_PNG) if wrote_tmp_png else "",
+        "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG) if wrote_tmp_png else "",
+        "raster_tmp_png_url": "/out/tmp_raster_pack.png" if wrote_tmp_png else "",
         "raster_tmp_json_path": str(RASTER_PACK_TMP_JSON),
         "raster_overlap_count": int(raster_report.get("count", 0)),
         "raster_pages": 1,
@@ -1895,6 +1900,7 @@ def serve_static(path):
 if __name__ == "__main__":
     server_debug = str(os.environ.get("SERVER_DEBUG", "1")).strip().lower() not in {"0", "false", "no"}
     use_reloader = str(os.environ.get("SERVER_RELOADER", "1")).strip().lower() not in {"0", "false", "no"}
+    server_port = int(str(os.environ.get("SERVER_PORT", "5000")).strip() or "5000")
     if server_debug and os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         ensure_outputs()
-    app.run(host="127.0.0.1", port=5000, debug=server_debug, use_reloader=use_reloader)
+    app.run(host="127.0.0.1", port=server_port, debug=server_debug, use_reloader=use_reloader)

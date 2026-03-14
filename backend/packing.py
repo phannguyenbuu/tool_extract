@@ -76,13 +76,6 @@ def _offset_outline_same_vertices(
         if prev is None or cur is None: out.append(pts[i]); continue
         (p1, p2, n1), (p3, p4, n2) = prev, cur
         
-        # --- BEVEL LOGIC FOR SHARP CORNERS (< 20 DEGREES) ---
-        dot = max(-1.0, min(1.0, n1[0]*n2[0] + n1[1]*n2[1]))
-        if dot < -0.9397: # Angle between normals > 160 deg -> Corner < 20 deg
-            out.append(p2) # First projected point
-            out.append(p3) # Second projected point
-            continue
-
         x1, y1 = p1; x2, y2 = p2; x3, y3 = p3; x4, y4 = p4
         den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
         if abs(den) < 1e-8:
@@ -125,17 +118,15 @@ def _bevel_outline_by_angle(polyline, r, angle_thresh=90.0) -> Tuple[List[Tuple[
     return out, debug_pts
 
 
-def _build_zone_pack_polys(zone_polys, bleed, bevel_angle=20.0) -> List[List[Tuple[float, float]]]:
+def _build_zone_pack_polys(zone_polys, bleed) -> List[List[Tuple[float, float]]]:
     if not zone_polys: return []
-    out, br = [], max(1.0, bleed * 0.5)
+    out = []
     for poly in zone_polys:
         pts = poly[:-1] if len(poly)>1 and abs(poly[0][0]-poly[-1][0])<1e-6 and abs(poly[0][1]-poly[-1][1])<1e-6 else poly[:]
         if len(pts) >= 3:
             if bleed > 0: pts = _offset_outline_same_vertices(pts, bleed)
-            pts, _ = _bevel_outline_by_angle(pts, br, angle_thresh=bevel_angle)
-        out.append(pts)
+            out.append(pts)
     return out
-
 
 def _resolve_pack_overlaps(zone_polys, placements, rot_info, step, padding=0.0, max_iter=50):
     if not zone_polys or not placements: return placements
@@ -195,7 +186,14 @@ def pack_regions_raster_fast(polys, canvas, fixed_centers=None, grid_step=4.0, r
     bw, bh = max(1, int((w-2*config.PACK_MARGIN_X-2*safety)/cell)), max(1, int((h-2*config.PACK_MARGIN_Y-2*safety)/cell))
     grid = np.zeros((bh, bw), dtype=np.uint8)
     rotations = rotations or [0.0, 90.0, 180.0, 270.0]
-    placements, rot_info, order, masks, centers, areas = [(-1,-1,0,0,False)]*len(polys), [{"bin":-1}]*len(polys), [], {}, {}, []
+    placements, rot_info, order, masks, centers, areas = (
+        [(-1, -1, 0, 0, False)] * len(polys),
+        [{"bin": -1} for _ in range(len(polys))],
+        [],
+        {},
+        {},
+        [],
+    )
     for rid in (place_ids or range(len(polys))):
         if rid>=len(polys) or len(polys[rid])<3: continue
         pg = Polygon(polys[rid])
@@ -227,7 +225,7 @@ def pack_regions_raster_fast(polys, canvas, fixed_centers=None, grid_step=4.0, r
                         break
                 if best and best[0] == ang: break
         if best:
-            ang, x, y, minx, miny, _, _, ww, hh, m = best
+            ang, x, y, minx, miny, mw, mh, ww, hh, m = best
             grid[y:y+mh, x:x+mw] |= m
             placements[rid] = (int(round(x_min+x*cell-minx)), int(round(y_min+y*cell-miny)), int(ceil(ww)), int(ceil(hh)), False)
             rot_info[rid] = {"angle": ang, "cx": centers[rid][0], "cy": centers[rid][1], "minx": minx, "miny": miny, "bin": 0}
@@ -279,7 +277,23 @@ def raster_overlap_report(zone_polys, placements, rot_info, canvas, cell=1):
     return {"count": len(pairs), "pairs": [list(p) for p in sorted(pairs)]}
 
 
-def write_pack_svg(polys, zone_id, zone_order, zone_polys, placements, canvas, colors, rot_info, *, placement_bin=None, placement_bin_by_zid=None, page_idx=0, out_path=None, include_bleed=True):
+def write_pack_svg(
+    polys,
+    zone_id,
+    zone_order,
+    zone_polys,
+    placements,
+    canvas,
+    colors,
+    rot_info,
+    *,
+    placement_bin=None,
+    placement_bin_by_zid=None,
+    page_idx=0,
+    out_path=None,
+    include_bleed=True,
+    write_file=True,
+):
     w, h, zone_shift, zone_rot, zone_center, zone_poly_by_zid = canvas[0], canvas[1], {}, {}, {}, {}
     bleed_canvas = float(config.PACK_BLEED)
     for idx, zid in enumerate(zone_order):
@@ -361,11 +375,14 @@ def write_pack_svg(polys, zone_id, zone_order, zone_polys, placements, canvas, c
                     except Exception: pass
                 bb, bg, br = colors[best_rid] if best_rid is not None else (200,200,200)
                 parts.append(f'<path d="M {" L ".join(f"{p[0]:.3f} {p[1]:.3f}" for p in bleed_poly)} Z" fill="rgb({br},{bg},{bb})" stroke="none"/>')
-    parts.append('</g></svg>')
-    (out_path or config.OUT_PACK_SVG).write_text("".join(parts), encoding="utf-8")
+    parts.append("</g></svg>")
+    svg_text = "".join(parts)
+    if write_file:
+        (out_path or config.OUT_PACK_SVG).write_text(svg_text, encoding="utf-8")
+    return svg_text
 
 
-def compute_scene(svg_path, snap: float) -> Dict:
+def compute_scene(svg_path, snap: float, include_packed: bool = False) -> Dict:
     config._apply_pack_env()
     regions, polys, canvas, debug = geometry.build_regions_from_svg(svg_path, snap_override=snap)
     zone_id = zones.build_zones(polys, config.TARGET_ZONES)
@@ -374,11 +391,18 @@ def compute_scene(svg_path, snap: float) -> Dict:
     zone_geoms = zones.build_zone_geoms(polys, zone_id)
     zone_polys, zone_order, zone_poly_debug = zones.build_zone_polys(polys, zone_id)
     zone_pack_polys = _build_zone_pack_polys(zone_polys, float(config.PACK_BLEED))
-    zone_pack_centers = [Polygon(p).centroid.coords[0] if p else (0,0) for p in zone_pack_polys]
-    placements, order, rot_info = pack_regions_raster_fast(zone_pack_polys, canvas, fixed_centers=zone_pack_centers)
-    placements = _resolve_pack_overlaps(zone_pack_polys, placements, rot_info, step=1.0, padding=float(config.PADDING))
-    placements = compact_nesting_polygons(zone_pack_polys, placements, rot_info, canvas)
-    placements = _fit_placements_into_canvas(placements, rot_info, canvas)
+    placements = [(-1, -1, 0, 0, False) for _ in zone_order]
+    rot_info = [{"angle": 0.0, "cx": 0.0, "cy": 0.0, "minx": 0.0, "miny": 0.0, "bin": -1} for _ in zone_order]
+    if include_packed and zone_pack_polys:
+        zone_pack_centers = [Polygon(p).centroid.coords[0] if p else (0, 0) for p in zone_pack_polys]
+        placements, order, rot_info = pack_regions_raster_fast(
+            zone_pack_polys, canvas, fixed_centers=zone_pack_centers
+        )
+        placements = _resolve_pack_overlaps(
+            zone_pack_polys, placements, rot_info, step=1.0, padding=float(config.PADDING)
+        )
+        placements = compact_nesting_polygons(zone_pack_polys, placements, rot_info, canvas)
+        placements = _fit_placements_into_canvas(placements, rot_info, canvas)
     zone_labels, zone_label_map = {}, {z: idx+1 for idx, z in enumerate(zone_order)}
     for zid, geom in zone_geoms.items():
         lx, ly, idx = None, None, {z: i for i, z in enumerate(zone_order)}.get(zid)
@@ -393,7 +417,19 @@ def compute_scene(svg_path, snap: float) -> Dict:
         zone_labels[str(zid)] = {"x": lx, "y": ly, "label": zone_label_map.get(zid, zid)}
     region_labels = {str(rid): {"x": float(Polygon(p).centroid.x), "y": float(Polygon(p).centroid.y), "label": rid, "zone": zone_id[rid] if rid<len(zone_id) else -1} for rid, p in enumerate(polys) if len(p)>=3}
     colors, _ = geometry.compute_region_colors(polys, canvas)
-    write_pack_svg(polys, zone_id, zone_order, zone_polys, placements, canvas, colors, rot_info, page_idx=0, out_path=config.OUT_PACK_SVG)
+    if include_packed:
+        write_pack_svg(
+            polys,
+            zone_id,
+            zone_order,
+            zone_polys,
+            placements,
+            canvas,
+            colors,
+            rot_info,
+            page_idx=0,
+            out_path=config.OUT_PACK_SVG,
+        )
     return {
         "canvas": {"w": canvas[0], "h": canvas[1]}, "draw_scale": config.DRAW_SCALE, "regions": polys, "zone_boundaries": zone_boundaries, "zone_id": zone_id, "zone_labels": zone_labels, "region_labels": region_labels, "zone_order": zone_order, "zone_pack_polys": zone_pack_polys,
         "zone_rot": {zid: rot_info[idx]["angle"] for idx, zid in enumerate(zone_order) if idx < len(rot_info)},

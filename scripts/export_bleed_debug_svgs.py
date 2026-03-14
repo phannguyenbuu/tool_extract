@@ -111,7 +111,7 @@ def main() -> None:
         boundary_open = boundary[:-1] if len(boundary) > 1 and boundary[0] == boundary[-1] else boundary
         offset = packing._offset_outline_same_vertices(boundary_open, bleed) if len(boundary_open) >= 3 else []
         bevel, _dbg = packing._bevel_outline_by_angle(offset, bleed, angle_thresh=60.0) if offset else ([], [])
-        pack_poly = packing._build_zone_pack_polys([zone_poly], bleed, bevel_angle=60.0)[0]
+                pack_poly = packing._build_zone_pack_polys([zone_poly], bleed)[0]
 
         minx, miny, maxx, maxy = bbox_of([p for p in [boundary_open, offset, bevel, zone_poly, pack_poly] if p])
         pad = 20.0

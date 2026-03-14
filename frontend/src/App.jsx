@@ -1279,8 +1279,6 @@ export default function App() {
   const regionNeighborCursorRef = useRef({});
   const [mainViewScale, setMainViewScale] = useState(1);
   const [mainViewPos, setMainViewPos] = useState({ x: 0, y: 0 });
-  const [scale, setScale] = useState(1);
-  const [pos, setPos] = useState({ x: 0, y: 0 });
   const [stageSize, setStageSize] = useState({ w: 800, h: 600 });
   const regionRef = useRef(null);
   const regionWrapRef = useRef(null);
@@ -1289,17 +1287,13 @@ export default function App() {
   const [regionStageSize, setRegionStageSize] = useState({ w: 400, h: 400 });
   const region2Ref = useRef(null);
   const region2WrapRef = useRef(null);
-  const [region2Scale, setRegion2Scale] = useState(1);
-  const [region2Pos, setRegion2Pos] = useState({ x: 0, y: 0 });
   const [region2StageSize, setRegion2StageSize] = useState({ w: 300, h: 200 });
   const zoneRef = useRef(null);
   const zoneWrapRef = useRef(null);
-  const [zoneScale, setZoneScale] = useState(1);
-  const [zonePos, setZonePos] = useState({ x: 0, y: 0 });
   const [zoneStageSize, setZoneStageSize] = useState({ w: 300, h: 200 });
   const zoneClickCacheRef = useRef([]);
-  const [leftTab, setLeftTab] = useState("region");
-  const rightTab = "packed";
+  const [leftTab, setLeftTab] = useState("source");
+  const [rightTab, setRightTab] = useState("packed");
   const neighborSnap = 0.5;
   const regionAdj = useMemo(
     () => buildRegionAdjacencyMulti((zoneScene || scene)?.regions || [], [neighborSnap, 2]),
@@ -1316,9 +1310,11 @@ export default function App() {
   const [packedFillPaths, setPackedFillPaths] = useState([]);
   const [packedBleedPaths, setPackedBleedPaths] = useState([]);
   const [packedBleedError, setPackedBleedError] = useState("");
+  const [packedDebugRects, setPackedDebugRects] = useState([]);
   const [packedFillPaths2, setPackedFillPaths2] = useState([]);
   const [packedBleedPaths2, setPackedBleedPaths2] = useState([]);
   const [packedBleedError2, setPackedBleedError2] = useState("");
+  const [packedDebugRects2, setPackedDebugRects2] = useState([]);
   const [packedEmptyCells, setPackedEmptyCells] = useState([]);
   const [edgeMode, setEdgeMode] = useState(false);
   const [addNodeMode, setAddNodeMode] = useState(false);
@@ -1473,7 +1469,7 @@ export default function App() {
     [sourceVoronoi]
   );
   const liveSnapRadius = Math.max(0, (snap || 0) * 0.35);
-  const greenToRedSnapRadius = 50;
+  const greenToRedSnapRadius = 5;
 
   const createSourceEditSnapshot = (
     nextNodes = nodes,
@@ -1967,8 +1963,8 @@ export default function App() {
     const viewW = stageSize.w;
     const viewH = stageSize.h;
     const fitScale = Math.min(viewW / w, viewH / h) * 0.95;
-    setScale(fitScale);
-    setPos({
+    setMainViewScale(fitScale);
+    setMainViewPos({
       x: (viewW - w * fitScale) / 2,
       y: (viewH - h * fitScale) / 2,
     });
@@ -1995,8 +1991,8 @@ export default function App() {
     const w = bounds.maxx - bounds.minx;
     const h = bounds.maxy - bounds.miny;
     const fitScale = Math.min(viewW / w, viewH / h) * 0.95;
-    setRegion2Scale(fitScale);
-    setRegion2Pos({
+    setMainViewScale(fitScale);
+    setMainViewPos({
       x: (viewW - w * fitScale) / 2 - bounds.minx * fitScale,
       y: (viewH - h * fitScale) / 2 - bounds.miny * fitScale,
     });
@@ -2009,8 +2005,8 @@ export default function App() {
     const w = bounds.maxx - bounds.minx;
     const h = bounds.maxy - bounds.miny;
     const fitScale = Math.min(viewW / w, viewH / h) * 0.95;
-    setZoneScale(fitScale);
-    setZonePos({
+    setMainViewScale(fitScale);
+    setMainViewPos({
       x: (viewW - w * fitScale) / 2 - bounds.minx * fitScale,
       y: (viewH - h * fitScale) / 2 - bounds.miny * fitScale,
     });
@@ -2265,19 +2261,19 @@ export default function App() {
             }));
           }
         }
-        if (savedView?.source?.scale && savedView?.source?.pos) {
-          setScale(savedView.source.scale);
-          setPos(savedView.source.pos);
+        if (savedView?.mainView?.scale && savedView?.mainView?.pos) {
+          setMainViewScale(savedView.mainView.scale);
+          setMainViewPos(savedView.mainView.pos);
           setAutoFit(false);
         }
-        if (fit && !(savedView?.source?.scale && savedView?.source?.pos)) {
+        if (fit && !(savedView?.mainView?.scale && savedView?.mainView?.pos)) {
           const w = parsedSize.w || 1200;
           const h = parsedSize.h || 800;
           const viewW = stageSize.w;
           const viewH = stageSize.h;
           const fitScale = Math.min(viewW / w, viewH / h) * 0.95;
-          setScale(fitScale);
-          setPos({
+          setMainViewScale(fitScale);
+          setMainViewPos({
             x: (viewW - w * fitScale) / 2,
             y: (viewH - h * fitScale) / 2,
           });
@@ -2393,31 +2389,31 @@ export default function App() {
           });
           setPackedLabels(nextPackedLabels);
         }
-        if (savedView?.source?.scale && savedView?.source?.pos) {
-          setScale(savedView.source.scale);
-          setPos(savedView.source.pos);
+        if (savedView?.mainView?.scale && savedView?.mainView?.pos) {
+          setMainViewScale(savedView.mainView.scale);
+          setMainViewPos(savedView.mainView.pos);
           setAutoFit(false);
         }
         if (savedView?.region?.scale && savedView?.region?.pos) {
           setRegionScale(savedView.region.scale);
           setRegionPos(savedView.region.pos);
         }
-        if (savedView?.region2?.scale && savedView?.region2?.pos) {
-          setRegion2Scale(savedView.region2.scale);
-          setRegion2Pos(savedView.region2.pos);
+        if (savedView?.mainView?.scale && savedView?.mainView?.pos) {
+          setMainViewScale(savedView.mainView.scale);
+          setMainViewPos(savedView.mainView.pos);
         }
-        if (savedView?.zone?.scale && savedView?.zone?.pos) {
-          setZoneScale(savedView.zone.scale);
-          setZonePos(savedView.zone.pos);
+        if (savedView?.mainView?.scale && savedView?.mainView?.pos) {
+          setMainViewScale(savedView.mainView.scale);
+          setMainViewPos(savedView.mainView.pos);
         }
-        if (fit && !(savedView?.source?.scale && savedView?.source?.pos)) {
+        if (fit && !(savedView?.mainView?.scale && savedView?.mainView?.pos)) {
           const w = parsedSize.w || data.canvas?.w || 1200;
           const h = parsedSize.h || data.canvas?.h || 800;
           const viewW = stageSize.w;
           const viewH = stageSize.h;
         const fitScale = Math.min(viewW / w, viewH / h) * 0.95;
-        setScale(fitScale);
-        setPos({
+        setMainViewScale(fitScale);
+        setMainViewPos({
           x: (viewW - w * fitScale) / 2,
           y: (viewH - h * fitScale) / 2,
         });
@@ -2816,8 +2812,8 @@ export default function App() {
     };
     const direction = e.evt.deltaY > 0 ? 1 : -1;
     const newScale = direction > 0 ? oldScale / scaleBy : oldScale * scaleBy;
-    setScale(newScale);
-    setPos({
+    setMainViewScale(newScale);
+    setMainViewPos({
       x: pointer.x - mousePointTo.x * newScale,
       y: pointer.y - mousePointTo.y * newScale,
     });
@@ -2861,12 +2857,14 @@ export default function App() {
       x: pointer.x - mousePointTo.x * newScale,
       y: pointer.y - mousePointTo.y * newScale,
     });
+    setAutoFit(false);
   };
 
   const handleMainViewDragMove = (e) => {
     const stage = e.target.getStage ? e.target.getStage() : e.target;
     if (!stage) return;
     setMainViewPos({ x: stage.x(), y: stage.y() });
+    setAutoFit(false);
   };
 
   const handleRegionDragMove = (e) => {
@@ -3437,12 +3435,11 @@ export default function App() {
       const scaledRegionData =
         (sourceScale || 1) === 1 ? regionData : scaleSceneData(regionData, sourceScale || 1);
       setScene(scaledRegionData);
-      await patchStateJson({ source_region_scene_cache: regionData }, sourceName);
       const nextZoneScene = buildSnapZoneSceneFromRegionScene(scaledRegionData);
       if (nextZoneScene?.zone_id?.length) {
         setZoneScene(nextZoneScene);
         setLeftTab("region");
-        clearManualPackedEdits(sourceName);
+        clearManualPackedEdits(sourceName, false);
         await refreshPackedFromZoneScene(nextZoneScene, enableBleed, sourceName);
       }
       setExportMsg("Saved Region + Zone");
@@ -3489,9 +3486,11 @@ export default function App() {
     }, 180);
   };
 
-  const clearManualPackedEdits = (sourceName = selectedSource) => {
+  const clearManualPackedEdits = (sourceName = selectedSource, persist = true) => {
     setManualPackedEdits({});
-    patchStateJson({ manual_packed: null }, sourceName);
+    if (persist) {
+      patchStateJson({ manual_packed: null }, sourceName);
+    }
   };
 
   const refreshPackedFromZoneScene = async (
@@ -3534,20 +3533,26 @@ export default function App() {
       }
       const data = await res.json();
       setShowRasterTemp(false);
+      let debugRectCount = 0;
       if (data?.packed_svg) {
         const parsed = parsePackedSvg(data.packed_svg);
         setPackedFillPaths(parsed.fillPaths);
         setPackedBleedPaths(parsed.bleedPaths);
+        setPackedDebugRects(parsed.debugRects || []);
         setPackedBleedError(parsed.hasBleed ? "" : "packed.svg missing bleed layer");
+        debugRectCount += (parsed.debugRects || []).length;
       }
       if (data?.packed_svg_page2) {
         const parsed2 = parsePackedSvg(data.packed_svg_page2);
         setPackedFillPaths2(parsed2.fillPaths);
         setPackedBleedPaths2(parsed2.bleedPaths);
+        setPackedDebugRects2(parsed2.debugRects || []);
         setPackedBleedError2(parsed2.hasBleed ? "" : "packed_page2.svg missing bleed layer");
+        debugRectCount += (parsed2.debugRects || []).length;
       } else {
         setPackedFillPaths2([]);
         setPackedBleedPaths2([]);
+        setPackedDebugRects2([]);
         setPackedBleedError2("");
       }
       if (data?.zone_shift || data?.zone_rot || data?.zone_center || data?.placement_bin) {
@@ -3567,19 +3572,21 @@ export default function App() {
         );
       }
       const tTotal = data?.timings_ms?.total;
+      const canvasCount = (data?.packed_svg_page2) ? 2 : 1;
+      const rectInfo = ` | Rects: ${canvasCount} (Canvas) + ${debugRectCount} (Debug)`;
+
       if (data?.one_page_ok === true) {
         setPackUiLog(
-          `Pack: One page OK${Number.isFinite(tTotal) ? ` (${Math.round(tTotal)} ms)` : ""}`
+          `Pack: One page OK${Number.isFinite(tTotal) ? ` (${Math.round(tTotal)}ms)` : ""}${rectInfo}`
         );
       } else if (Number.isFinite(data?.unplaced_count) && data.unplaced_count > 0) {
         setPackUiLog(
           `Pack: WARNING overflow, unplaced=${data.unplaced_count}${
-            Number.isFinite(tTotal) ? ` (${Math.round(tTotal)} ms)` : ""
-          }`
+            Number.isFinite(tTotal) ? ` (${Math.round(tTotal)}ms)` : ""
+          }${rectInfo}`
         );
-      }
-      if (Number.isFinite(tTotal)) {
-        setPackUiLog(`Pack: ${Math.round(tTotal)} ms`);
+      } else if (Number.isFinite(tTotal)) {
+        setPackUiLog(`Pack: ${Math.round(tTotal)}ms${rectInfo}`);
         localStorage.setItem("lastPackDuration", Math.round(tTotal).toString());
       }
     } catch (err) {
@@ -3855,7 +3862,8 @@ export default function App() {
     if (!sceneLoading) return null;
     if (isPackLoading && panel !== "right") return null;
     const elapsedSec = (packTiming.running ? packTiming.elapsedMs : 0) / 1000;
-    const remainingSec = Math.max(0, 80 - elapsedSec);
+    const estTotalSec = (packTiming.avgMs || packTiming.lastMs || 80000) / 1000;
+    const remainingSec = Math.max(0, estTotalSec - elapsedSec);
     const avgSec =
       packTiming.count > 0 && Number.isFinite(packTiming.avgMs)
         ? (packTiming.avgMs / 1000).toFixed(2)
@@ -3969,7 +3977,7 @@ export default function App() {
 
   const handlePackedZoneSelect = (zid) => {
     const next = String(zid);
-    setLeftTab("region");
+    setLeftTab("source");
     setSelectedZoneId(next);
     centerRegionViewById(next);
   };
@@ -4349,9 +4357,12 @@ export default function App() {
   ]);
 
   const parsePackedSvg = (text) => {
+    console.log("parsePackedSvg text length:", text?.length);
     const doc = new DOMParser().parseFromString(text, "image/svg+xml");
     const fill = doc.querySelector('g#fill');
     const bleed = doc.querySelector('g#bleed');
+    const debugBboxes = doc.querySelector('g#debug_bboxes');
+    console.log("parsePackedSvg groups found:", { fill: !!fill, bleed: !!bleed, debugBboxes: !!debugBboxes });
     const parsePaths = (node) =>
       Array.from(node?.querySelectorAll("path") || []).map((p) => ({
         d: p.getAttribute("d") || "",
@@ -4359,9 +4370,20 @@ export default function App() {
         stroke: p.getAttribute("stroke") || "",
         strokeWidth: parseFloat(p.getAttribute("stroke-width") || "0") || 0,
       }));
+    const parseRects = (node) =>
+      Array.from(node?.querySelectorAll("rect") || []).map((r) => ({
+        x: parseFloat(r.getAttribute("x") || "0") || 0,
+        y: parseFloat(r.getAttribute("y") || "0") || 0,
+        width: parseFloat(r.getAttribute("width") || "0") || 0,
+        height: parseFloat(r.getAttribute("height") || "0") || 0,
+        stroke: r.getAttribute("stroke") || "#ffffff",
+        strokeWidth: parseFloat(r.getAttribute("stroke-width") || "1") || 1,
+      }));
     const fillPaths = parsePaths(fill).filter((p) => p.d);
     const bleedPaths = parsePaths(bleed).filter((p) => p.d);
-    return { fillPaths, bleedPaths, hasBleed: !!bleed };
+    const debugRects = parseRects(debugBboxes);
+    console.log("parsePackedSvg results:", { fillPaths: fillPaths.length, bleedPaths: bleedPaths.length, debugRects: debugRects.length });
+    return { fillPaths, bleedPaths, debugRects, hasBleed: !!bleed };
   };
 
   function lerp(a, b, t) {
@@ -4816,7 +4838,7 @@ export default function App() {
           const target = resolveSourceSnapTarget(e.target.x(), e.target.y(), {
             excludeVoronoiId: v.id,
             includeNodes: true,
-            includeVoronoi: false,
+            includeVoronoi: true,
             radius: greenToRedSnapRadius,
           });
           const nextTarget =
@@ -5054,7 +5076,7 @@ export default function App() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scene, stageSize, regionStageSize, region2StageSize, zoneStageSize, autoFit, leftTab]);
+  }, [scene, stageSize, regionStageSize, region2StageSize, zoneStageSize, autoFit]);
 
   return (
     <div className="app">
@@ -5577,6 +5599,11 @@ export default function App() {
           {!sourceOnlyMode ? (
           <div className="panel toolbar">
             <div className="toolbar-segmented">
+              <button className={rightTab === "packed" ? "active" : ""} onClick={() => setRightTab("packed")}>Packed</button>
+              <button className={rightTab === "box" ? "active" : ""} onClick={() => setRightTab("box")}>Box</button>
+              <button className={rightTab === "boundary" ? "active" : ""} onClick={() => setRightTab("boundary")}>Boundary</button>
+            </div>
+            <div className="toolbar-segmented">
               {Object.entries(PACK_PRESETS).map(([key, cfg]) => (
                 <button
                   key={key}
@@ -5810,7 +5837,9 @@ export default function App() {
                             listening={false}
                           />
                         ))}
+                        {/* Tạm ẩn bleed paths */}
                         {enableBleed &&
+
                           packedBleedPaths.map((p, idx) => (
                           <Path
                             key={`bleed-path-${idx}`}
@@ -5819,13 +5848,13 @@ export default function App() {
                             listening={false}
                           />
                         ))}
-                      </Group>
-                      <Group
+                        </Group>
+                        <Group
                         x={(packedSource?.canvas?.w || 0) / 2 + (packedSource?.canvas?.w || 0) + 40}
                         y={(packedSource?.canvas?.h || 0) / 2}
                         offsetX={(packedSource?.canvas?.w || 0) / 2}
                         offsetY={(packedSource?.canvas?.h || 0) / 2}
-                      >
+                        >
                         {packedFillPaths2.map((p, idx) => (
                           <Path
                             key={`fill-path2-${idx}`}
@@ -5835,7 +5864,9 @@ export default function App() {
                             listening={false}
                           />
                         ))}
+                        {/* Tạm ẩn bleed paths 2 */}
                         {enableBleed &&
+
                           packedBleedPaths2.map((p, idx) => (
                           <Path
                             key={`bleed-path2-${idx}`}
@@ -5844,6 +5875,7 @@ export default function App() {
                             listening={false}
                           />
                         ))}
+
                       </Group>
                     </>
                   )}</Layer>
@@ -5971,8 +6003,46 @@ export default function App() {
                       onTouchStart={(e) => beginPackedEdit(item.zid, e)}
                     />
                   ))}</Layer>
-                ) : null}{rightTab === "box" ? (
-                <Layer name="packed-bbox">{showStroke
+                ) : null}{rightTab === "box" || rightTab === "boundary" ? (
+                <Layer name="packed-bbox">
+                  {rightTab === "box" && (packedFillPaths || []).length > 0 &&
+                    (!showImages) &&
+                    (packedFillPaths || []).map((p, idx) => {
+                      const offset = (packedSource?.canvas?.w || 0) + 40;
+                      return (
+                        <Path
+                          key={`fill-box-${idx}`}
+                          data={p.d}
+                          fill="none"
+                          stroke="rgba(255,255,255,0.2)"
+                          strokeWidth={0.5 / regionScale}
+                          x={(packedSource?.canvas?.w || 0) / 2}
+                          y={(packedSource?.canvas?.h || 0) / 2}
+                          offsetX={(packedSource?.canvas?.w || 0) / 2}
+                          offsetY={(packedSource?.canvas?.h || 0) / 2}
+                          listening={false}
+                        />
+                      );
+                    })}
+                  {rightTab === "box" && (packedFillPaths2 || []).length > 0 &&
+                    (packedFillPaths2 || []).map((p, idx) => {
+                      const offset = (packedSource?.canvas?.w || 0) + 40;
+                      return (
+                        <Path
+                          key={`fill-box2-${idx}`}
+                          data={p.d}
+                          fill="none"
+                          stroke="rgba(255,255,255,0.2)"
+                          strokeWidth={0.5 / regionScale}
+                          x={(packedSource?.canvas?.w || 0) / 2 + offset}
+                          y={(packedSource?.canvas?.h || 0) / 2}
+                          offsetX={(packedSource?.canvas?.w || 0) / 2}
+                          offsetY={(packedSource?.canvas?.h || 0) / 2}
+                          listening={false}
+                        />
+                      );
+                    })}
+                  {rightTab === "box" && showStroke
                     ? packedZoneOutlineItems.map((item) => {
                         const isSelected = String(item.zid) === String(selectedZoneId);
                         return (
@@ -5987,7 +6057,7 @@ export default function App() {
                           />
                         );
                       })
-                    : null}{packedEmptyCellsDerived.map((cell, idx) => (
+                    : null}{rightTab === "box" && packedEmptyCellsDerived.map((cell, idx) => (
                     <Circle
                       key={`pcell-${idx}`}
                       x={cell[0]}
@@ -5998,7 +6068,7 @@ export default function App() {
                       fill="rgba(0,194,255,0.12)"
                       listening={false}
                     />
-                  ))}{packedBoxData.map((box) => {
+                  ))}{rightTab === "box" && packedBoxData.map((box) => {
                     const w = Math.max(0, box.maxx - box.minx);
                     const h = Math.max(0, box.maxy - box.miny);
                     const size = Math.max(10 / regionScale, 6 / regionScale);
@@ -6047,7 +6117,7 @@ export default function App() {
           <div className="modal">
             <div className="modal-title">
               {exportPdfLoading
-                ? `Creating PDF... ${Math.max(0, 60 - exportPdfTiming.elapsedMs / 1000).toFixed(1)}s`
+                ? `Creating PDF... ${Math.max(0, (exportPdfTiming.estimatedMs - exportPdfTiming.elapsedMs) / 1000).toFixed(1)}s`
                 : "Successful created PDF !"}
             </div>
             {!exportPdfLoading && exportPdfInfo ? (

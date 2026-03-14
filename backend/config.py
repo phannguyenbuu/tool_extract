@@ -61,6 +61,11 @@ LABEL_FONT_SCALE = 0.64
 LABEL_OFFSET = 10.0
 PACK_LABEL_SCALE = 2.4
 PACK_BLEED = 3
+WRITE_DEBUG_ARTIFACTS = str(os.getenv("WRITE_DEBUG_ARTIFACTS", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
 def _safe_float_env(name: str, default: float) -> float:

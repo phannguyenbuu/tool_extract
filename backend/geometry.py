@@ -455,10 +455,19 @@ def build_regions_from_svg(
     debug["tri_removed_outside"] = float(tri_removed_outside)
     debug["polygons_final"] = float(len(polys))
 
-    svg_utils._write_svg_paths_fill_stroke(config.OUT_DEBUG_POLY_RAW_SVG, canvas[0], canvas[1], raw_poly_pts, "#4cc9f0", "#1b243d")
-    svg_utils._write_svg_paths_fill_stroke(config.OUT_DEBUG_POLY_FINAL_SVG, canvas[0], canvas[1], polys, "#a8ffb0", "#1b243d")
-    svg_utils._write_svg_paths_fill(config.OUT_DEBUG_TRI_OUT_SVG, canvas[0], canvas[1], tri_out_pts, "#ff2d55")
-    svg_utils._write_svg_paths_fill(config.OUT_DEBUG_TRI_SMALL_SVG, canvas[0], canvas[1], tri_small_pts, "#ffb020")
+    if config.WRITE_DEBUG_ARTIFACTS:
+        svg_utils._write_svg_paths_fill_stroke(
+            config.OUT_DEBUG_POLY_RAW_SVG, canvas[0], canvas[1], raw_poly_pts, "#4cc9f0", "#1b243d"
+        )
+        svg_utils._write_svg_paths_fill_stroke(
+            config.OUT_DEBUG_POLY_FINAL_SVG, canvas[0], canvas[1], polys, "#a8ffb0", "#1b243d"
+        )
+        svg_utils._write_svg_paths_fill(
+            config.OUT_DEBUG_TRI_OUT_SVG, canvas[0], canvas[1], tri_out_pts, "#ff2d55"
+        )
+        svg_utils._write_svg_paths_fill(
+            config.OUT_DEBUG_TRI_SMALL_SVG, canvas[0], canvas[1], tri_small_pts, "#ffb020"
+        )
 
     regions: List[RegionInfo] = []
     for idx, pts in enumerate(polys):
