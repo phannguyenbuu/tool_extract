@@ -4835,16 +4835,7 @@ export default function App() {
           sourceDragSnapshotRef.current = createSourceEditSnapshot();
         }}
         onDragMove={(e) => {
-          const target = resolveSourceSnapTarget(e.target.x(), e.target.y(), {
-            excludeVoronoiId: v.id,
-            includeNodes: true,
-            includeVoronoi: true,
-            radius: greenToRedSnapRadius,
-          });
-          const nextTarget =
-            target?.kind === "none"
-              ? { x: e.target.x(), y: e.target.y(), kind: "none", id: null }
-              : target;
+          const nextTarget = { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
           updateSourceVoronoiVertex(v.id, nextTarget.x, nextTarget.y, {
             snapTarget: nextTarget,
           });
@@ -4852,16 +4843,7 @@ export default function App() {
           e.target.y(nextTarget.y);
         }}
         onDragEnd={(e) => {
-          const target = resolveSourceSnapTarget(e.target.x(), e.target.y(), {
-            excludeVoronoiId: v.id,
-            includeNodes: true,
-            includeVoronoi: false,
-            radius: greenToRedSnapRadius,
-          });
-          const finalTarget =
-            target?.kind === "none"
-              ? { x: e.target.x(), y: e.target.y(), kind: "none", id: null }
-              : target;
+          const finalTarget = { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
           const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
           const graph = buildVoronoiVertexGraph(currentVoronoi?.snappedCells || []);
           let nextVoronoi = currentVoronoi;
@@ -4890,10 +4872,8 @@ export default function App() {
     addNodeMode,
     commitSourceDragHistory,
     createSourceEditSnapshot,
-    greenToRedSnapRadius,
     nodes,
     persistSourceCacheNow,
-    resolveSourceSnapTarget,
     segs,
     selectedSource,
     sourceVoronoi,

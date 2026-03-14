@@ -533,7 +533,6 @@ def api_pack_from_scene():
     source_name = _get_active_source_name(request.args.get("source") or payload.get("source"))
     _activate_source(source_name)
     raster_only = bool(payload.get("raster_only", False))
-    print(f"[pack_from_scene] start source={source_name} raster_only={int(raster_only)}")
     for key, env_key in (
         ("pack_padding", "PACK_PADDING"),
         ("pack_margin_x", "PACK_MARGIN_X"),
@@ -556,23 +555,6 @@ def api_pack_from_scene():
     if not regions or not zone_id:
         return jsonify({"ok": False, "error": "regions/zone_id missing"}), 400
     config._apply_pack_env()
-    unique_zone_count = len({int(z) for z in zone_id if isinstance(z, (int, float, str))})
-    
-    # Cleanup temp files to prevent stale reads
-    for p in [RASTER_PACK_TMP_JSON, config.OUT_PACK_SVG, config.OUT_PACK_SVG_PAGE2]:
-        try:
-            if p.exists():
-                os.remove(p)
-        except Exception:
-            pass
-
-    print(
-        "[pack_from_scene] input "
-        f"canvas={w}x{h} regions={len(regions)} zones={unique_zone_count} "
-        f"padding={getattr(config, 'PADDING', 0)} bleed={getattr(config, 'PACK_BLEED', 0)} "
-        f"grid={getattr(config, 'PACK_GRID_STEP', 0)} angle={getattr(config, 'PACK_ANGLE_STEP', 0)} "
-        f"mode={getattr(config, 'PACK_MODE', 'fast')}"
-    )
     _mark("init_validate")
     grid_step = max(1.0, float(getattr(config, "PACK_GRID_STEP", 5.0) or 5.0))
     # Fixed margin as requested.
@@ -617,19 +599,10 @@ def api_pack_from_scene():
             zone_order = list(range(len(zone_polys)))
     else:
         zone_polys, zone_order, _zone_poly_debug = zones.build_zone_polys(polys, zone_id)
-    print(
-        f"[pack_from_scene] zone_polys built={len(zone_polys)} zone_order={len(zone_order)} "
-        f"explicit={int(explicit_zone_polys)}"
-    )
     _mark("build_zone_polys")
     # Bleed is applied before raster nest via inflated zone polygons.
     zone_pack_polys = packing._build_zone_pack_polys(
         zone_polys, float(config.PACK_BLEED)
-    )
-    print(
-        "[pack_from_scene] bleed_polys "
-        f"enabled={int(float(getattr(config, 'PACK_BLEED', 0) or 0) > 0)} "
-        f"bleed={float(getattr(config, 'PACK_BLEED', 0) or 0):.2f}"
     )
     _mark("build_bleed_polys")
     # TS-style raster pack (ultra-fast): large-first, then fill holes with small pieces.
@@ -651,12 +624,6 @@ def api_pack_from_scene():
     safety_for_raster = max(0.25, min(1.0, pack_gap * 0.15))
     # 5-degree step full half-turn for better local orientation near dense rows.
     rotations_5 = [float(a) for a in range(0, 180, 5)]
-    print(
-        "[pack_from_scene] raster_config "
-        f"scale=1/{int(raster_scale_factor)} grid_for_raster={grid_for_raster} "
-        f"cell={raster_cell} stride={search_stride} safety={safety_for_raster:.3f} "
-        f"rotations={len(rotations_5)}"
-    )
 
     zone_pack_centers = []
     area_map: Dict[int, float] = {}
@@ -682,10 +649,6 @@ def api_pack_from_scene():
     small_asc = sorted(small_ids, key=lambda i: area_map.get(i, 0.0))
     # TS-like queue: place large first, then let small pieces fill holes.
     queue = large_ids + small_asc
-    print(
-        "[pack_from_scene] queue "
-        f"total={len(queue)} large_first={len(large_ids)} small_fill={len(small_asc)}"
-    )
 
     # One-page TS-like queue pass.
     pp, _o, rr = packing.pack_regions_raster_fast(
@@ -711,11 +674,6 @@ def api_pack_from_scene():
         rot_info[idx] = ri
         placed_now.add(idx)
     queue = [idx for idx in queue if idx not in placed_now]
-    print(
-        "[pack_from_scene] page1 "
-        f"placed={len(placed_now)} unplaced={len(queue)} "
-        f"fill_rate={(len(placed_now) / max(1, n)):.3f}"
-    )
     _mark("pack_page1")
 
     # Center packed bbox in canvas for cleaner margins.
@@ -747,48 +705,16 @@ def api_pack_from_scene():
             for rid in placed_ids:
                 dx, dy, bw, bh, rf = placements[rid]
                 placements[rid] = (float(dx) + shift_x, float(dy) + shift_y, bw, bh, rf)
-            print(
-                "[pack_from_scene] center_bbox "
-                f"placed={len(placed_ids)} shift=({shift_x:.2f},{shift_y:.2f}) "
-                f"bbox=({minx:.2f},{miny:.2f})-({maxx:.2f},{maxy:.2f})"
-            )
-    else:
-        print("[pack_from_scene] center_bbox skipped=no placed zones")
     _mark("center_bbox")
 
     unplaced_count = len(queue)
-    if unplaced_count > 0:
-        print(f"[pack_from_scene] WARNING: one page overflow, unplaced={unplaced_count}")
-    else:
-        print("[pack_from_scene] One page OK")
 
     raster_report = packing.raster_overlap_report(
         zone_pack_polys, placements, rot_info, (w, h), cell=raster_cell
     )
-    overlap_pairs = raster_report.get("pairs", []) or []
-    print(
-        "[pack_from_scene] raster_overlap "
-        f"count={int(raster_report.get('count', 0))} "
-        f"sample_pairs={overlap_pairs[:5]}"
-    )
     _mark("raster_overlap")
-
-    tmp_payload = {
-        "canvas": {"w": w, "h": h},
-        "pages": 1,
-        "raster_scale_factor": raster_scale_factor,
-        "strict_gap": pack_gap,
-        "one_page_ok": unplaced_count == 0,
-        "unplaced_count": unplaced_count,
-        "timings_ms": timings_ms,
-        "raster_check": raster_report,
-        "placements": [[float(a), float(b), int(c), int(d), bool(e)] for (a, b, c, d, e) in placements],
-        "rot_info": rot_info,
-    }
-    # Removed RASTER_PACK_TMP_JSON generation
-    _mark("skip_tmp_json")
     wrote_tmp_png = False
-    if raster_only or getattr(config, "WRITE_DEBUG_ARTIFACTS", False):
+    if raster_only:
         try:
             img = Image.new("RGB", (max(1, int(w)), max(1, int(h))), (6, 14, 46))
             draw = ImageDraw.Draw(img, "RGBA")
@@ -838,7 +764,6 @@ def api_pack_from_scene():
                     continue
             img.save(RASTER_PACK_TMP_PNG)
             wrote_tmp_png = True
-            print(f"[pack_from_scene] write tmp_png path={RASTER_PACK_TMP_PNG}")
         except Exception:
             pass
     _mark("write_tmp_png")
@@ -865,7 +790,6 @@ def api_pack_from_scene():
         zone_center[zid] = (float(info.get("cx", 0.0)), float(info.get("cy", 0.0)))
     if raster_only:
         timings_ms["total"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
-        print(f"[pack_from_scene] done raster_only=1 timings_ms={timings_ms}")
         return jsonify(
             {
                 "ok": True,
@@ -873,7 +797,7 @@ def api_pack_from_scene():
                 "raster_tmp_path": str(RASTER_PACK_TMP_PNG),
                 "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG),
                 "raster_tmp_png_url": "/out/tmp_raster_pack.png",
-                "raster_tmp_json_path": str(RASTER_PACK_TMP_JSON),
+                "raster_tmp_json_path": "",
                 "raster_overlap_count": int(raster_report.get("count", 0)),
                 "raster_pages": 1,
                 "one_page_ok": unplaced_count == 0,
@@ -902,17 +826,8 @@ def api_pack_from_scene():
         include_bleed=PACKED_INCLUDE_BLEED,
         write_file=False,
     )
-    print(
-        "[pack_from_scene] write_svg "
-        f"path=in_memory include_bleed={int(bool(PACKED_INCLUDE_BLEED))}"
-    )
     _mark("write_svg_page1")
     timings_ms["total"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
-    print(
-        "[pack_from_scene] done "
-        f"one_page_ok={int(unplaced_count == 0)} unplaced={unplaced_count} "
-        f"timings_ms={timings_ms}"
-    )
     result = {
         "ok": True,
         "source_name": source_name,
@@ -928,7 +843,7 @@ def api_pack_from_scene():
         "raster_tmp_path": str(RASTER_PACK_TMP_PNG) if wrote_tmp_png else "",
         "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG) if wrote_tmp_png else "",
         "raster_tmp_png_url": "/out/tmp_raster_pack.png" if wrote_tmp_png else "",
-        "raster_tmp_json_path": str(RASTER_PACK_TMP_JSON),
+        "raster_tmp_json_path": "",
         "raster_overlap_count": int(raster_report.get("count", 0)),
         "raster_pages": 1,
         "one_page_ok": unplaced_count == 0,
