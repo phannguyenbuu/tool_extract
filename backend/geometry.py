@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -507,8 +507,9 @@ def write_png(polys: List[List[Tuple[float, float]]], regions: List[RegionInfo],
     cv2.imwrite(str(config.OUT_PNG), img)
 
 
-def compute_region_colors(polys: List[List[Tuple[float, float]]], canvas: Tuple[int, int]) -> Tuple[List[Tuple[int, int, int]], np.ndarray]:
-    root = ET.parse(config.SVG_PATH).getroot()
+def compute_region_colors(polys: List[List[Tuple[float, float]]], canvas: Tuple[int, int], svg_path: Optional[Path] = None) -> Tuple[List[Tuple[int, int, int]], np.ndarray]:
+    target_svg = svg_path or config.SVG_PATH
+    root = ET.parse(target_svg).getroot()
     try:
         img_path, img_transform, img_display_size = svg_utils._find_embedded_image(root)
         img_bgr = svg_utils._read_image_any(img_path)
@@ -519,143 +520,147 @@ def compute_region_colors(polys: List[List[Tuple[float, float]]], canvas: Tuple[
         img_display_size = (float(canvas[0]), float(canvas[1]))
     
     img_h, img_w = img_bgr.shape[:2]
-    display_w = float(img_display_size[0]) if img_display_size and img_display_size[0] else 0.0
-    display_h = float(img_display_size[1]) if img_display_size and img_display_size[1] else 0.0
-    use_direct_image_space = display_w > 1e-6 and display_h > 1e-6
+    # Use the full transform matrix provided by svg_utils which includes scale and translate
+    # We no longer need separate scale_x/y if the matrix is correctly computed from the SVG element.
+    use_direct_image_space = True 
 
-    if use_direct_image_space:
-        scale_x = float(img_w) / display_w
-        scale_y = float(img_h) / display_h
-        img_to_resize = img_bgr
-    else:
-        w, h = canvas
-        w_px = max(1, int(w * config.DRAW_SCALE))
-        h_px = max(1, int(h * config.DRAW_SCALE))
-        resized = cv2.resize(img_bgr, (w_px, h_px), interpolation=cv2.INTER_AREA)
-        img_to_resize = img_bgr
+    w, h = canvas
+    w_px = max(1, int(w * config.DRAW_SCALE))
+    h_px = max(1, int(h * config.DRAW_SCALE))
+    # 'preview' is used for the overlap/debug image, resize to canvas size for overlay
+    preview = cv2.resize(img_bgr, (w_px, h_px), interpolation=cv2.INTER_AREA)
 
     colors: List[Tuple[int, int, int]] = []
+    def _pick_nonwhite_near(sample_img: np.ndarray, cx: int, cy: int, radii: tuple[int, ...] = (3, 6, 10, 16)):
+        h, w = sample_img.shape[:2]
+        for radius in radii:
+            x0 = max(0, cx - radius)
+            x1 = min(w, cx + radius + 1)
+            y0 = max(0, cy - radius)
+            y1 = min(h, cy + radius + 1)
+            patch = sample_img[y0:y1, x0:x1]
+            if patch.size == 0:
+                continue
+            flat = patch.reshape(-1, 3)
+            non_white = flat[(np.max(flat, axis=1) > 15) & (np.min(flat, axis=1) < 245)]
+            if non_white.size > 0:
+                med = np.median(non_white, axis=0)
+                return (int(med[0]), int(med[1]), int(med[2]))
+        return None
     for pts in polys:
         poly = Polygon(pts)
         if poly.is_empty:
             colors.append(config.WHITE_FALLBACK)
             continue
-        if use_direct_image_space:
-            mapped_pts = [
-                svg_utils._invert_transform_point(float(p[0]), float(p[1]), img_transform)
-                for p in pts
-            ]
-            pts_scaled = np.array(
-                [
-                    [
-                        mapped[0] * scale_x,
-                        mapped[1] * scale_y,
-                    ]
-                    for mapped in mapped_pts
-                ],
-                dtype=np.float32,
-            )
-            sample_img = img_bgr
-            sample_w = img_w
-            sample_h = img_h
-            rep = poly.representative_point()
-            rep_local = svg_utils._invert_transform_point(float(rep.x), float(rep.y), img_transform)
-            rep_px = (rep_local[0] * scale_x, rep_local[1] * scale_y)
-        else:
-            pts_scaled = np.array(
-                [[p[0] * config.DRAW_SCALE, p[1] * config.DRAW_SCALE] for p in pts],
-                dtype=np.float32,
-            )
-            sample_img = resized
-            sample_w = w_px
-            sample_h = h_px
-            rep = poly.representative_point()
-            rep_px = (float(rep.x) * config.DRAW_SCALE, float(rep.y) * config.DRAW_SCALE)
+
+        rep = poly.representative_point()
+
+        # Always map points using the inverse of the image's cumulative transform matrix
+        mapped_pts = [
+            svg_utils._invert_transform_point(float(p[0]), float(p[1]), img_transform)
+            for p in pts
+        ]
+        pts_scaled = np.array(
+            [[m[0], m[1]] for m in mapped_pts],
+            dtype=np.float32,
+        )
+        sample_img = img_bgr
+        sample_w, sample_h = img_w, img_h
+
+        rep_local = svg_utils._invert_transform_point(float(rep.x), float(rep.y), img_transform)
+        rep_px = (rep_local[0], rep_local[1])
+
         minx = max(0, int(math.floor(np.min(pts_scaled[:, 0]))))
+
         miny = max(0, int(math.floor(np.min(pts_scaled[:, 1]))))
         maxx = min(sample_w - 1, int(math.ceil(np.max(pts_scaled[:, 0]))))
         maxy = min(sample_h - 1, int(math.ceil(np.max(pts_scaled[:, 1]))))
+
         if minx > maxx or miny > maxy:
-            color = (255, 255, 255)
+            color = config.WHITE_FALLBACK
         else:
             local = pts_scaled.copy()
             local[:, 0] -= minx
             local[:, 1] -= miny
-            mask = np.zeros((maxy - miny + 1, maxx - minx + 1), dtype=np.uint8)
+            
+            mask_w = maxx - minx + 1
+            mask_h = maxy - miny + 1
+            mask = np.zeros((mask_h, mask_w), dtype=np.uint8)
             cv2.fillPoly(mask, [np.round(local).astype(np.int32)], 255)
-            region_img = sample_img[miny : maxy + 1, minx : maxx + 1]
+            
             use_mask = mask
-            if mask.shape[0] >= 21 and mask.shape[1] >= 21:
-                inner_2 = cv2.erode(mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
-                inner_10 = cv2.erode(mask, np.ones((21, 21), dtype=np.uint8), iterations=1)
-                ring_2_10 = cv2.subtract(inner_2, inner_10)
-                if int(np.count_nonzero(ring_2_10)) >= max(12, int(np.count_nonzero(mask) * 0.04)):
-                    use_mask = ring_2_10
-                elif int(np.count_nonzero(inner_2)) >= max(8, int(np.count_nonzero(mask) * 0.1)):
-                    use_mask = inner_2
-            elif mask.shape[0] >= 3 and mask.shape[1] >= 3:
-                eroded = cv2.erode(mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
-                if int(np.count_nonzero(eroded)) >= max(4, int(np.count_nonzero(mask) * 0.15)):
+            # Try to erode to get inner pixels
+            if mask_w > 10 and mask_h > 10:
+                eroded = cv2.erode(mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
+                if np.count_nonzero(eroded) > 20:
                     use_mask = eroded
+            elif mask_w > 4 and mask_h > 4:
+                eroded = cv2.erode(mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
+                if np.count_nonzero(eroded) > 5:
+                    use_mask = eroded
+
+            region_img = sample_img[miny : maxy + 1, minx : maxx + 1]
             pixels = region_img[use_mask > 0]
+            
             if pixels.size == 0:
-                color = (255, 255, 255)
+                rx, ry = int(round(rep_px[0])), int(round(rep_px[1]))
+                rx = max(0, min(sample_w - 1, rx))
+                ry = max(0, min(sample_h - 1, ry))
+                color_bgr = sample_img[ry, rx]
+                color = (int(color_bgr[0]), int(color_bgr[1]), int(color_bgr[2]))
             else:
                 sample = pixels
-                non_black = sample[np.max(sample, axis=1) > 12]
-                if len(non_black):
-                    sample = non_black
-                non_white = sample[np.min(sample, axis=1) < 245]
-                if len(non_white):
-                    sample = non_white
-                if len(sample) < 12:
-                    rx = int(round(rep_px[0])) - minx
-                    ry = int(round(rep_px[1])) - miny
-                    h_mask, w_mask = mask.shape[:2]
-                    picked = []
-                    for rad in (1, 2, 3, 4):
-                        for yy in range(max(0, ry - rad), min(h_mask, ry + rad + 1)):
-                            for xx in range(max(0, rx - rad), min(w_mask, rx + rad + 1)):
-                                if mask[yy, xx] <= 0:
-                                    continue
-                                pix = region_img[yy, xx]
-                                if int(max(pix)) <= 12:
-                                    continue
-                                if int(min(pix)) >= 245:
-                                    continue
-                                picked.append(pix)
-                        if len(picked) >= 6:
-                            break
-                    if picked:
-                        sample = np.asarray(picked, dtype=np.uint8)
+                non_edge = sample[
+                    (np.max(sample, axis=1) > 15) & (np.min(sample, axis=1) < 240)
+                ]
+                if non_edge.size > 0:
+                    sample = non_edge
+                
                 med = np.median(sample, axis=0)
                 color = (int(med[0]), int(med[1]), int(med[2]))
-        if color[0] >= 245 and color[1] >= 245 and color[2] >= 245:
+
+            if all(c >= 245 for c in color):
+                # Thin edge regions often collapse to white after erosion.
+                # Retry with a dilated neighborhood around the polygon before falling back.
+                retry_mask = cv2.dilate(mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
+                retry_pixels = region_img[retry_mask > 0]
+                if retry_pixels.size > 0:
+                    retry_non_white = retry_pixels[
+                        (np.max(retry_pixels, axis=1) > 15) & (np.min(retry_pixels, axis=1) < 245)
+                    ]
+                    if retry_non_white.size > 0:
+                        med = np.median(retry_non_white, axis=0)
+                        color = (int(med[0]), int(med[1]), int(med[2]))
+                if all(c >= 245 for c in color):
+                    rx, ry = int(round(rep_px[0])), int(round(rep_px[1]))
+                    rx = max(0, min(sample_w - 1, rx))
+                    ry = max(0, min(sample_h - 1, ry))
+                    retry = _pick_nonwhite_near(sample_img, rx, ry)
+                    if retry is not None:
+                        color = retry
+
+        if all(c >= 245 for c in color):
             color = config.WHITE_FALLBACK
         colors.append(color)
 
     if use_direct_image_space:
-        w, h = canvas
-        w_px = max(1, int(w * config.DRAW_SCALE))
-        h_px = max(1, int(h * config.DRAW_SCALE))
-        preview = cv2.resize(img_to_resize, (w_px, h_px), interpolation=cv2.INTER_AREA)
         return colors, preview
-    return colors, resized
+    return colors, preview
 
 
-def render_color_regions(polys: List[List[Tuple[float, float]]], canvas: Tuple[int, int]) -> Tuple[List[Tuple[int, int, int]], np.ndarray]:
+def render_color_regions(polys: List[List[Tuple[float, float]]], canvas: Tuple[int, int], svg_path: Optional[Path] = None) -> Tuple[List[Tuple[int, int, int]], np.ndarray]:
     w, h = canvas
     w_px = int(w * config.DRAW_SCALE)
     h_px = int(h * config.DRAW_SCALE)
     out = np.full((h_px, w_px, 3), 255, dtype=np.uint8)
 
-    colors, resized = compute_region_colors(polys, canvas)
+    colors, resized = compute_region_colors(polys, canvas, svg_path=svg_path)
     for pts, color in zip(polys, colors):
         pts_scaled = np.array(
             [[p[0] * config.DRAW_SCALE, p[1] * config.DRAW_SCALE] for p in pts],
             dtype=np.int32,
         )
-        cv2.fillPoly(out, [pts_scaled], color)
+        cv2.fillPoly(out, [pts_scaled], (int(color[0]), int(color[1]), int(color[2])), cv2.LINE_AA)
 
     cv2.imwrite(str(config.OUT_COLOR_PNG), out)
 

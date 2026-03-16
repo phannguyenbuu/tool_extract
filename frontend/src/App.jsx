@@ -2,6 +2,8 @@ import React, { useMemo, useRef, useState, useEffect, useCallback } from "react"
 import Konva from "konva";
 import { Stage, Layer, Line, Text, Circle, Rect, Path, Group, Image, Transformer } from "react-konva";
 
+const SOURCE_VORONOI_VERSION = 9;
+
 const toPoints = (pts) => pts.flatMap((p) => [p[0], p[1]]);
 
 const toFinite = (v, fallback = 0) => (Number.isFinite(v) ? v : fallback);
@@ -190,6 +192,7 @@ const normalizeNodesForSave = (nodes, scale = 1) =>
   }));
 
 const normalizeVoronoiForSave = (voronoi, scale = 1) => ({
+  version: SOURCE_VORONOI_VERSION,
   mask: (voronoi?.mask || []).map(([x, y]) => [x / scale, y / scale]),
   cells: (voronoi?.cells || []).map((poly) => (poly || []).map(([x, y]) => [x / scale, y / scale])),
   snapped_cells: (voronoi?.snappedCells || []).map((poly) =>
@@ -744,8 +747,38 @@ const mergeNodesIfClose = (nodes, segs, movedId, snap) => {
 const buildVoronoiVertexGraph = (cells, eps = 0.01) => {
   const keyToId = new Map();
   const vertices = [];
+  const sanitizeVoronoiPoly = (poly, minSeg = 0.75) => {
+    const pts = Array.isArray(poly) ? poly : [];
+    if (pts.length < 3) return [];
+    const minSeg2 = minSeg * minSeg;
+    const out = [];
+    pts.forEach((pt) => {
+      if (!Array.isArray(pt) || pt.length < 2) return;
+      const next = [Number(pt[0]) || 0, Number(pt[1]) || 0];
+      const prev = out[out.length - 1];
+      if (!prev) {
+        out.push(next);
+        return;
+      }
+      const dx = next[0] - prev[0];
+      const dy = next[1] - prev[1];
+      if (dx * dx + dy * dy >= minSeg2) {
+        out.push(next);
+      }
+    });
+    if (out.length > 1) {
+      const first = out[0];
+      const last = out[out.length - 1];
+      const dx = first[0] - last[0];
+      const dy = first[1] - last[1];
+      if (dx * dx + dy * dy < minSeg2) {
+        out.pop();
+      }
+    }
+    return out.length >= 3 ? out : [];
+  };
   const refs = (cells || []).map((poly) =>
-    (poly || []).map((pt) => {
+    sanitizeVoronoiPoly(poly).map((pt) => {
       const key = `${(pt?.[0] ?? 0).toFixed(3)}:${(pt?.[1] ?? 0).toFixed(3)}`;
       let id = keyToId.get(key);
       if (id == null) {
@@ -757,6 +790,36 @@ const buildVoronoiVertexGraph = (cells, eps = 0.01) => {
     })
   );
   return { vertices, refs, eps };
+};
+
+const sanitizeRebuiltVoronoiPoly = (pts, minSeg = 0.75) => {
+  if (!Array.isArray(pts) || pts.length < 3) return null;
+  const minSeg2 = minSeg * minSeg;
+  const out = [];
+  pts.forEach((pt) => {
+    if (!Array.isArray(pt) || pt.length < 2) return;
+    const next = [Number(pt[0]) || 0, Number(pt[1]) || 0];
+    const prev = out[out.length - 1];
+    if (!prev) {
+      out.push(next);
+      return;
+    }
+    const dx = next[0] - prev[0];
+    const dy = next[1] - prev[1];
+    if (dx * dx + dy * dy >= minSeg2) {
+      out.push(next);
+    }
+  });
+  if (out.length > 1) {
+    const first = out[0];
+    const last = out[out.length - 1];
+    const dx = first[0] - last[0];
+    const dy = first[1] - last[1];
+    if (dx * dx + dy * dy < minSeg2) {
+      out.pop();
+    }
+  }
+  return out.length >= 3 ? out : null;
 };
 
 const rebuildVoronoiCellsFromGraph = (vertices, refs) =>
@@ -777,9 +840,76 @@ const rebuildVoronoiCellsFromGraph = (vertices, refs) =>
           pts.pop();
         }
       }
-      return pts.length >= 3 ? pts : null;
+      return sanitizeRebuiltVoronoiPoly(pts);
     })
     .filter(Boolean);
+
+const cross2d = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+
+const orient2d = (a, b, c) => cross2d(a, b, c);
+
+const onSegment2d = (a, b, p, eps = 1e-6) =>
+  Math.min(a[0], b[0]) - eps <= p[0] &&
+  p[0] <= Math.max(a[0], b[0]) + eps &&
+  Math.min(a[1], b[1]) - eps <= p[1] &&
+  p[1] <= Math.max(a[1], b[1]) + eps;
+
+const segmentsIntersectStrict = (a, b, c, d, eps = 1e-6) => {
+  const o1 = orient2d(a, b, c);
+  const o2 = orient2d(a, b, d);
+  const o3 = orient2d(c, d, a);
+  const o4 = orient2d(c, d, b);
+  if ((o1 > eps && o2 < -eps || o1 < -eps && o2 > eps) && (o3 > eps && o4 < -eps || o3 < -eps && o4 > eps)) {
+    return true;
+  }
+  if (Math.abs(o1) <= eps && onSegment2d(a, b, c, eps)) return true;
+  if (Math.abs(o2) <= eps && onSegment2d(a, b, d, eps)) return true;
+  if (Math.abs(o3) <= eps && onSegment2d(c, d, a, eps)) return true;
+  if (Math.abs(o4) <= eps && onSegment2d(c, d, b, eps)) return true;
+  return false;
+};
+
+const canMoveVoronoiVertexSafely = (graph, vertexId, nextPt, minNeighborGap = 0.8) => {
+  if (!graph?.vertices?.[vertexId] || !Array.isArray(nextPt) || nextPt.length < 2) return false;
+  const minGap2 = minNeighborGap * minNeighborGap;
+  const current = graph.vertices[vertexId];
+  for (const polyRefs of graph.refs || []) {
+    const len = Array.isArray(polyRefs) ? polyRefs.length : 0;
+    if (len < 3) continue;
+    for (let i = 0; i < len; i++) {
+      if (polyRefs[i] !== vertexId) continue;
+      const prev = graph.vertices[polyRefs[(i - 1 + len) % len]];
+      const next = graph.vertices[polyRefs[(i + 1) % len]];
+      if (!prev || !next) continue;
+      const dPrevX = nextPt[0] - prev.x;
+      const dPrevY = nextPt[1] - prev.y;
+      const dNextX = nextPt[0] - next.x;
+      const dNextY = nextPt[1] - next.y;
+      if (dPrevX * dPrevX + dPrevY * dPrevY < minGap2) return false;
+      if (dNextX * dNextX + dNextY * dNextY < minGap2) return false;
+      const before = cross2d([prev.x, prev.y], [current.x, current.y], [next.x, next.y]);
+      const after = cross2d([prev.x, prev.y], nextPt, [next.x, next.y]);
+      if (Math.abs(before) > 1e-3 && before * after <= 0) return false;
+
+      const candidate = polyRefs.map((vid) =>
+        vid === vertexId ? [nextPt[0], nextPt[1]] : [graph.vertices[vid].x, graph.vertices[vid].y]
+      );
+      for (let a = 0; a < len; a++) {
+        const a0 = candidate[a];
+        const a1 = candidate[(a + 1) % len];
+        for (let b = a + 1; b < len; b++) {
+          const b0 = candidate[b];
+          const b1 = candidate[(b + 1) % len];
+          if (a === b) continue;
+          if ((a + 1) % len === b || (b + 1) % len === a) continue;
+          if (a === 0 && (b + 1) % len === 0) continue;
+          if (segmentsIntersectStrict(a0, a1, b0, b1)) return false;
+        }
+      }
+    }
+  }
+  return true;
+};
 
 const mergeVoronoiVerticesIfClose = (vertices, refs, movedId, snap) => {
   if (!snap || snap <= 0) return { vertices, refs };
@@ -1469,7 +1599,7 @@ export default function App() {
     [sourceVoronoi]
   );
   const liveSnapRadius = Math.max(0, (snap || 0) * 0.35);
-  const greenToRedSnapRadius = 5;
+  const greenToRedSnapRadius = 4.5;
 
   const createSourceEditSnapshot = (
     nextNodes = nodes,
@@ -1582,21 +1712,47 @@ export default function App() {
     return best || { x, y, kind: "none", id: null };
   };
 
+  const resolveSafeVoronoiNodeSnapTarget = (x, y, vertexId, radius = greenToRedSnapRadius) => {
+    if (!(radius > 0) || !sourceVoronoiGraph?.vertices?.[vertexId]) {
+      return { x, y, kind: "none", id: null };
+    }
+    const maxD2 = radius * radius;
+    const candidates = [];
+    (nodes || []).forEach((n) => {
+      const dx = n.x - x;
+      const dy = n.y - y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 <= maxD2) {
+        candidates.push({ x: n.x, y: n.y, kind: "node", id: n.id, d2 });
+      }
+    });
+    candidates.sort((a, b) => a.d2 - b.d2);
+    for (const candidate of candidates) {
+      if (canMoveVoronoiVertexSafely(sourceVoronoiGraph, vertexId, [candidate.x, candidate.y], 0.55)) {
+        return candidate;
+      }
+    }
+    return { x, y, kind: "none", id: null };
+  };
+
   const updateSourceVoronoiVertex = (vertexId, x, y, options = {}) => {
     const { snapTarget = null } = options;
     const target = snapTarget || { x, y, kind: "none", id: null };
     const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
     const graph = buildVoronoiVertexGraph(currentVoronoi?.snappedCells || []);
     if (!graph.vertices[vertexId]) return target;
+    const safePt = canMoveVoronoiVertexSafely(graph, vertexId, [target.x, target.y])
+      ? { x: target.x, y: target.y, kind: target.kind, id: target.id }
+      : { x, y, kind: "none", id: null };
     let nextVertices = graph.vertices.map((v) =>
-      v.id === vertexId ? { ...v, x: target.x, y: target.y } : { ...v }
+      v.id === vertexId ? { ...v, x: safePt.x, y: safePt.y } : { ...v }
     );
     const nextVoronoi = {
       ...currentVoronoi,
       snappedCells: rebuildVoronoiCellsFromGraph(nextVertices, graph.refs),
     };
     setSourceVoronoi(nextVoronoi);
-    return target;
+    return safePt;
   };
 
   const applyPackPreset = (name, rerender = false) => {
@@ -2168,9 +2324,12 @@ export default function App() {
       setRawSegments(segments);
       const cachedNodesRaw = Array.isArray(savedState?.svg_nodes) ? savedState.svg_nodes : null;
       const cachedSegsRaw = Array.isArray(savedState?.svg_segments) ? savedState.svg_segments : null;
-      const cachedVoronoiRaw = savedState?.source_voronoi && typeof savedState.source_voronoi === "object"
-        ? savedState.source_voronoi
-        : null;
+      const cachedVoronoiRaw =
+        savedState?.source_voronoi &&
+        typeof savedState.source_voronoi === "object" &&
+        Number(savedState.source_voronoi.version) === SOURCE_VORONOI_VERSION
+          ? savedState.source_voronoi
+          : null;
       let nextGraph = null;
       if (cachedNodesRaw?.length && cachedSegsRaw?.length) {
         nextGraph = {
@@ -2240,7 +2399,11 @@ export default function App() {
           savedState?.source_region_scene_cache && typeof savedState.source_region_scene_cache === "object"
             ? savedState.source_region_scene_cache
             : null;
-        if (cachedRegionSceneRaw?.canvas && Array.isArray(cachedRegionSceneRaw?.regions)) {
+        if (
+          Number(cachedRegionSceneRaw?.version) === SOURCE_VORONOI_VERSION &&
+          cachedRegionSceneRaw?.canvas &&
+          Array.isArray(cachedRegionSceneRaw?.regions)
+        ) {
           const scaledRegionData =
             scaleRatio === 1 ? cachedRegionSceneRaw : scaleSceneData(cachedRegionSceneRaw, scaleRatio);
           setScene(scaledRegionData);
@@ -2893,28 +3056,47 @@ export default function App() {
   };
 
   const findEdgeCandidate = (worldPt) => {
-    if (!nodes.length) return null;
+    if (!sourceVoronoiGraph?.vertices?.length || !sourceVoronoiGraph?.refs?.length) return null;
     const EDGE_HOVER_DIST = 10;
-    const EDGE_MAX_LEN = 80;
-    const segSet = new Set(segs.map(([a, b]) => edgeKey(a, b)));
+    const EDGE_MAX_LEN = 120;
     let best = null;
     let bestDist = Infinity;
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const dx = nodes[j].x - nodes[i].x;
-        const dy = nodes[j].y - nodes[i].y;
-        const len = Math.hypot(dx, dy);
-        if (len > EDGE_MAX_LEN) continue;
-        if (segSet.has(edgeKey(i, j))) continue;
-        const mx = (nodes[i].x + nodes[j].x) * 0.5;
-        const my = (nodes[i].y + nodes[j].y) * 0.5;
+    sourceVoronoiGraph.refs.forEach((polyRefs, polyIdx) => {
+      const lenRefs = Array.isArray(polyRefs) ? polyRefs.length : 0;
+      if (lenRefs < 4) return;
+      for (let i = 0; i < lenRefs; i++) {
+        for (let j = i + 2; j < lenRefs; j++) {
+          if (i === 0 && j === lenRefs - 1) continue;
+          const va = sourceVoronoiGraph.vertices[polyRefs[i]];
+          const vb = sourceVoronoiGraph.vertices[polyRefs[j]];
+          if (!va || !vb) continue;
+          const dx = vb.x - va.x;
+          const dy = vb.y - va.y;
+          const chordLen = Math.hypot(dx, dy);
+          if (chordLen > EDGE_MAX_LEN) continue;
+          let intersects = false;
+          for (let k = 0; k < lenRefs; k++) {
+            const ka = sourceVoronoiGraph.vertices[polyRefs[k]];
+            const kb = sourceVoronoiGraph.vertices[polyRefs[(k + 1) % lenRefs]];
+            if (!ka || !kb) continue;
+            if (polyRefs[k] === polyRefs[i] || polyRefs[k] === polyRefs[j] || polyRefs[(k + 1) % lenRefs] === polyRefs[i] || polyRefs[(k + 1) % lenRefs] === polyRefs[j]) {
+              continue;
+            }
+            if (segmentsIntersectStrict([va.x, va.y], [vb.x, vb.y], [ka.x, ka.y], [kb.x, kb.y])) {
+              intersects = true;
+              break;
+            }
+          }
+          if (intersects) continue;
+          const mx = (va.x + vb.x) * 0.5;
+          const my = (va.y + vb.y) * 0.5;
         const d = Math.hypot(worldPt.x - mx, worldPt.y - my);
         if (d > EDGE_HOVER_DIST || d >= bestDist) continue;
-        if (segmentWouldIntersect(i, j)) continue;
         bestDist = d;
-        best = { a: i, b: j };
+          best = { a: polyRefs[i], b: polyRefs[j], polyIdx, refA: i, refB: j };
+        }
       }
-    }
+    });
     return best;
   };
 
@@ -2954,6 +3136,18 @@ export default function App() {
       .map(([a, b]) => [remap.get(a), remap.get(b)])
       .filter(([a, b]) => a != null && b != null && a !== b);
     return { nodes: kept, segs: remappedSegs };
+  };
+
+  const splitVoronoiPolyByChord = (polyRefs, refA, refB) => {
+    const refs = Array.isArray(polyRefs) ? polyRefs : [];
+    const len = refs.length;
+    if (len < 4) return null;
+    const lo = Math.min(refA, refB);
+    const hi = Math.max(refA, refB);
+    const poly1 = refs.slice(lo, hi + 1);
+    const poly2 = [...refs.slice(hi), ...refs.slice(0, lo + 1)];
+    if (poly1.length < 3 || poly2.length < 3) return null;
+    return [poly1, poly2];
   };
 
   const findZoneAtPoint = (pt) => {
@@ -3417,16 +3611,22 @@ export default function App() {
         svg_nodes: normalizeNodesForSave(nextNodes, sourceScale || 1),
         svg_segments: (nextSegs || []).map(([a, b]) => [a, b]),
         source_voronoi: normalizeVoronoiForSave(nextVoronoi, sourceScale || 1),
+        source_region_scene_cache: null,
       },
       sourceName
     );
   };
 
-  const saveSourceEditsAndRefreshRegion = async (sourceName = selectedSource) => {
+  const saveSourceEditsAndRefreshRegion = async (
+    sourceName = selectedSource,
+    nextNodes = nodes,
+    nextSegs = segs,
+    nextVoronoi = sourceVoronoi
+  ) => {
     try {
       setError("");
       setSceneLoading(true);
-      await persistSourceCacheNow(nodes, segs, sourceVoronoi, sourceName);
+      await persistSourceCacheNow(nextNodes, nextSegs, nextVoronoi, sourceName);
       const res = await fetch(`/api/source_region_scene?${sourceQuery(sourceName)}&count=120&relax=2&seed=7`);
       if (!res.ok) {
         throw new Error(`source region scene fetch failed: ${res.status}`);
@@ -3439,7 +3639,7 @@ export default function App() {
       if (nextZoneScene?.zone_id?.length) {
         setZoneScene(nextZoneScene);
         setLeftTab("region");
-        clearManualPackedEdits(sourceName, false);
+        await resetPackedCache(sourceName);
         await refreshPackedFromZoneScene(nextZoneScene, enableBleed, sourceName);
       }
       setExportMsg("Saved Region + Zone");
@@ -3490,6 +3690,26 @@ export default function App() {
     setManualPackedEdits({});
     if (persist) {
       patchStateJson({ manual_packed: null }, sourceName);
+    }
+  };
+
+  const resetPackedCache = async (sourceName = selectedSource) => {
+    setManualPackedEdits({});
+    setPackedLabels([]);
+    setPackedFillPaths([]);
+    setPackedBleedPaths([]);
+    setPackedDebugRects([]);
+    setPackedFillPaths2([]);
+    setPackedBleedPaths2([]);
+    setPackedDebugRects2([]);
+    setPackedBleedError("");
+    setPackedBleedError2("");
+    setPackedEmptyCells([]);
+    const res = await fetch(`/api/reset_packed_cache?${sourceQuery(sourceName)}`, {
+      method: "POST",
+    });
+    if (!res.ok) {
+      throw new Error(`reset packed cache failed: ${res.status}`);
     }
   };
 
@@ -4835,30 +5055,41 @@ export default function App() {
           sourceDragSnapshotRef.current = createSourceEditSnapshot();
         }}
         onDragMove={(e) => {
-          const nextTarget = { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
-          updateSourceVoronoiVertex(v.id, nextTarget.x, nextTarget.y, {
+          const target = resolveSafeVoronoiNodeSnapTarget(e.target.x(), e.target.y(), v.id, greenToRedSnapRadius);
+          const nextTarget =
+            target?.kind === "node"
+              ? target
+              : { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
+          const applied = updateSourceVoronoiVertex(v.id, e.target.x(), e.target.y(), {
             snapTarget: nextTarget,
           });
-          e.target.x(nextTarget.x);
-          e.target.y(nextTarget.y);
+          e.target.x(applied.x);
+          e.target.y(applied.y);
         }}
         onDragEnd={(e) => {
-          const finalTarget = { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
+          const target = resolveSafeVoronoiNodeSnapTarget(e.target.x(), e.target.y(), v.id, greenToRedSnapRadius);
+          const finalTarget =
+            target?.kind === "node"
+              ? target
+              : { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
           const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
           const graph = buildVoronoiVertexGraph(currentVoronoi?.snappedCells || []);
+          const safeTarget = canMoveVoronoiVertexSafely(graph, v.id, [finalTarget.x, finalTarget.y])
+            ? finalTarget
+            : { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
           let nextVoronoi = currentVoronoi;
           if (graph.vertices[v.id]) {
             const nextVertices = graph.vertices.map((item) =>
-              item.id === v.id ? { ...item, x: finalTarget.x, y: finalTarget.y } : { ...item }
+              item.id === v.id ? { ...item, x: safeTarget.x, y: safeTarget.y } : { ...item }
             );
             nextVoronoi = {
               ...currentVoronoi,
               snappedCells: rebuildVoronoiCellsFromGraph(nextVertices, graph.refs),
             };
           }
-          updateSourceVoronoiVertex(v.id, finalTarget.x, finalTarget.y, { snapTarget: finalTarget });
-          e.target.x(finalTarget.x);
-          e.target.y(finalTarget.y);
+          updateSourceVoronoiVertex(v.id, e.target.x(), e.target.y(), { snapTarget: safeTarget });
+          e.target.x(safeTarget.x);
+          e.target.y(safeTarget.y);
           commitSourceDragHistory(nodes, segs, nextVoronoi);
           void persistSourceCacheNow(nodes, segs, nextVoronoi, selectedSource);
         }}
@@ -4871,9 +5102,11 @@ export default function App() {
     deleteEdgeMode,
     addNodeMode,
     commitSourceDragHistory,
+    greenToRedSnapRadius,
     createSourceEditSnapshot,
     nodes,
     persistSourceCacheNow,
+    resolveSafeVoronoiNodeSnapTarget,
     segs,
     selectedSource,
     sourceVoronoi,
@@ -5319,12 +5552,24 @@ export default function App() {
                     };
                     if (edgeMode) {
                       if (!edgeCandidate) return;
-                      const key = edgeKey(edgeCandidate.a, edgeCandidate.b);
-                      const segSet = new Set(segs.map(([a, b]) => edgeKey(a, b)));
-                      if (segSet.has(key)) return;
                       pushSourceUndoSnapshot(createSourceEditSnapshot());
-                      const nextSegs = [...segs, [edgeCandidate.a, edgeCandidate.b]];
-                      setSegs(nextSegs);
+                      const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
+                      const graph = buildVoronoiVertexGraph(currentVoronoi?.snappedCells || []);
+                      const nextRefs = [...(graph.refs || [])];
+                      const split = splitVoronoiPolyByChord(
+                        nextRefs[edgeCandidate.polyIdx],
+                        edgeCandidate.refA,
+                        edgeCandidate.refB
+                      );
+                      if (!split) return;
+                      nextRefs.splice(edgeCandidate.polyIdx, 1, split[0], split[1]);
+                      const nextVoronoi = {
+                        ...currentVoronoi,
+                        snappedCells: rebuildVoronoiCellsFromGraph(graph.vertices, nextRefs),
+                      };
+                      setSourceVoronoi(nextVoronoi);
+                      commitSourceDragHistory(nodes, segs, nextVoronoi);
+                      void persistSourceCacheNow(nodes, segs, nextVoronoi, selectedSource);
                       return;
                     }
                     if (deleteEdgeMode) {
@@ -5370,10 +5615,10 @@ export default function App() {
               ) : null}</Layer><Layer>{nodeLayer}</Layer><Layer>{borderLayer}</Layer>{edgeCandidate ? (
                 <Layer><Line
                     points={[
-                      nodes[edgeCandidate.a].x,
-                      nodes[edgeCandidate.a].y,
-                      nodes[edgeCandidate.b].x,
-                      nodes[edgeCandidate.b].y,
+                      sourceVoronoiGraph.vertices[edgeCandidate.a].x,
+                      sourceVoronoiGraph.vertices[edgeCandidate.a].y,
+                      sourceVoronoiGraph.vertices[edgeCandidate.b].x,
+                      sourceVoronoiGraph.vertices[edgeCandidate.b].y,
                     ]}
                   stroke="#cfd6ff"
                   opacity={0.4}
