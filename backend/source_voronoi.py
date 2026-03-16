@@ -20,7 +20,7 @@ import config
 import geometry
 import svg_utils
 
-SOURCE_VORONOI_VERSION = 9
+SOURCE_VORONOI_VERSION = 12
 
 
 def _strip_ns(tag: str) -> str:
@@ -394,6 +394,266 @@ def _polygon_boundary_lines(poly: Polygon | None) -> list[LineString]:
     return out
 
 
+def _graph_from_cells(
+    cells: list[Polygon],
+    *,
+    digits: int = 4,
+    min_seg: float = 0.18,
+) -> tuple[list[list[float]], list[list[int]]]:
+    key_to_id: dict[tuple[float, float], int] = {}
+    vertices: list[list[float]] = []
+    segments: list[list[int]] = []
+    seen_edges: set[tuple[int, int]] = set()
+    for poly in cells or []:
+        pts = _clean_poly_vertices(_poly_to_vertices(poly), min_seg=min_seg)
+        if len(pts) < 3:
+            continue
+        ids: list[int] = []
+        for x, y in pts:
+            key = (round(float(x), digits), round(float(y), digits))
+            vid = key_to_id.get(key)
+            if vid is None:
+                vid = len(vertices)
+                key_to_id[key] = vid
+                vertices.append([float(x), float(y)])
+            ids.append(vid)
+        for i in range(len(ids)):
+            a = ids[i]
+            b = ids[(i + 1) % len(ids)]
+            if a == b:
+                continue
+            edge = (a, b) if a < b else (b, a)
+            if edge in seen_edges:
+                continue
+            seen_edges.add(edge)
+            segments.append([edge[0], edge[1]])
+    return vertices, segments
+
+
+def _collapse_short_graph_edges(
+    vertices: list[list[float]],
+    segments: list[list[int]],
+    *,
+    merge_dist: float = 0.9,
+) -> tuple[list[list[float]], list[list[int]]]:
+    if not vertices or not segments:
+        return vertices, segments
+    parent = list(range(len(vertices)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    merge_d2 = merge_dist * merge_dist
+    for seg in segments:
+        if not isinstance(seg, list) or len(seg) < 2:
+            continue
+        a = int(seg[0])
+        b = int(seg[1])
+        if a < 0 or b < 0 or a >= len(vertices) or b >= len(vertices) or a == b:
+            continue
+        ax, ay = vertices[a]
+        bx, by = vertices[b]
+        dx = float(ax) - float(bx)
+        dy = float(ay) - float(by)
+        if dx * dx + dy * dy <= merge_d2:
+            union(a, b)
+
+    groups: dict[int, list[int]] = defaultdict(list)
+    for idx in range(len(vertices)):
+        groups[find(idx)].append(idx)
+
+    remap: dict[int, int] = {}
+    next_vertices: list[list[float]] = []
+    for members in groups.values():
+        sx = 0.0
+        sy = 0.0
+        for idx in members:
+            sx += float(vertices[idx][0])
+            sy += float(vertices[idx][1])
+        rep_idx = len(next_vertices)
+        next_vertices.append([sx / len(members), sy / len(members)])
+        for idx in members:
+            remap[idx] = rep_idx
+
+    seen_edges: set[tuple[int, int]] = set()
+    next_segments: list[list[int]] = []
+    for seg in segments:
+        if not isinstance(seg, list) or len(seg) < 2:
+            continue
+        a = remap.get(int(seg[0]))
+        b = remap.get(int(seg[1]))
+        if a is None or b is None or a == b:
+            continue
+        edge = (a, b) if a < b else (b, a)
+        if edge in seen_edges:
+            continue
+        seen_edges.add(edge)
+        next_segments.append([edge[0], edge[1]])
+    return next_vertices, next_segments
+
+
+def _collapse_tiny_graph_cells(
+    cells: list[Polygon],
+    vertices: list[list[float]],
+    segments: list[list[int]],
+    *,
+    digits: int = 4,
+    min_seg: float = 0.18,
+    max_area: float = 18.0,
+    max_bbox_area: float = 32.0,
+    max_short_side: float = 4.2,
+) -> tuple[list[list[float]], list[list[int]]]:
+    if not cells or not vertices or not segments:
+        return vertices, segments
+
+    parent = list(range(len(vertices)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    key_to_ids: dict[tuple[float, float], list[int]] = defaultdict(list)
+    for idx, pt in enumerate(vertices):
+        key = (round(float(pt[0]), digits), round(float(pt[1]), digits))
+        key_to_ids[key].append(idx)
+
+    for poly in cells or []:
+        if poly is None or poly.is_empty:
+            continue
+        minx, miny, maxx, maxy = poly.bounds
+        bw = max(0.0, float(maxx) - float(minx))
+        bh = max(0.0, float(maxy) - float(miny))
+        bbox_area = bw * bh
+        short_side = min(bw, bh)
+        is_tiny = poly.area <= max_area or bbox_area <= max_bbox_area or short_side <= max_short_side
+        if not is_tiny:
+            continue
+        pts = _clean_poly_vertices(_poly_to_vertices(poly), min_seg=min_seg)
+        if len(pts) < 3:
+            continue
+        ids: list[int] = []
+        for x, y in pts:
+            key = (round(float(x), digits), round(float(y), digits))
+            matches = key_to_ids.get(key) or []
+            if matches:
+                ids.append(matches[0])
+        if len(ids) < 2:
+            continue
+        base = ids[0]
+        for vid in ids[1:]:
+            union(base, vid)
+
+    groups: dict[int, list[int]] = defaultdict(list)
+    for idx in range(len(vertices)):
+        groups[find(idx)].append(idx)
+
+    remap: dict[int, int] = {}
+    next_vertices: list[list[float]] = []
+    for members in groups.values():
+        sx = 0.0
+        sy = 0.0
+        for idx in members:
+            sx += float(vertices[idx][0])
+            sy += float(vertices[idx][1])
+        rep_idx = len(next_vertices)
+        next_vertices.append([sx / len(members), sy / len(members)])
+        for idx in members:
+            remap[idx] = rep_idx
+
+    seen_edges: set[tuple[int, int]] = set()
+    next_segments: list[list[int]] = []
+    for seg in segments:
+        if not isinstance(seg, list) or len(seg) < 2:
+            continue
+        a = remap.get(int(seg[0]))
+        b = remap.get(int(seg[1]))
+        if a is None or b is None or a == b:
+            continue
+        edge = (a, b) if a < b else (b, a)
+        if edge in seen_edges:
+            continue
+        seen_edges.add(edge)
+        next_segments.append([edge[0], edge[1]])
+    return next_vertices, next_segments
+
+
+def _graph_lines(
+    vertices: list[list[float]],
+    segments: list[list[int]],
+) -> list[LineString]:
+    lines: list[LineString] = []
+    seen: set[tuple[tuple[float, float], tuple[float, float]]] = set()
+    for seg in segments or []:
+        if not isinstance(seg, list) or len(seg) < 2:
+            continue
+        a = int(seg[0])
+        b = int(seg[1])
+        if a < 0 or b < 0 or a >= len(vertices) or b >= len(vertices) or a == b:
+            continue
+        ax, ay = float(vertices[a][0]), float(vertices[a][1])
+        bx, by = float(vertices[b][0]), float(vertices[b][1])
+        key_a = (round(ax, 4), round(ay, 4))
+        key_b = (round(bx, 4), round(by, 4))
+        key = (key_a, key_b) if key_a <= key_b else (key_b, key_a)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(LineString([(ax, ay), (bx, by)]))
+    return lines
+
+
+def _cells_from_graph(
+    mask: Polygon,
+    vertices: list[list[float]],
+    segments: list[list[int]],
+    *,
+    simplify_tol: float = 0.18,
+    min_seg: float = 0.35,
+) -> list[Polygon]:
+    if mask is None or mask.is_empty:
+        return []
+    lines = _graph_lines(vertices, segments)
+    if not lines:
+        return []
+    merged = unary_union(lines + _polygon_boundary_lines(mask))
+    poly_pts, _ = polygonize_full(merged)[:2]
+    cells: list[Polygon] = []
+    seen: set[tuple[tuple[float, float], ...]] = set()
+    geoms = poly_pts.geoms if hasattr(poly_pts, "geoms") else [poly_pts]
+    for geom in geoms:
+        if geom.is_empty or geom.geom_type != "Polygon":
+            continue
+        clipped = _coerce_polygon(geom.intersection(mask), allow_largest=True)
+        if clipped is None or clipped.is_empty or clipped.area <= 1e-4:
+            continue
+        clean = _clean_polygon(clipped, simplify_tol=simplify_tol, min_seg=min_seg)
+        if clean is None or clean.area <= 1e-4:
+            continue
+        key = tuple((round(x, 4), round(y, 4)) for x, y in _poly_to_vertices(clean))
+        if key in seen:
+            continue
+        seen.add(key)
+        cells.append(clean)
+    return cells
+
+
 def _viewbox_mask(vb: List[float]) -> Polygon:
     x0, y0, w, h = vb
     return Polygon([(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h)])
@@ -446,6 +706,17 @@ def build_source_voronoi(source_path: Path, count: int | None = None, relax: int
     if not snapped_cells:
         snapped_cells = regularized_cells or cells
     snapped_cells = _rebuild_cells_with_boundary_connections(mask, snapped_cells)
+    graph_vertices, graph_segments = _graph_from_cells(snapped_cells)
+    graph_vertices, graph_segments = _collapse_tiny_graph_cells(
+        snapped_cells,
+        graph_vertices,
+        graph_segments,
+    )
+    graph_vertices, graph_segments = _collapse_short_graph_edges(graph_vertices, graph_segments, merge_dist=0.9)
+    graph_cells = _cells_from_graph(mask, graph_vertices, graph_segments)
+    if graph_cells:
+        snapped_cells = graph_cells
+
     def poly_to_vertices(poly: Polygon):
         return [[float(x), float(y)] for x, y in _poly_to_vertices(poly)]
     return {
@@ -454,6 +725,8 @@ def build_source_voronoi(source_path: Path, count: int | None = None, relax: int
         "mask": poly_to_vertices(mask),
         "cells": [poly_to_vertices(poly) for poly in snapped_cells],
         "snapped_cells": [poly_to_vertices(poly) for poly in snapped_cells],
+        "graph_vertices": graph_vertices,
+        "graph_segments": graph_segments,
         "count": len(snapped_cells),
     }
 
@@ -1074,6 +1347,53 @@ def normalize_source_voronoi_payload(source_path: Path, payload: dict | None) ->
     root = ET.parse(source_path).getroot()
     vb = payload.get("viewBox") or _parse_viewbox(root)
     mask = _mask_from_vertices(vb, payload.get("mask")) or _build_source_mask(source_path)[1]
+    raw_graph_vertices = payload.get("graph_vertices") or payload.get("graphVertices") or []
+    raw_graph_segments = payload.get("graph_segments") or payload.get("graphSegments") or []
+    if raw_graph_vertices and raw_graph_segments:
+        graph_vertices: list[list[float]] = []
+        for pt in raw_graph_vertices:
+            if not isinstance(pt, list) or len(pt) < 2:
+                continue
+            graph_vertices.append([float(pt[0]), float(pt[1])])
+        graph_segments: list[list[int]] = []
+        for seg in raw_graph_segments:
+            if not isinstance(seg, list) or len(seg) < 2:
+                continue
+            a = int(seg[0])
+            b = int(seg[1])
+            if a == b:
+                continue
+            graph_segments.append([a, b])
+        base_cells = _cells_from_graph(mask, graph_vertices, graph_segments)
+        graph_vertices, graph_segments = _collapse_tiny_graph_cells(
+            base_cells,
+            graph_vertices,
+            graph_segments,
+        )
+        graph_vertices, graph_segments = _collapse_short_graph_edges(graph_vertices, graph_segments, merge_dist=0.9)
+        final_cells = _cells_from_graph(mask, graph_vertices, graph_segments)
+        if final_cells:
+            out_path = source_path.parent.parent / "scripts" / f"tmp_voronoi_regularized_{source_path.stem}.svg"
+            try:
+                _write_voronoi_debug_svg(out_path, vb, mask, final_cells)
+            except Exception:
+                pass
+
+            def poly_to_vertices(poly: Polygon):
+                return [[float(x), float(y)] for x, y in _poly_to_vertices(poly)]
+
+            cell_vertices = [poly_to_vertices(poly) for poly in final_cells]
+            return {
+                "version": SOURCE_VORONOI_VERSION,
+                "viewBox": [float(v) for v in vb],
+                "mask": poly_to_vertices(mask),
+                "cells": cell_vertices,
+                "snapped_cells": cell_vertices,
+                "snappedCells": cell_vertices,
+                "graph_vertices": graph_vertices,
+                "graph_segments": graph_segments,
+                "count": len(cell_vertices),
+            }
     raw_cells = (
         payload.get("snapped_cells")
         or payload.get("snappedCells")
@@ -1106,15 +1426,25 @@ def normalize_source_voronoi_payload(source_path: Path, payload: dict | None) ->
         regularized = _regularize_voronoi_cells(cells, mask)
         final_cells = _filter_region_seed_cells(regularized or cells, mask) or regularized or cells
         final_cells = _rebuild_cells_with_boundary_connections(mask, final_cells)
+
+    def poly_to_vertices(poly: Polygon):
+        return [[float(x), float(y)] for x, y in _poly_to_vertices(poly)]
+
+    graph_vertices, graph_segments = _graph_from_cells(final_cells)
+    graph_vertices, graph_segments = _collapse_tiny_graph_cells(
+        final_cells,
+        graph_vertices,
+        graph_segments,
+    )
+    graph_vertices, graph_segments = _collapse_short_graph_edges(graph_vertices, graph_segments, merge_dist=0.9)
+    graph_cells = _cells_from_graph(mask, graph_vertices, graph_segments)
+    if graph_cells:
+        final_cells = graph_cells
     out_path = source_path.parent.parent / "scripts" / f"tmp_voronoi_regularized_{source_path.stem}.svg"
     try:
         _write_voronoi_debug_svg(out_path, vb, mask, final_cells)
     except Exception:
         pass
-
-    def poly_to_vertices(poly: Polygon):
-        return [[float(x), float(y)] for x, y in _poly_to_vertices(poly)]
-
     cell_vertices = [poly_to_vertices(poly) for poly in final_cells]
     return {
         "version": SOURCE_VORONOI_VERSION,
@@ -1123,6 +1453,8 @@ def normalize_source_voronoi_payload(source_path: Path, payload: dict | None) ->
         "cells": cell_vertices,
         "snapped_cells": cell_vertices,
         "snappedCells": cell_vertices,
+        "graph_vertices": graph_vertices,
+        "graph_segments": graph_segments,
         "count": len(cell_vertices),
     }
 
@@ -1269,12 +1601,133 @@ def _sanitize_region_poly(poly: Polygon | None) -> Polygon | None:
     clean = _coerce_polygon(poly, allow_largest=True)
     if clean is None or clean.is_empty:
         return None
-    pts = _clean_poly_vertices(_poly_to_vertices(clean), min_seg=0.35)
-    pts = _prune_region_spikes(pts)
-    pts = _clean_poly_vertices(pts, min_seg=0.45)
+    # Keep region topology close to the polygonized source+voronoi graph.
+    # Over-aggressive cleanup removes thin but valid closed faces near the boundary.
+    pts = _clean_poly_vertices(_poly_to_vertices(clean), min_seg=0.12)
+    pts = _prune_region_spikes(
+        pts,
+        spike_height=0.22,
+        tail_width=0.28,
+        tail_area2=0.25,
+        max_passes=2,
+    )
+    pts = _clean_poly_vertices(pts, min_seg=0.18)
     if len(pts) < 3:
         return None
     return _coerce_polygon(Polygon(pts), allow_largest=True)
+
+
+def _iter_line_parts(geom) -> Iterable[LineString]:
+    if geom is None or getattr(geom, "is_empty", True):
+        return []
+    if isinstance(geom, LineString):
+        return [geom]
+    if hasattr(geom, "geoms"):
+        out: list[LineString] = []
+        for g in geom.geoms:
+            if isinstance(g, LineString):
+                out.append(g)
+        return out
+    return []
+
+
+def _build_regions_from_voronoi_cells(
+    snapped_polys: list[Polygon],
+    source_lines: list[LineString],
+) -> tuple[list[list[list[float]]], list[Polygon], dict[str, list[int]]]:
+    regions: list[list[list[float]]] = []
+    region_polys: list[Polygon] = []
+    snap_region_map: dict[str, list[int]] = {str(i): [] for i in range(len(snapped_polys))}
+    if not snapped_polys:
+        return regions, region_polys, snap_region_map
+
+    source_bounds = [ln.bounds for ln in source_lines]
+
+    def _bbox_hits(a, b) -> bool:
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        return ax1 >= bx0 and bx1 >= ax0 and ay1 >= by0 and by1 >= ay0
+
+    for zid, cell in enumerate(snapped_polys):
+        if cell is None or cell.is_empty:
+            continue
+        cell_bounds = cell.bounds
+        local_lines: list[LineString] = []
+        for ln, ln_bounds in zip(source_lines, source_bounds):
+            if not _bbox_hits(cell_bounds, ln_bounds):
+                continue
+            try:
+                clipped = ln.intersection(cell)
+            except GEOSException:
+                continue
+            for part in _iter_line_parts(clipped):
+                coords = list(part.coords)
+                if len(coords) < 2:
+                    continue
+                local_lines.append(LineString([(float(coords[0][0]), float(coords[0][1])), (float(coords[-1][0]), float(coords[-1][1]))]))
+        all_lines = _weld_segments(local_lines + _polygon_boundary_lines(cell), weld_dist=0.35)
+        if not all_lines:
+            clean_cell = _sanitize_region_poly(cell) or _coerce_polygon(cell, allow_largest=True)
+            if clean_cell is not None and not clean_cell.is_empty:
+                coords = list(clean_cell.exterior.coords)
+                if coords and coords[0] == coords[-1]:
+                    coords = coords[:-1]
+                rid = len(regions)
+                regions.append([[float(x), float(y)] for x, y in coords])
+                region_polys.append(clean_cell)
+                snap_region_map[str(zid)].append(rid)
+            continue
+        merged = unary_union(all_lines)
+        poly_pts, _cuts, _dangles, _invalid = polygonize_full(merged)
+        kept_local: list[Polygon] = []
+        geoms = poly_pts.geoms if hasattr(poly_pts, "geoms") else [poly_pts]
+        for geom in geoms:
+            if geom.is_empty or geom.geom_type != "Polygon":
+                continue
+            try:
+                clipped = geom.intersection(cell)
+            except GEOSException:
+                continue
+            if clipped.is_empty or clipped.area <= 1e-6:
+                continue
+            parts = list(clipped.geoms) if hasattr(clipped, "geoms") and clipped.geom_type == "MultiPolygon" else [clipped]
+            for part in parts:
+                part_poly = _sanitize_region_poly(part)
+                if part_poly is None or part_poly.area <= 1e-6:
+                    continue
+                kept_local.append(part_poly)
+        if kept_local:
+            try:
+                covered = unary_union(kept_local)
+                missing = cell.difference(covered)
+                extras = list(missing.geoms) if hasattr(missing, "geoms") and missing.geom_type == "MultiPolygon" else [missing]
+                for extra in extras:
+                    poly = _sanitize_region_poly(extra) or _coerce_polygon(extra, allow_largest=True)
+                    if poly is None or poly.is_empty or poly.area <= 1e-4:
+                        continue
+                    kept_local.append(poly)
+            except GEOSException:
+                pass
+        else:
+            poly = _sanitize_region_poly(cell) or _coerce_polygon(cell, allow_largest=True)
+            if poly is not None and not poly.is_empty and poly.area > 1e-6:
+                kept_local.append(poly)
+
+        seen_local: set[tuple[tuple[float, float], ...]] = set()
+        for poly in kept_local:
+            coords = list(poly.exterior.coords)
+            if coords and coords[0] == coords[-1]:
+                coords = coords[:-1]
+            key = tuple((round(float(x), 4), round(float(y), 4)) for x, y in coords)
+            if len(coords) < 3 or key in seen_local:
+                continue
+            seen_local.add(key)
+            rid = len(regions)
+            regions.append([[float(x), float(y)] for x, y in coords])
+            region_polys.append(poly)
+            snap_region_map[str(zid)].append(rid)
+
+    return regions, region_polys, snap_region_map
 
 
 def build_source_region_scene(
@@ -1300,77 +1753,37 @@ def build_source_region_scene(
     voronoi_lines: list[LineString] = []
     voronoi_cells_raw = voronoi.get("snapped_cells") or voronoi.get("cells") or []
     snapped_polys: list[Polygon] = []
-    for pts in voronoi_cells_raw:
-        p = _coerce_polygon(Polygon(pts), allow_largest=True)
-        if p is not None:
-            snapped_polys.append(p)
-        if len(pts) >= 3:
-            for i in range(len(pts)):
-                p1, p2 = pts[i], pts[(i+1)%len(pts)]
-                if not _is_on_boundary(p1, p2, vb):
-                    voronoi_lines.append(LineString([p1, p2]))
-    snapped_polys = _filter_region_seed_cells(snapped_polys, mask) or snapped_polys
-    voronoi_lines.extend(_build_boundary_connection_lines(mask, snapped_polys))
+    graph_vertices = voronoi.get("graph_vertices") or voronoi.get("graphVertices") or []
+    graph_segments = voronoi.get("graph_segments") or voronoi.get("graphSegments") or []
+    if graph_vertices and graph_segments:
+        base_cells = snapped_polys or [
+            _coerce_polygon(Polygon(pts), allow_largest=True)
+            for pts in voronoi_cells_raw
+            if isinstance(pts, list) and len(pts) >= 3
+        ]
+        base_cells = [poly for poly in base_cells if poly is not None]
+        graph_vertices, graph_segments = _collapse_tiny_graph_cells(
+            base_cells,
+            graph_vertices,
+            graph_segments,
+        )
+        graph_vertices, graph_segments = _collapse_short_graph_edges(graph_vertices, graph_segments, merge_dist=0.9)
+        voronoi_lines.extend(_graph_lines(graph_vertices, graph_segments))
+        rebuilt_polys = _cells_from_graph(mask, graph_vertices, graph_segments)
+        if rebuilt_polys:
+            snapped_polys.extend(rebuilt_polys)
+    if not snapped_polys:
+        for pts in voronoi_cells_raw:
+            p = _coerce_polygon(Polygon(pts), allow_largest=True)
+            if p is not None:
+                snapped_polys.append(p)
+            if len(pts) >= 3:
+                for i in range(len(pts)):
+                    p1, p2 = pts[i], pts[(i+1)%len(pts)]
+                    if not _is_on_boundary(p1, p2, vb):
+                        voronoi_lines.append(LineString([p1, p2]))
 
-    # Add canvas boundaries only for polygonization to close edge cells
-    boundary_lines = [
-        LineString([(vb[0], vb[1]), (vb[0]+vb[2], vb[1])]),
-        LineString([(vb[0]+vb[2], vb[1]), (vb[0]+vb[2], vb[1]+vb[3])]),
-        LineString([(vb[0]+vb[2], vb[1]+vb[3]), (vb[0], vb[1]+vb[3])]),
-        LineString([(vb[0], vb[1]+vb[3]), (vb[0], vb[1])])
-    ]
-    
-    all_lines = _weld_segments(source_lines + voronoi_lines + boundary_lines)
-    merged = unary_union(all_lines)
-    poly_pts, _ = polygonize_full(merged)[:2]
-    
-    regions: list[list[list[float]]] = []
-    region_polys: list[Polygon] = []
-    for geom in (poly_pts.geoms if hasattr(poly_pts, "geoms") else [poly_pts]):
-        if geom.is_empty or geom.geom_type != "Polygon": continue
-        clipped = geom.intersection(mask)
-        if clipped.is_empty or clipped.area <= 1e-6: continue
-        if clipped.geom_type == "MultiPolygon":
-            parts = list(clipped.geoms)
-        elif hasattr(clipped, "geoms") and clipped.geom_type == "GeometryCollection":
-            parts = [g for g in clipped.geoms if getattr(g, "geom_type", "") == "Polygon"]
-        else:
-            parts = [clipped]
-        for part in parts:
-            part_poly = _sanitize_region_poly(part)
-            if part_poly is None or part_poly.area <= 1e-6:
-                continue
-            if not _keep_region_fast(part_poly):
-                continue
-            coords = list(part_poly.exterior.coords)
-            if coords[0] == coords[-1]: coords = coords[:-1]
-            regions.append([[float(x), float(y)] for x, y in coords])
-            region_polys.append(part_poly)
-
-    snap_region_map = _assign_regions_to_snapped_cells(region_polys, snapped_polys)
-    assigned_ids = {
-        int(rid)
-        for region_ids in snap_region_map.values()
-        for rid in (region_ids or [])
-        if isinstance(rid, int) or (isinstance(rid, str) and str(rid).isdigit())
-    }
-    if assigned_ids:
-        filtered_regions = []
-        filtered_polys = []
-        remap = {}
-        for old_idx, (region, poly) in enumerate(zip(regions, region_polys)):
-            if old_idx not in assigned_ids:
-                continue
-            remap[old_idx] = len(filtered_regions)
-            filtered_regions.append(region)
-            filtered_polys.append(poly)
-        regions = filtered_regions
-        region_polys = filtered_polys
-        next_snap_region_map: dict[str, list[int]] = {}
-        for zid, region_ids in snap_region_map.items():
-            next_ids = [remap[rid] for rid in (region_ids or []) if rid in remap]
-            next_snap_region_map[str(zid)] = next_ids
-        snap_region_map = next_snap_region_map
+    regions, region_polys, snap_region_map = _build_regions_from_voronoi_cells(snapped_polys, source_lines)
     colors_bgr, _ = geometry.compute_region_colors(
         [[(float(x), float(y)) for x, y in pts] for pts in regions],
         canvas,

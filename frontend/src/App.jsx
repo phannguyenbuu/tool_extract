@@ -2,7 +2,7 @@ import React, { useMemo, useRef, useState, useEffect, useCallback } from "react"
 import Konva from "konva";
 import { Stage, Layer, Line, Text, Circle, Rect, Path, Group, Image, Transformer } from "react-konva";
 
-const SOURCE_VORONOI_VERSION = 9;
+const SOURCE_VORONOI_VERSION = 12;
 
 const toPoints = (pts) => pts.flatMap((p) => [p[0], p[1]]);
 
@@ -172,7 +172,7 @@ const scaleSegments = (segments, ratio) =>
   (segments || []).map((seg) => scalePts(seg, ratio));
 
 const scaleVoronoiData = (voronoi, ratio) => {
-  if (!voronoi) return { mask: [], cells: [], snappedCells: [] };
+  if (!voronoi) return { mask: [], cells: [], snappedCells: [], graphVertices: [], graphSegments: [] };
   return {
     ...voronoi,
     mask: (voronoi.mask || []).map(([x, y]) => [x * ratio, y * ratio]),
@@ -181,6 +181,14 @@ const scaleVoronoiData = (voronoi, ratio) => {
       (voronoi.snappedCells || voronoi.snapped_cells || []).map((poly) =>
         (poly || []).map(([x, y]) => [x * ratio, y * ratio])
       ),
+    graphVertices: (voronoi.graphVertices || voronoi.graph_vertices || []).map(([x, y]) => [
+      x * ratio,
+      y * ratio,
+    ]),
+    graphSegments: (voronoi.graphSegments || voronoi.graph_segments || []).map((seg) => [
+      Number(seg?.[0]) || 0,
+      Number(seg?.[1]) || 0,
+    ]),
   };
 };
 
@@ -191,14 +199,16 @@ const normalizeNodesForSave = (nodes, scale = 1) =>
     y: (n?.y || 0) / scale,
   }));
 
-const normalizeVoronoiForSave = (voronoi, scale = 1) => ({
-  version: SOURCE_VORONOI_VERSION,
-  mask: (voronoi?.mask || []).map(([x, y]) => [x / scale, y / scale]),
-  cells: (voronoi?.cells || []).map((poly) => (poly || []).map(([x, y]) => [x / scale, y / scale])),
-  snapped_cells: (voronoi?.snappedCells || []).map((poly) =>
-    (poly || []).map(([x, y]) => [x / scale, y / scale])
-  ),
-});
+const normalizeVoronoiForSave = (voronoi, scale = 1) => {
+  const graph = buildVoronoiVertexGraph(voronoi?.snappedCells || []);
+  return {
+    version: SOURCE_VORONOI_VERSION,
+    mask: (voronoi?.mask || []).map(([x, y]) => [x / scale, y / scale]),
+    graph_vertices: (graph.vertices || []).map((v) => [v.x / scale, v.y / scale]),
+    graph_segments: (graph.segments || []).map(([a, b]) => [a, b]),
+    count: (graph.refs || []).length,
+  };
+};
 
 const cloneSourceNodes = (nodes) =>
   (nodes || []).map((n, idx) => ({
@@ -217,6 +227,11 @@ const cloneSourceVoronoi = (voronoi) => ({
   snappedCells: (voronoi?.snappedCells || []).map((poly) =>
     (poly || []).map(([x, y]) => [x, y])
   ),
+  graphVertices: (voronoi?.graphVertices || voronoi?.graph_vertices || []).map(([x, y]) => [x, y]),
+  graphSegments: (voronoi?.graphSegments || voronoi?.graph_segments || []).map((seg) => [
+    Number(seg?.[0]) || 0,
+    Number(seg?.[1]) || 0,
+  ]),
 });
 
 const scaleSceneData = (scene, ratio) => {
@@ -747,6 +762,8 @@ const mergeNodesIfClose = (nodes, segs, movedId, snap) => {
 const buildVoronoiVertexGraph = (cells, eps = 0.01) => {
   const keyToId = new Map();
   const vertices = [];
+  const segmentSet = new Set();
+  const segments = [];
   const sanitizeVoronoiPoly = (poly, minSeg = 0.75) => {
     const pts = Array.isArray(poly) ? poly : [];
     if (pts.length < 3) return [];
@@ -777,8 +794,8 @@ const buildVoronoiVertexGraph = (cells, eps = 0.01) => {
     }
     return out.length >= 3 ? out : [];
   };
-  const refs = (cells || []).map((poly) =>
-    sanitizeVoronoiPoly(poly).map((pt) => {
+  const refs = (cells || []).map((poly) => {
+    const ids = sanitizeVoronoiPoly(poly).map((pt) => {
       const key = `${(pt?.[0] ?? 0).toFixed(3)}:${(pt?.[1] ?? 0).toFixed(3)}`;
       let id = keyToId.get(key);
       if (id == null) {
@@ -787,9 +804,19 @@ const buildVoronoiVertexGraph = (cells, eps = 0.01) => {
         vertices.push({ id, x: pt[0], y: pt[1] });
       }
       return id;
-    })
-  );
-  return { vertices, refs, eps };
+    });
+    for (let i = 0; i < ids.length; i += 1) {
+      const a = ids[i];
+      const b = ids[(i + 1) % ids.length];
+      if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) continue;
+      const key = a < b ? `${a}:${b}` : `${b}:${a}`;
+      if (segmentSet.has(key)) continue;
+      segmentSet.add(key);
+      segments.push(a < b ? [a, b] : [b, a]);
+    }
+    return ids;
+  });
+  return { vertices, refs, segments, eps };
 };
 
 const sanitizeRebuiltVoronoiPoly = (pts, minSeg = 0.75) => {
@@ -2368,6 +2395,8 @@ export default function App() {
           mask: scaledVoronoi.mask || [],
           cells: scaledVoronoi.cells || [],
           snappedCells: scaledVoronoi.snappedCells || [],
+          graphVertices: scaledVoronoi.graphVertices || [],
+          graphSegments: scaledVoronoi.graphSegments || [],
         });
       } else {
         try {
@@ -2385,9 +2414,11 @@ export default function App() {
             mask: scaledVoronoi.mask || [],
             cells: scaledVoronoi.cells || [],
             snappedCells: scaledVoronoi.snappedCells || [],
+            graphVertices: scaledVoronoi.graphVertices || [],
+            graphSegments: scaledVoronoi.graphSegments || [],
           });
         } catch {
-          setSourceVoronoi({ mask: [], cells: [], snappedCells: [] });
+          setSourceVoronoi({ mask: [], cells: [], snappedCells: [], graphVertices: [], graphSegments: [] });
         }
       }
       setNodes(nextGraph.nodes);
