@@ -184,38 +184,76 @@ def _parse_path(d: str) -> List[List[Tuple[float, float]]]:
     return paths
 
 
+def _apply_matrix(pts: List[Tuple[float, float]], m: np.ndarray) -> List[Tuple[float, float]]:
+    if np.allclose(m, np.eye(3)):
+        return pts
+    res = []
+    for x, y in pts:
+        v = np.array([x, y, 1.0], dtype=np.float64)
+        out = m @ v
+        res.append((float(out[0]), float(out[1])))
+    return res
+
+
 def _iter_geometry(root: ET.Element) -> Iterable[Tuple[str, List[Tuple[float, float]]]]:
     skip_tags = {"defs", "clippath"}
 
-    def walk(el: ET.Element, skipped: bool = False) -> Iterable[Tuple[str, List[Tuple[float, float]]]]:
+    def walk(el: ET.Element, current_m: np.ndarray, skipped: bool = False) -> Iterable[Tuple[str, List[Tuple[float, float]]]]:
         tag = el.tag.rsplit("}", 1)[-1].lower()
+        
+        # Accumulate transform
+        trans_attr = el.attrib.get("transform", "")
+        m = current_m @ _parse_transform(trans_attr)
+        
+        # Some elements have x, y that act as translation (except for path)
+        if tag in ["rect", "circle", "ellipse", "use"]:
+            try:
+                tx = float(el.attrib.get("x", "0"))
+                ty = float(el.attrib.get("y", "0"))
+                if tx != 0 or ty != 0:
+                    t = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
+                    m = m @ t
+            except ValueError:
+                pass
+
         current_skipped = skipped or tag in skip_tags
         if not current_skipped:
             if tag == "polyline":
                 pts = _parse_points(el.attrib.get("points", ""))
                 if len(pts) >= 2:
-                    yield ("polyline", pts)
+                    yield ("polyline", _apply_matrix(pts, m))
             elif tag == "polygon":
                 pts = _parse_points(el.attrib.get("points", ""))
                 if len(pts) >= 3:
-                    yield ("polygon", pts)
+                    yield ("polygon", _apply_matrix(pts, m))
             elif tag == "line":
                 try:
                     x1 = float(el.attrib.get("x1", "0"))
                     y1 = float(el.attrib.get("y1", "0"))
                     x2 = float(el.attrib.get("x2", "0"))
                     y2 = float(el.attrib.get("y2", "0"))
-                    yield ("polyline", [(x1, y1), (x2, y2)])
+                    yield ("polyline", _apply_matrix([(x1, y1), (x2, y2)], m))
                 except ValueError:
-                    return
+                    pass
             elif tag == "path":
                 for pts in _parse_path(el.attrib.get("d", "")):
                     if len(pts) >= 2:
-                        yield ("polyline", pts)
-        for child in list(el):
-            yield from walk(child, current_skipped)
+                        yield ("polyline", _apply_matrix(pts, m))
+            elif tag == "rect":
+                try:
+                    # x, y already applied to m for rect
+                    w = float(el.attrib.get("width", "0"))
+                    h = float(el.attrib.get("height", "0"))
+                    if w > 0 and h > 0:
+                        pts = [(0, 0), (w, 0), (w, h), (0, h), (0, 0)]
+                        yield ("polygon", _apply_matrix(pts, m))
+                except ValueError:
+                    pass
 
-    yield from walk(root, False)
+        for child in list(el):
+            yield from walk(child, m, current_skipped)
+
+    yield from walk(root, np.eye(3, dtype=np.float64), False)
 
 
 def _get_canvas_size(root: ET.Element, scale: float) -> Tuple[int, int]:
@@ -235,34 +273,72 @@ def _get_canvas_size(root: ET.Element, scale: float) -> Tuple[int, int]:
     raise RuntimeError("Cannot determine SVG canvas size")
 
 
-def _parse_transform(transform: str) -> List[Tuple[str, Tuple[float, float]]]:
-    ops: List[Tuple[str, Tuple[float, float]]] = []
+def _parse_transform(transform: str) -> np.ndarray:
+    m = np.eye(3, dtype=np.float64)
     if not transform:
-        return ops
-    for name, args in re.findall(r"(translate|scale)\s*\(([^)]*)\)", transform):
+        return m
+    
+    # Match any of the SVG transform functions
+    for name, args in re.findall(r"([a-z]+)\s*\(([^)]*)\)", transform.lower()):
         nums = [float(v) for v in re.split(r"[ ,]+", args.strip()) if v]
         if name == "translate":
             tx = nums[0] if len(nums) > 0 else 0.0
             ty = nums[1] if len(nums) > 1 else 0.0
-            ops.append(("translate", (tx, ty)))
+            t = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
+            m = m @ t
         elif name == "scale":
             sx = nums[0] if len(nums) > 0 else 1.0
             sy = nums[1] if len(nums) > 1 else sx
-            ops.append(("scale", (sx, sy)))
-    return ops
-
-
-def _ops_to_matrix(ops: List[Tuple[str, Tuple[float, float]]]) -> np.ndarray:
-    m = np.eye(3, dtype=np.float64)
-    for name, params in ops:
-        if name == "translate":
-            tx, ty = params
-            t = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
-            m = t @ m
-        elif name == "scale":
-            sx, sy = params
             s = np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], dtype=np.float64)
-            m = s @ m
+            m = m @ s
+        elif name == "matrix" and len(nums) == 6:
+            # matrix(a, b, c, d, e, f) -> [[a, c, e], [b, d, f], [0, 0, 1]]
+            a, b, c, d, e, f = nums
+            mat = np.array([[a, c, e], [b, d, f], [0, 0, 1]], dtype=np.float64)
+            m = m @ mat
+        elif name == "rotate" and len(nums) >= 1:
+            angle = np.deg2rad(nums[0])
+            ca, sa = np.cos(angle), np.sin(angle)
+            if len(nums) == 3:
+                cx, cy = nums[1], nums[2]
+                t1 = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1]], dtype=np.float64)
+                r = np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]], dtype=np.float64)
+                t2 = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float64)
+                m = m @ t1 @ r @ t2
+            else:
+                r = np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]], dtype=np.float64)
+                m = m @ r
+    return m
+
+
+def _get_element_transform(el: ET.Element, parent_map: dict[ET.Element, ET.Element]) -> np.ndarray:
+    # Accumulate transforms from root down to element
+    path = []
+    curr = el
+    while curr is not None:
+        path.append(curr)
+        curr = parent_map.get(curr)
+    
+    m = np.eye(3, dtype=np.float64)
+    # Iterate from root to leaf
+    for node in reversed(path):
+        tag = node.tag.rsplit("}", 1)[-1]
+        
+        # 1. Apply node's transform attribute
+        trans_attr = node.attrib.get("transform", "")
+        if trans_attr:
+            m = m @ _parse_transform(trans_attr)
+            
+        # 2. If it's an <image> tag, apply x, y attributes as translation
+        if tag == "image":
+            try:
+                tx = float(node.attrib.get("x", "0"))
+                ty = float(node.attrib.get("y", "0"))
+                if tx != 0 or ty != 0:
+                    t = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
+                    m = m @ t
+            except ValueError:
+                pass
     return m
 
 
@@ -271,6 +347,21 @@ def _invert_transform_point(x: float, y: float, m: np.ndarray) -> Tuple[float, f
     v = np.array([x, y, 1.0], dtype=np.float64)
     out = inv @ v
     return float(out[0]), float(out[1])
+
+
+def _ops_to_matrix(ops: List[Tuple[str, Tuple[float, float]]]) -> np.ndarray:
+    # Minimal version for backward compatibility
+    m = np.eye(3, dtype=np.float64)
+    for name, params in ops:
+        if name == "translate":
+            tx, ty = params
+            t = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
+            m = m @ t
+        elif name == "scale":
+            sx, sy = params
+            s = np.array([[sx, 0, 0], [0, sy, 0], [0, 0, 1]], dtype=np.float64)
+            m = m @ s
+    return m
 
 
 def _normalize_name(name: str) -> str:
@@ -282,6 +373,10 @@ def _normalize_name(name: str) -> str:
 def _find_embedded_image(root: ET.Element) -> Tuple[Union[Path, str], np.ndarray, Tuple[float, float]]:
     href_key = "{http://www.w3.org/1999/xlink}href"
     svg_dir = config.SVG_PATH.parent
+    
+    # Build parent map for transform accumulation
+    parent_map = {c: p for p in root.iter() for c in p}
+    
     for el in root.iter():
         tag = el.tag.rsplit("}", 1)[-1]
         if tag != "image":
@@ -299,22 +394,13 @@ def _find_embedded_image(root: ET.Element) -> Tuple[Union[Path, str], np.ndarray
                 img_path = (svg_dir / img_path).resolve()
             img_path_or_uri = img_path
         
-        transform = el.attrib.get("transform", "")
-        ops = []
-        x_attr = float(el.attrib.get("x", "0"))
-        y_attr = float(el.attrib.get("y", "0"))
-        if x_attr != 0.0 or y_attr != 0.0:
-            ops.append(("translate", (x_attr, y_attr)))
-        ops.extend(_parse_transform(transform))
-        if len(ops) == 2 and ops[0][0] == "translate" and ops[1][0] == "scale":
-            tx, ty = ops[0][1]
-            sx, sy = ops[1][1]
-            m = np.array([[sx, 0, tx], [0, sy, ty], [0, 0, 1]], dtype=np.float64)
-        else:
-            m = _ops_to_matrix(ops)
+        # Accumulate all transforms from parents + this element's x,y,transform
+        m = _get_element_transform(el, parent_map)
+        
         w = _parse_length(el.attrib.get("width", "0"))
         h = _parse_length(el.attrib.get("height", "0"))
         
+        # Return the first valid image found
         if isinstance(img_path_or_uri, str) and img_path_or_uri.startswith("data:"):
             return img_path_or_uri, m, (w, h)
         if isinstance(img_path_or_uri, Path) and img_path_or_uri.exists():

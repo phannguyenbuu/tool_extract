@@ -2,7 +2,7 @@ import React, { useMemo, useRef, useState, useEffect, useCallback } from "react"
 import Konva from "konva";
 import { Stage, Layer, Line, Text, Circle, Rect, Path, Group, Image, Transformer } from "react-konva";
 
-const SOURCE_VORONOI_VERSION = 12;
+const SOURCE_VORONOI_VERSION = 18;
 
 const toPoints = (pts) => pts.flatMap((p) => [p[0], p[1]]);
 
@@ -200,7 +200,14 @@ const normalizeNodesForSave = (nodes, scale = 1) =>
   }));
 
 const normalizeVoronoiForSave = (voronoi, scale = 1) => {
-  const graph = buildVoronoiVertexGraph(voronoi?.snappedCells || []);
+  const graph =
+    voronoi?.graphVertices?.length && voronoi?.graphSegments?.length
+      ? {
+          vertices: (voronoi.graphVertices || []).map(([x, y], id) => ({ id, x, y })),
+          segments: (voronoi.graphSegments || []).map(([a, b]) => [a, b]),
+          refs: [],
+        }
+      : buildVoronoiVertexGraph(voronoi?.snappedCells || []);
   return {
     version: SOURCE_VORONOI_VERSION,
     mask: (voronoi?.mask || []).map(([x, y]) => [x / scale, y / scale]),
@@ -819,6 +826,59 @@ const buildVoronoiVertexGraph = (cells, eps = 0.01) => {
   return { vertices, refs, segments, eps };
 };
 
+const buildVoronoiEditGraph = (voronoi, eps = 0.01) => {
+  const cells = voronoi?.snappedCells || voronoi?.cells || [];
+  const base = buildVoronoiVertexGraph(cells, eps);
+  const vertices = (base.vertices || []).map((v) => ({ ...v }));
+  const refs = (base.refs || []).map((r) => [...r]);
+  const segmentSet = new Set();
+  const segments = [];
+  const keyToId = new Map();
+
+  vertices.forEach((v, idx) => {
+    const key = `${(v?.x ?? 0).toFixed(3)}:${(v?.y ?? 0).toFixed(3)}`;
+    keyToId.set(key, idx);
+  });
+  (base.segments || []).forEach(([a, b]) => {
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) return;
+    const key = a < b ? `${a}:${b}` : `${b}:${a}`;
+    if (segmentSet.has(key)) return;
+    segmentSet.add(key);
+    segments.push(a < b ? [a, b] : [b, a]);
+  });
+
+  const getVertexId = (pt) => {
+    const x = Number(pt?.[0]) || 0;
+    const y = Number(pt?.[1]) || 0;
+    const key = `${x.toFixed(3)}:${y.toFixed(3)}`;
+    const existing = keyToId.get(key);
+    if (existing != null) return existing;
+    const id = vertices.length;
+    vertices.push({ id, x, y });
+    keyToId.set(key, id);
+    return id;
+  };
+
+  const mask = dedupeConsecutivePolyPts(voronoi?.mask || [], eps);
+  if (mask.length >= 3) {
+    const maskRefs = mask.map((pt) => getVertexId(pt));
+    for (let i = 0; i < maskRefs.length; i += 1) {
+      const a = maskRefs[i];
+      const b = maskRefs[(i + 1) % maskRefs.length];
+      if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) continue;
+      const key = a < b ? `${a}:${b}` : `${b}:${a}`;
+      if (segmentSet.has(key)) continue;
+      segmentSet.add(key);
+      segments.push(a < b ? [a, b] : [b, a]);
+    }
+  }
+
+  vertices.forEach((v, idx) => {
+    v.id = idx;
+  });
+  return { vertices, refs, segments, eps };
+};
+
 const sanitizeRebuiltVoronoiPoly = (pts, minSeg = 0.75) => {
   if (!Array.isArray(pts) || pts.length < 3) return null;
   const minSeg2 = minSeg * minSeg;
@@ -870,6 +930,338 @@ const rebuildVoronoiCellsFromGraph = (vertices, refs) =>
       return sanitizeRebuiltVoronoiPoly(pts);
     })
     .filter(Boolean);
+
+const canonicalizePolyKey = (pts) => {
+  const arr = (pts || []).map(([x, y]) => `${Number(x).toFixed(3)}:${Number(y).toFixed(3)}`);
+  const n = arr.length;
+  if (!n) return "";
+  const rotations = [];
+  for (let i = 0; i < n; i += 1) {
+    rotations.push(arr.slice(i).concat(arr.slice(0, i)).join("|"));
+  }
+  const rev = [...arr].reverse();
+  for (let i = 0; i < n; i += 1) {
+    rotations.push(rev.slice(i).concat(rev.slice(0, i)).join("|"));
+  }
+  rotations.sort();
+  return rotations[0];
+};
+
+const weldVoronoiCellsByDistance = (cells, threshold = 2) => {
+  const polys = Array.isArray(cells) ? cells : [];
+  if (!polys.length || !(threshold > 0)) return polys;
+  const thr2 = threshold * threshold;
+  const reps = [];
+  const counts = [];
+  const assignPoint = (pt) => {
+    const x = Number(pt?.[0]) || 0;
+    const y = Number(pt?.[1]) || 0;
+    let best = -1;
+    let bestD2 = thr2;
+    for (let i = 0; i < reps.length; i += 1) {
+      const dx = x - reps[i][0];
+      const dy = y - reps[i][1];
+      const d2 = dx * dx + dy * dy;
+      if (d2 <= bestD2) {
+        bestD2 = d2;
+        best = i;
+      }
+    }
+    if (best >= 0) {
+      const c = counts[best] + 1;
+      reps[best][0] = (reps[best][0] * counts[best] + x) / c;
+      reps[best][1] = (reps[best][1] * counts[best] + y) / c;
+      counts[best] = c;
+      return reps[best];
+    }
+    reps.push([x, y]);
+    counts.push(1);
+    return reps[reps.length - 1];
+  };
+
+  const out = [];
+  const seen = new Set();
+  polys.forEach((poly) => {
+    const mapped = (poly || []).map((pt) => {
+      const r = assignPoint(pt);
+      return [r[0], r[1]];
+    });
+    const clean = sanitizeRebuiltVoronoiPoly(mapped);
+    if (!clean) return;
+    const key = canonicalizePolyKey(clean);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(clean);
+  });
+  return out.length ? out : polys;
+};
+
+const polygonSelfIntersects = (pts) => {
+  const poly = Array.isArray(pts) ? pts : [];
+  const n = poly.length;
+  if (n < 4) return false;
+  for (let i = 0; i < n; i += 1) {
+    const a0 = poly[i];
+    const a1 = poly[(i + 1) % n];
+    for (let j = i + 1; j < n; j += 1) {
+      if (i === j) continue;
+      if ((i + 1) % n === j || (j + 1) % n === i) continue;
+      if (i === 0 && j === n - 1) continue;
+      const b0 = poly[j];
+      const b1 = poly[(j + 1) % n];
+      if (segmentsIntersectStrict(a0, a1, b0, b1)) return true;
+    }
+  }
+  return false;
+};
+
+const dedupeConsecutivePolyPts = (pts, eps = 1e-6) => {
+  const src = Array.isArray(pts) ? pts : [];
+  const out = [];
+  src.forEach((p) => {
+    if (!Array.isArray(p) || p.length < 2) return;
+    const x = Number(p[0]) || 0;
+    const y = Number(p[1]) || 0;
+    const prev = out[out.length - 1];
+    if (prev && Math.hypot(prev[0] - x, prev[1] - y) <= eps) return;
+    out.push([x, y]);
+  });
+  if (out.length > 1) {
+    const first = out[0];
+    const last = out[out.length - 1];
+    if (Math.hypot(first[0] - last[0], first[1] - last[1]) <= eps) out.pop();
+  }
+  return out;
+};
+
+const polySignedArea = (pts) => {
+  const poly = Array.isArray(pts) ? pts : [];
+  if (poly.length < 3) return 0;
+  let s = 0;
+  for (let i = 0; i < poly.length; i += 1) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    s += a[0] * b[1] - b[0] * a[1];
+  }
+  return 0.5 * s;
+};
+
+const polyPerimeter = (pts) => {
+  const poly = Array.isArray(pts) ? pts : [];
+  if (poly.length < 2) return 0;
+  let p = 0;
+  for (let i = 0; i < poly.length; i += 1) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    p += Math.hypot(b[0] - a[0], b[1] - a[1]);
+  }
+  return p;
+};
+
+const filterTinyVoronoiCells = (cells, minArea = 40) => {
+  const src = Array.isArray(cells) ? cells : [];
+  const out = [];
+  const threshold = Math.max(0, Number(minArea) || 0);
+  src.forEach((poly) => {
+    const clean = sanitizeRebuiltVoronoiPoly(poly);
+    if (!clean) return;
+    const area = Math.abs(polySignedArea(clean));
+    if (area < threshold) return;
+    out.push(clean);
+  });
+  return out;
+};
+
+const reorderBoundaryByGraphAdj = (mask, vertices, segments, snapDist = 4) => {
+  const pts = dedupeConsecutivePolyPts(mask, 1e-5);
+  const verts = Array.isArray(vertices) ? vertices : [];
+  const segs = Array.isArray(segments) ? segments : [];
+  if (pts.length < 3 || verts.length < 3 || segs.length < 2) return pts;
+  const snap2 = snapDist * snapDist;
+  const nearestVid = (pt) => {
+    let best = null;
+    let bestD2 = snap2;
+    for (const v of verts) {
+      const dx = v.x - pt[0];
+      const dy = v.y - pt[1];
+      const d2 = dx * dx + dy * dy;
+      if (d2 <= bestD2) {
+        bestD2 = d2;
+        best = v.id;
+      }
+    }
+    return best;
+  };
+
+  const boundaryIds = [];
+  const idSet = new Set();
+  pts.forEach((p) => {
+    const vid = nearestVid(p);
+    if (!Number.isFinite(vid) || idSet.has(vid)) return;
+    idSet.add(vid);
+    boundaryIds.push(vid);
+  });
+  if (boundaryIds.length < 3) return pts;
+
+  const adj = new Map();
+  const addAdj = (a, b) => {
+    if (!adj.has(a)) adj.set(a, []);
+    adj.get(a).push(b);
+  };
+  segs.forEach(([a, b]) => {
+    if (!idSet.has(a) || !idSet.has(b) || a === b) return;
+    addAdj(a, b);
+    addAdj(b, a);
+  });
+  const usable = boundaryIds.filter((id) => (adj.get(id) || []).length > 0);
+  if (usable.length < 3) return pts;
+
+  let start = usable[0];
+  usable.forEach((id) => {
+    const a = verts[id];
+    const b = verts[start];
+    if (!a || !b) return;
+    if (a.x < b.x || (Math.abs(a.x - b.x) < 1e-6 && a.y < b.y)) start = id;
+  });
+
+  const path = [];
+  const visited = new Set();
+  let prev = null;
+  let cur = start;
+  const maxSteps = usable.length + 8;
+  for (let step = 0; step < maxSteps; step += 1) {
+    path.push(cur);
+    visited.add(cur);
+    const nbrs = (adj.get(cur) || []).filter((n) => n !== prev);
+    if (!nbrs.length) break;
+    const curV = verts[cur];
+    let next = null;
+    if (prev == null) {
+      next = [...nbrs].sort((i, j) => {
+        const vi = verts[i];
+        const vj = verts[j];
+        const ai = Math.atan2(vi.y - curV.y, vi.x - curV.x);
+        const aj = Math.atan2(vj.y - curV.y, vj.x - curV.x);
+        return ai - aj;
+      })[0];
+    } else {
+      const prevV = verts[prev];
+      const ux = curV.x - prevV.x;
+      const uy = curV.y - prevV.y;
+      next = [...nbrs].sort((i, j) => {
+        const vi = verts[i];
+        const vj = verts[j];
+        const vix = vi.x - curV.x;
+        const viy = vi.y - curV.y;
+        const vjx = vj.x - curV.x;
+        const vjy = vj.y - curV.y;
+        const ai = Math.atan2(ux * viy - uy * vix, ux * vix + uy * viy);
+        const aj = Math.atan2(ux * vjy - uy * vjx, ux * vjx + uy * vjy);
+        const nai = ai < 0 ? ai + Math.PI * 2 : ai;
+        const naj = aj < 0 ? aj + Math.PI * 2 : aj;
+        return nai - naj;
+      })[0];
+    }
+    if (!Number.isFinite(next)) break;
+    if (next === start) break;
+    if (visited.has(next)) break;
+    prev = cur;
+    cur = next;
+  }
+
+  if (path.length < 3) return pts;
+  const ordered = dedupeConsecutivePolyPts(path.map((vid) => [verts[vid].x, verts[vid].y]), 1e-5);
+  if (ordered.length < Math.max(3, Math.floor(usable.length * 0.7))) return pts;
+  if (polygonSelfIntersects(ordered)) return pts;
+  const area0 = Math.abs(polySignedArea(pts));
+  const area1 = Math.abs(polySignedArea(ordered));
+  const peri0 = polyPerimeter(pts);
+  const peri1 = polyPerimeter(ordered);
+  if (area0 > 1e-6) {
+    const areaRatio = area1 / area0;
+    if (!(areaRatio >= 0.6 && areaRatio <= 1.4)) return pts;
+  }
+  if (peri0 > 1e-6) {
+    const periRatio = peri1 / peri0;
+    if (!(periRatio >= 0.6 && periRatio <= 1.6)) return pts;
+  }
+  return ordered;
+};
+
+const rebuildVoronoiCellsFromSegments = (vertices, segments, mask) => {
+  const verts = (vertices || []).map((v) => [Number(v?.x) || 0, Number(v?.y) || 0]);
+  const segs = (segments || [])
+    .map((seg) => [Number(seg?.[0]), Number(seg?.[1])])
+    .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b) && a >= 0 && b >= 0 && a !== b && a < verts.length && b < verts.length);
+  if (!verts.length || !segs.length || !Array.isArray(mask) || mask.length < 3) return [];
+
+  const adj = new Map();
+  const angleOf = (from, to) => Math.atan2(verts[to][1] - verts[from][1], verts[to][0] - verts[from][0]);
+  segs.forEach(([a, b]) => {
+    if (!adj.has(a)) adj.set(a, []);
+    if (!adj.has(b)) adj.set(b, []);
+    adj.get(a).push(b);
+    adj.get(b).push(a);
+  });
+  adj.forEach((nbrs, vid) => {
+    nbrs.sort((i, j) => angleOf(vid, i) - angleOf(vid, j));
+  });
+
+  const directedSeen = new Set();
+  const cells = [];
+  const seenPolyKeys = new Set();
+  const maxSteps = Math.max(16, segs.length * 4);
+
+  const tryKeepFace = (faceIds) => {
+    const pts = faceIds.map((vid) => verts[vid]);
+    const clean = sanitizeRebuiltVoronoiPoly(pts);
+    if (!clean || clean.length < 3) return;
+    const { area, cx, cy } = polyCentroid(clean);
+    if (!(Math.abs(area) > 1e-4)) return;
+    if (!pointInPoly([cx, cy], mask)) return;
+    for (let i = 1; i <= 4; i += 1) {
+      const t = i / 5;
+      const sx = clean[0][0] * (1 - t) + clean[1 % clean.length][0] * t;
+      const sy = clean[0][1] * (1 - t) + clean[1 % clean.length][1] * t;
+      if (!pointInPolyWithOffset([sx, sy], mask, 0.75)) return;
+    }
+    const key = canonicalizePolyKey(clean);
+    if (!key || seenPolyKeys.has(key)) return;
+    seenPolyKeys.add(key);
+    cells.push(clean);
+  };
+
+  segs.forEach(([sa, sb]) => {
+    [[sa, sb], [sb, sa]].forEach(([u0, v0]) => {
+      const startKey = `${u0}:${v0}`;
+      if (directedSeen.has(startKey)) return;
+      const faceIds = [];
+      let u = u0;
+      let v = v0;
+      let closed = false;
+      for (let step = 0; step < maxSteps; step += 1) {
+        const edgeKey = `${u}:${v}`;
+        if (directedSeen.has(edgeKey)) break;
+        directedSeen.add(edgeKey);
+        faceIds.push(u);
+        const nbrs = adj.get(v) || [];
+        const idx = nbrs.indexOf(u);
+        if (idx < 0 || !nbrs.length) break;
+        const next = nbrs[(idx - 1 + nbrs.length) % nbrs.length];
+        u = v;
+        v = next;
+        if (u === u0 && v === v0) {
+          closed = true;
+          break;
+        }
+      }
+      if (closed && faceIds.length >= 3) {
+        tryKeepFace(faceIds);
+      }
+    });
+  });
+  return cells;
+};
 
 const cross2d = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
 
@@ -936,6 +1328,218 @@ const canMoveVoronoiVertexSafely = (graph, vertexId, nextPt, minNeighborGap = 0.
     }
   }
   return true;
+};
+
+const rebuildVoronoiEdgesPlanar = (voronoi) => {
+  const current = voronoi || { mask: [], snappedCells: [] };
+  const baseCellsRaw = current?.snappedCells || current?.cells || [];
+  const baseCells = weldVoronoiCellsByDistance(baseCellsRaw, 1);
+  if (!baseCells.length) {
+    return { ok: false, error: "missing mask or cells" };
+  }
+  const graph = buildVoronoiVertexGraph(baseCells);
+  const vertices = (graph.vertices || []).map((v) => ({ ...v }));
+  const rawMask = Array.isArray(current?.mask) ? current.mask : [];
+  const mask = reorderBoundaryByGraphAdj(rawMask, vertices, graph.segments || [], 4);
+  if (!mask.length) {
+    return { ok: false, error: "missing mask or cells" };
+  }
+  if (vertices.length < 3) {
+    return { ok: false, error: "not enough vertices" };
+  }
+  const targetCount = Math.max(1, baseCells.length);
+  const eps = 2.2;
+
+  const edgeKey = (a, b) => (a < b ? `${a}:${b}` : `${b}:${a}`);
+  const edgeLen = ([a, b]) => {
+    const va = vertices[a];
+    const vb = vertices[b];
+    if (!va || !vb) return Number.POSITIVE_INFINITY;
+    return Math.hypot(vb.x - va.x, vb.y - va.y);
+  };
+  const samePt = (p, q) => Math.hypot((p?.[0] ?? 0) - (q?.[0] ?? 0), (p?.[1] ?? 0) - (q?.[1] ?? 0)) <= eps;
+  const edgeInsideMask = (a, b) => {
+    const va = vertices[a];
+    const vb = vertices[b];
+    if (!va || !vb) return false;
+    for (let i = 1; i <= 4; i += 1) {
+      const t = i / 5;
+      const px = va.x * (1 - t) + vb.x * t;
+      const py = va.y * (1 - t) + vb.y * t;
+      if (!pointInPolyWithOffset([px, py], mask, 0.75)) return false;
+    }
+    return true;
+  };
+  const intersectsAny = (a, b, selected) => {
+    const va = vertices[a];
+    const vb = vertices[b];
+    if (!va || !vb) return true;
+    for (const [x, y] of selected) {
+      if (x === a || x === b || y === a || y === b) continue;
+      const vx = vertices[x];
+      const vy = vertices[y];
+      if (!vx || !vy) continue;
+      if (segmentsIntersectStrict([va.x, va.y], [vb.x, vb.y], [vx.x, vx.y], [vy.x, vy.y])) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const nearestVertexId = (pt) => {
+    let best = null;
+    let bestD2 = eps * eps;
+    for (const v of vertices) {
+      const dx = v.x - pt[0];
+      const dy = v.y - pt[1];
+      const d2 = dx * dx + dy * dy;
+      if (d2 <= bestD2) {
+        bestD2 = d2;
+        best = v.id;
+      }
+    }
+    return best;
+  };
+
+  const boundaryForced = [];
+  if (Array.isArray(mask) && mask.length >= 3) {
+    const closedMask = [...mask];
+    const first = closedMask[0];
+    const last = closedMask[closedMask.length - 1];
+    if (!samePt(first, last)) closedMask.push(first);
+    for (let i = 0; i + 1 < closedMask.length; i += 1) {
+      const a = nearestVertexId(closedMask[i]);
+      const b = nearestVertexId(closedMask[i + 1]);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) continue;
+      boundaryForced.push(a < b ? [a, b] : [b, a]);
+    }
+  }
+
+  const selected = [];
+  const selectedSet = new Set();
+  const forcedSet = new Set();
+  const addEdgeSafe = (edge, force = false) => {
+    const [a, b] = edge;
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) return false;
+    const key = edgeKey(a, b);
+    if (selectedSet.has(key)) return false;
+    if (!force && !edgeInsideMask(a, b)) return false;
+    if (intersectsAny(a, b, selected)) return false;
+    selected.push(a < b ? [a, b] : [b, a]);
+    selectedSet.add(key);
+    if (force) forcedSet.add(key);
+    return true;
+  };
+  const removeEdgeAt = (idx) => {
+    if (idx < 0 || idx >= selected.length) return null;
+    const [a, b] = selected[idx];
+    const key = edgeKey(a, b);
+    selected.splice(idx, 1);
+    selectedSet.delete(key);
+    return [a, b];
+  };
+
+  boundaryForced.forEach((edge) => addEdgeSafe(edge, true));
+  const sortedBase = [...(graph.segments || [])]
+    .map(([a, b]) => (a < b ? [a, b] : [b, a]))
+    .sort((a, b) => edgeLen(a) - edgeLen(b));
+  sortedBase.forEach((edge) => addEdgeSafe(edge));
+
+  let bestCells = rebuildVoronoiCellsFromSegments(vertices, selected, mask);
+  if (bestCells.length > targetCount) {
+    let changed = true;
+    while (bestCells.length > targetCount && changed) {
+      changed = false;
+      const removable = selected
+        .map((edge, idx) => ({ edge, idx }))
+        .filter(({ edge }) => !forcedSet.has(edgeKey(edge[0], edge[1])))
+        .sort((a, b) => edgeLen(b.edge) - edgeLen(a.edge));
+      for (const item of removable) {
+        const removed = removeEdgeAt(item.idx);
+        if (!removed) continue;
+        const nextCells = rebuildVoronoiCellsFromSegments(vertices, selected, mask);
+        if (nextCells.length > 0 && nextCells.length >= targetCount && nextCells.length <= bestCells.length) {
+          bestCells = nextCells;
+          changed = true;
+          break;
+        }
+        addEdgeSafe(removed);
+      }
+    }
+    if (bestCells.length > targetCount) {
+      return {
+        ok: false,
+        error: `rebound prune failed (${bestCells.length}/${targetCount} cells)`,
+      };
+    }
+  }
+
+  const kNeighbors = 8;
+  const candidateKeys = new Set();
+  const candidates = [];
+  for (let i = 0; i < vertices.length; i += 1) {
+    const vi = vertices[i];
+    const nbrs = [];
+    for (let j = 0; j < vertices.length; j += 1) {
+      if (i === j) continue;
+      const vj = vertices[j];
+      const d = Math.hypot(vj.x - vi.x, vj.y - vi.y);
+      nbrs.push({ j, d });
+    }
+    nbrs.sort((a, b) => a.d - b.d);
+    nbrs.slice(0, kNeighbors).forEach(({ j }) => {
+      const a = Math.min(i, j);
+      const b = Math.max(i, j);
+      const key = edgeKey(a, b);
+      if (candidateKeys.has(key) || selectedSet.has(key)) return;
+      candidateKeys.add(key);
+      candidates.push([a, b]);
+    });
+  }
+  candidates.sort((a, b) => edgeLen(a) - edgeLen(b));
+
+  for (const [a, b] of candidates) {
+    if (bestCells.length >= targetCount) break;
+    if (!addEdgeSafe([a, b])) continue;
+    const nextCells = rebuildVoronoiCellsFromSegments(vertices, selected, mask);
+    if (!nextCells.length || nextCells.length > targetCount) {
+      selected.pop();
+      selectedSet.delete(edgeKey(a, b));
+      continue;
+    }
+    if (nextCells.length >= bestCells.length) {
+      bestCells = nextCells;
+    } else {
+      selected.pop();
+      selectedSet.delete(edgeKey(a, b));
+    }
+  }
+
+  if (bestCells.length !== targetCount) {
+    return {
+      ok: false,
+      error: `rebound incomplete (${bestCells.length}/${targetCount} cells)`,
+    };
+  }
+
+  // Remove tiny sliver cells, then rebuild graph so orphan vertices/edges are dropped.
+  const avgArea = Math.abs(polySignedArea(mask)) / Math.max(1, bestCells.length);
+  const tinyAreaThreshold = Math.max(40, avgArea * 0.015);
+  const trimmedCells = filterTinyVoronoiCells(bestCells, tinyAreaThreshold);
+  const finalCells = trimmedCells.length ? trimmedCells : bestCells;
+  const removedTiny = Math.max(0, bestCells.length - finalCells.length);
+  const finalGraph = buildVoronoiVertexGraph(finalCells);
+
+  return {
+    ok: true,
+    mask,
+    cells: finalCells,
+    graphVertices: (finalGraph.vertices || []).map((v) => [v.x, v.y]),
+    graphSegments: (finalGraph.segments || []).map(([a, b]) => [a, b]),
+    cellCount: finalCells.length,
+    targetCount,
+    removedTiny,
+  };
 };
 
 const mergeVoronoiVerticesIfClose = (vertices, refs, movedId, snap) => {
@@ -1306,30 +1910,18 @@ const buildSnapZoneSceneFromRegionScene = (data) => {
     });
   });
 
-  if (zonePolys.length) {
-    const zoneCenters = zonePolys.map((poly) => {
-      const { cx, cy } = polyCentroid(poly);
-      return [cx, cy];
-    });
-    for (let i = 0; i < regionCount; i++) {
-      if (zoneId[i] >= 0) continue;
-      const { cx, cy } = polyCentroid(data.regions[i] || []);
-      let bestZid = 0;
-      let bestD2 = Infinity;
-      zoneCenters.forEach((pt, zid) => {
-        const dx = (pt?.[0] ?? 0) - cx;
-        const dy = (pt?.[1] ?? 0) - cy;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < bestD2) {
-          bestD2 = d2;
-          bestZid = zid;
-        }
-      });
-      zoneId[i] = bestZid;
-    }
-  } else {
+  if (!zonePolys.length) {
     for (let i = 0; i < regionCount; i++) {
       if (zoneId[i] < 0) zoneId[i] = i;
+    }
+  }
+
+  // Strict mode: only keep region->zone links explicitly provided by snap_region_map.
+  // Do not auto-attach by nearest-center because that creates random pack groups.
+  if (zonePolys.length) {
+    const valid = new Set(zoneOrder.map((z) => Number(z)));
+    for (let i = 0; i < regionCount; i++) {
+      if (!valid.has(Number(zoneId[i]))) zoneId[i] = -1;
     }
   }
 
@@ -1477,6 +2069,7 @@ export default function App() {
   const [addNodeMode, setAddNodeMode] = useState(false);
   const [deleteEdgeMode, setDeleteEdgeMode] = useState(false);
   const [edgeCandidate, setEdgeCandidate] = useState(null);
+  const [edgeStartVertex, setEdgeStartVertex] = useState(null);
   const [deleteEdgeCandidate, setDeleteEdgeCandidate] = useState(null);
   const [sceneLoading, setSceneLoading] = useState(true);
   const [packPadding, setPackPadding] = useState(5);
@@ -1621,10 +2214,7 @@ export default function App() {
     }
   };
 
-  const sourceVoronoiGraph = useMemo(
-    () => buildVoronoiVertexGraph(sourceVoronoi?.snappedCells || []),
-    [sourceVoronoi]
-  );
+  const sourceVoronoiGraph = useMemo(() => buildVoronoiEditGraph(sourceVoronoi), [sourceVoronoi]);
   const liveSnapRadius = Math.max(0, (snap || 0) * 0.35);
   const greenToRedSnapRadius = 4.5;
 
@@ -1745,12 +2335,13 @@ export default function App() {
     }
     const maxD2 = radius * radius;
     const candidates = [];
-    (nodes || []).forEach((n) => {
-      const dx = n.x - x;
-      const dy = n.y - y;
+    (sourceVoronoiGraph?.vertices || []).forEach((v) => {
+      if (v.id === vertexId) return;
+      const dx = v.x - x;
+      const dy = v.y - y;
       const d2 = dx * dx + dy * dy;
       if (d2 <= maxD2) {
-        candidates.push({ x: n.x, y: n.y, kind: "node", id: n.id, d2 });
+        candidates.push({ x: v.x, y: v.y, kind: "voronoi", id: v.id, d2 });
       }
     });
     candidates.sort((a, b) => a.d2 - b.d2);
@@ -1766,20 +2357,56 @@ export default function App() {
     const { snapTarget = null } = options;
     const target = snapTarget || { x, y, kind: "none", id: null };
     const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
-    const graph = buildVoronoiVertexGraph(currentVoronoi?.snappedCells || []);
+    const graph = buildVoronoiEditGraph(currentVoronoi);
     if (!graph.vertices[vertexId]) return target;
+    const boundarySnapEps = 1.25;
     const safePt = canMoveVoronoiVertexSafely(graph, vertexId, [target.x, target.y])
       ? { x: target.x, y: target.y, kind: target.kind, id: target.id }
       : { x, y, kind: "none", id: null };
+    const prevVertex = graph.vertices[vertexId];
     let nextVertices = graph.vertices.map((v) =>
       v.id === vertexId ? { ...v, x: safePt.x, y: safePt.y } : { ...v }
     );
+    let nextMask = Array.isArray(currentVoronoi?.mask) ? currentVoronoi.mask.map((pt) => [...pt]) : [];
+    if (nextMask.length) {
+      let changed = false;
+      nextMask = nextMask.map((pt) => {
+        const dx = (pt?.[0] ?? 0) - prevVertex.x;
+        const dy = (pt?.[1] ?? 0) - prevVertex.y;
+        if (dx * dx + dy * dy <= boundarySnapEps * boundarySnapEps) {
+          changed = true;
+          return [safePt.x, safePt.y];
+        }
+        return pt;
+      });
+      if (changed) {
+        const deduped = [];
+        nextMask.forEach((pt) => {
+          const prev = deduped[deduped.length - 1];
+          if (prev && Math.hypot((prev[0] ?? 0) - (pt?.[0] ?? 0), (prev[1] ?? 0) - (pt?.[1] ?? 0)) < 1e-6) return;
+          deduped.push(pt);
+        });
+        if (deduped.length > 1) {
+          const first = deduped[0];
+          const last = deduped[deduped.length - 1];
+          if (Math.hypot((first[0] ?? 0) - (last[0] ?? 0), (first[1] ?? 0) - (last[1] ?? 0)) < 1e-6) {
+            deduped.pop();
+          }
+        }
+        nextMask = deduped;
+      }
+    }
+    const rebuiltCells = rebuildVoronoiCellsFromGraph(nextVertices, graph.refs);
     const nextVoronoi = {
       ...currentVoronoi,
-      snappedCells: rebuildVoronoiCellsFromGraph(nextVertices, graph.refs),
+      mask: nextMask,
+      cells: rebuiltCells,
+      snappedCells: rebuiltCells,
+      graphVertices: nextVertices.map((v) => [v.x, v.y]),
+      graphSegments: (graph.segments || []).map(([a, b]) => [a, b]),
     };
     setSourceVoronoi(nextVoronoi);
-    return safePt;
+    return { ...safePt, nextVoronoi };
   };
 
   const applyPackPreset = (name, rerender = false) => {
@@ -1935,7 +2562,7 @@ export default function App() {
                         key={`sim-pack-fill-${idx}`}
                         points={toPoints(tpts)}
                         closed
-                        fill={scene.region_colors[idx]}
+                        fill={scene.region_colors?.[idx] || "#bbbbbb"}
                         strokeScaleEnabled={false}
                       />
                     );
@@ -2020,7 +2647,7 @@ export default function App() {
                         key={`sim-move-fill-${idx}`}
                         points={toPoints(pts)}
                         closed
-                        fill={scene.region_colors[idx]}
+                        fill={scene.region_colors?.[idx] || "#bbbbbb"}
                         strokeScaleEnabled={false}
                       />
                     );
@@ -3088,10 +3715,10 @@ export default function App() {
 
   const findEdgeCandidate = (worldPt) => {
     if (!sourceVoronoiGraph?.vertices?.length || !sourceVoronoiGraph?.refs?.length) return null;
-    const EDGE_HOVER_DIST = 10;
-    const EDGE_MAX_LEN = 120;
+    const EDGE_HOVER_DIST = 7;
+    const EDGE_MAX_LEN = 80;
     let best = null;
-    let bestDist = Infinity;
+    let bestScore = Infinity;
     sourceVoronoiGraph.refs.forEach((polyRefs, polyIdx) => {
       const lenRefs = Array.isArray(polyRefs) ? polyRefs.length : 0;
       if (lenRefs < 4) return;
@@ -3101,9 +3728,7 @@ export default function App() {
           const va = sourceVoronoiGraph.vertices[polyRefs[i]];
           const vb = sourceVoronoiGraph.vertices[polyRefs[j]];
           if (!va || !vb) continue;
-          const dx = vb.x - va.x;
-          const dy = vb.y - va.y;
-          const chordLen = Math.hypot(dx, dy);
+          const chordLen = Math.hypot(vb.x - va.x, vb.y - va.y);
           if (chordLen > EDGE_MAX_LEN) continue;
           let intersects = false;
           for (let k = 0; k < lenRefs; k++) {
@@ -3119,11 +3744,11 @@ export default function App() {
             }
           }
           if (intersects) continue;
-          const mx = (va.x + vb.x) * 0.5;
-          const my = (va.y + vb.y) * 0.5;
-        const d = Math.hypot(worldPt.x - mx, worldPt.y - my);
-        if (d > EDGE_HOVER_DIST || d >= bestDist) continue;
-        bestDist = d;
+          const d = pointSegDist([worldPt.x, worldPt.y], [va.x, va.y], [vb.x, vb.y]);
+          if (d > EDGE_HOVER_DIST) continue;
+          const score = d + chordLen * 0.06;
+          if (score >= bestScore) continue;
+          bestScore = score;
           best = { a: polyRefs[i], b: polyRefs[j], polyIdx, refA: i, refB: j };
         }
       }
@@ -3131,19 +3756,73 @@ export default function App() {
     return best;
   };
 
+  const buildEdgeCandidateFromVertices = (vertexA, vertexB) => {
+    if (!Number.isFinite(vertexA) || !Number.isFinite(vertexB) || vertexA === vertexB) return null;
+    if (!sourceVoronoiGraph?.vertices?.length || !sourceVoronoiGraph?.segments?.length) return null;
+    const va = sourceVoronoiGraph.vertices[vertexA];
+    const vb = sourceVoronoiGraph.vertices[vertexB];
+    if (!va || !vb) return null;
+    const edgeKey = vertexA < vertexB ? `${vertexA}:${vertexB}` : `${vertexB}:${vertexA}`;
+    const existing = new Set((sourceVoronoiGraph.segments || []).map(([a, b]) => (a < b ? `${a}:${b}` : `${b}:${a}`)));
+    if (existing.has(edgeKey)) return null;
+    for (const [a, b] of sourceVoronoiGraph.segments || []) {
+      if (a === vertexA || a === vertexB || b === vertexA || b === vertexB) continue;
+      const pa = sourceVoronoiGraph.vertices[a];
+      const pb = sourceVoronoiGraph.vertices[b];
+      if (!pa || !pb) continue;
+      if (segmentsIntersectStrict([va.x, va.y], [vb.x, vb.y], [pa.x, pa.y], [pb.x, pb.y])) {
+        return null;
+      }
+    }
+    const mask = sourceVoronoi?.mask || [];
+    if (Array.isArray(mask) && mask.length >= 3) {
+      for (let i = 1; i <= 4; i += 1) {
+        const t = i / 5;
+        const px = va.x * (1 - t) + vb.x * t;
+        const py = va.y * (1 - t) + vb.y * t;
+        if (!pointInPolyWithOffset([px, py], mask, 0.75)) {
+          return null;
+        }
+      }
+    }
+    return { a: vertexA, b: vertexB };
+  };
+
   const findExistingEdgeCandidate = (worldPt) => {
-    if (!nodes.length || !segs.length) return null;
+    if (!sourceVoronoiGraph?.vertices?.length || !sourceVoronoiGraph?.refs?.length) return null;
     const EDGE_HOVER_DIST = 10;
+    const edgeMap = new Map();
+    sourceVoronoiGraph.refs.forEach((polyRefs, polyIdx) => {
+      const refs = Array.isArray(polyRefs) ? polyRefs : [];
+      if (refs.length < 2) return;
+      for (let i = 0; i < refs.length; i += 1) {
+        const a = refs[i];
+        const b = refs[(i + 1) % refs.length];
+        if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) continue;
+        const key = a < b ? `${a}:${b}` : `${b}:${a}`;
+        const list = edgeMap.get(key) || [];
+        list.push({ polyIdx, a, b, edgeIdx: i });
+        edgeMap.set(key, list);
+      }
+    });
     let best = null;
     let bestDist = Infinity;
-    segs.forEach(([a, b], idx) => {
-      const na = nodes[a];
-      const nb = nodes[b];
+    edgeMap.forEach((occurs, key) => {
+      if (!Array.isArray(occurs) || occurs.length !== 2) return;
+      const [left, right] = occurs;
+      const [a, b] = key.split(":").map((v) => parseInt(v, 10));
+      const na = sourceVoronoiGraph.vertices[a];
+      const nb = sourceVoronoiGraph.vertices[b];
       if (!na || !nb) return;
       const d = pointSegDist([worldPt.x, worldPt.y], [na.x, na.y], [nb.x, nb.y]);
       if (d <= EDGE_HOVER_DIST && d < bestDist) {
         bestDist = d;
-        best = { a, b, idx };
+        best = {
+          a,
+          b,
+          polyA: left.polyIdx,
+          polyB: right.polyIdx,
+        };
       }
     });
     return best;
@@ -3179,6 +3858,55 @@ export default function App() {
     const poly2 = [...refs.slice(hi), ...refs.slice(0, lo + 1)];
     if (poly1.length < 3 || poly2.length < 3) return null;
     return [poly1, poly2];
+  };
+
+  const mergeVoronoiPolysBySharedEdge = (polyARefs, polyBRefs, sharedA, sharedB) => {
+    const refsA = Array.isArray(polyARefs) ? polyARefs : [];
+    const refsB = Array.isArray(polyBRefs) ? polyBRefs : [];
+    if (refsA.length < 3 || refsB.length < 3) return null;
+    const remainingEdges = [];
+    const pushEdges = (refs) => {
+      for (let i = 0; i < refs.length; i += 1) {
+        const a = refs[i];
+        const b = refs[(i + 1) % refs.length];
+        if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) continue;
+        const isShared =
+          (a === sharedA && b === sharedB) ||
+          (a === sharedB && b === sharedA);
+        if (isShared) continue;
+        remainingEdges.push([a, b]);
+      }
+    };
+    pushEdges(refsA);
+    pushEdges(refsB);
+    const adjacency = new Map();
+    remainingEdges.forEach(([a, b]) => {
+      if (!adjacency.has(a)) adjacency.set(a, []);
+      if (!adjacency.has(b)) adjacency.set(b, []);
+      adjacency.get(a).push(b);
+      adjacency.get(b).push(a);
+    });
+    for (const neighbors of adjacency.values()) {
+      if (neighbors.length !== 2) return null;
+    }
+    const start = sharedA;
+    if (!adjacency.has(start)) return null;
+    const cycle = [start];
+    let prev = null;
+    let current = start;
+    const maxSteps = adjacency.size + 2;
+    for (let step = 0; step < maxSteps; step += 1) {
+      const neighbors = adjacency.get(current) || [];
+      const next = neighbors.find((n) => n !== prev);
+      if (!Number.isFinite(next)) return null;
+      if (next === start) {
+        return cycle.length >= 3 ? cycle : null;
+      }
+      cycle.push(next);
+      prev = current;
+      current = next;
+    }
+    return null;
   };
 
   const findZoneAtPoint = (pt) => {
@@ -3679,6 +4407,33 @@ export default function App() {
       setError(err.message || String(err));
     } finally {
       setSceneLoading(false);
+    }
+  };
+
+  const reboundSourceVoronoi = async (sourceName = selectedSource) => {
+    try {
+      setError("");
+      const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
+      const rebound = rebuildVoronoiEdgesPlanar(currentVoronoi);
+      if (!rebound?.ok) {
+        throw new Error(rebound?.error || "rebound failed");
+      }
+      const nextVoronoi = {
+        ...currentVoronoi,
+        mask: Array.isArray(rebound.mask) && rebound.mask.length ? rebound.mask : currentVoronoi.mask,
+        cells: rebound.cells,
+        snappedCells: rebound.cells,
+        graphVertices: rebound.graphVertices,
+        graphSegments: rebound.graphSegments,
+      };
+      pushSourceUndoSnapshot(createSourceEditSnapshot());
+      setSourceVoronoi(nextVoronoi);
+      await persistSourceCacheNow(nodes, segs, nextVoronoi, sourceName);
+      const tinyMsg = rebound.removedTiny > 0 ? `, removed ${rebound.removedTiny} tiny` : "";
+      setExportMsg(`Rebound OK (${rebound.cellCount} cells${tinyMsg})`);
+      setTimeout(() => setExportMsg(""), 2200);
+    } catch (err) {
+      setError(err.message || String(err));
     }
   };
 
@@ -4413,118 +5168,182 @@ export default function App() {
       setExportPdfTiming({ startTs: exportStartTs, elapsedMs: 0 });
       setExportPdfInfo(null);
       const size = { w: scene.canvas.w, h: scene.canvas.h };
-      const buildRegionFillSvg = () => {
+      const rewriteSvgForPdf = (
+        rawSvg,
+        {
+          whiteBg = true,
+          textColor = null,
+          textScale = 1,
+          strokeColor = null,
+          removeCanvasBackdrop = false,
+        } = {}
+      ) => {
+        try {
+          const doc = new DOMParser().parseFromString(rawSvg || "", "image/svg+xml");
+          const svg = doc.querySelector("svg");
+          if (!svg) return rawSvg || "";
+          if (whiteBg) {
+            const bg = doc.createElementNS("http://www.w3.org/2000/svg", "rect");
+            bg.setAttribute("x", "0");
+            bg.setAttribute("y", "0");
+            bg.setAttribute("width", String(size.w));
+            bg.setAttribute("height", String(size.h));
+            bg.setAttribute("fill", "#ffffff");
+            svg.insertBefore(bg, svg.firstChild || null);
+          }
+          if (textColor || textScale !== 1) {
+            Array.from(svg.querySelectorAll("text")).forEach((node) => {
+              if (textColor) node.setAttribute("fill", textColor);
+              if (textScale !== 1) {
+                const cur = parseFloat(node.getAttribute("font-size") || "0");
+                if (Number.isFinite(cur) && cur > 0) {
+                  node.setAttribute("font-size", String(cur * textScale));
+                }
+              }
+            });
+          }
+          if (strokeColor) {
+            Array.from(svg.querySelectorAll("*")).forEach((node) => {
+              const stroke = node.getAttribute("stroke");
+              if (!stroke || stroke === "none") return;
+              node.setAttribute("stroke", strokeColor);
+            });
+          }
+          if (removeCanvasBackdrop) {
+            const isDarkFill = (value) => {
+              const v = String(value || "").trim().toLowerCase();
+              return (
+                v === "#000" ||
+                v === "#000000" ||
+                v === "black" ||
+                v === "rgb(0,0,0)" ||
+                v === "rgb(0 0 0)"
+              );
+            };
+            Array.from(svg.querySelectorAll("rect")).forEach((node) => {
+              const x = parseFloat(node.getAttribute("x") || "0");
+              const y = parseFloat(node.getAttribute("y") || "0");
+              const w = parseFloat(node.getAttribute("width") || "0");
+              const h = parseFloat(node.getAttribute("height") || "0");
+              const isFullCanvas =
+                Math.abs(x) <= 1e-3 &&
+                Math.abs(y) <= 1e-3 &&
+                Math.abs(w - size.w) <= 1e-2 &&
+                Math.abs(h - size.h) <= 1e-2;
+              if (!isFullCanvas) return;
+              const fill = node.getAttribute("fill");
+              const stroke = node.getAttribute("stroke");
+              const hasDarkBackdrop = isDarkFill(fill);
+              const hasStroke = !!stroke && stroke !== "none";
+              if (hasDarkBackdrop || hasStroke) {
+                node.remove();
+              }
+            });
+          }
+          return new XMLSerializer().serializeToString(svg);
+        } catch {
+          return rawSvg || "";
+        }
+      };
+      const buildRegionFillOnlySvg = () => {
         const parts = [
           `<svg xmlns="http://www.w3.org/2000/svg" width="${size.w}" height="${size.h}" viewBox="0 0 ${size.w} ${size.h}">`,
+          `<rect x="0" y="0" width="${size.w}" height="${size.h}" fill="#ffffff"/>`,
         ];
         (scene.regions || []).forEach((poly, idx) => {
           if (!poly?.length) return;
           const d = `M ${poly.map((p) => `${p[0]} ${p[1]}`).join(" L ")} Z`;
           const fill = scene.region_colors?.[idx] || "#bbbbbb";
-          parts.push(`<path d="${d}" fill="${escapeXml(fill)}"/>`);
+          parts.push(`<path d="${d}" fill="${escapeXml(fill)}" stroke="none"/>`);
         });
         parts.push("</svg>");
         return parts.join("");
       };
-      const buildZoneOnlySvg = () => {
-        const source = regionZoneScene || buildSnapZoneSceneFromRegionScene(scene);
+      const buildVoronoiStrokeOnlySvg = () => {
         const parts = [
           `<svg xmlns="http://www.w3.org/2000/svg" width="${size.w}" height="${size.h}" viewBox="0 0 ${size.w} ${size.h}">`,
+          `<rect x="0" y="0" width="${size.w}" height="${size.h}" fill="#ffffff"/>`,
         ];
-        const zoneOrder = source?.zone_order || [];
-        const zonePolys = source?.zone_polys || [];
-        if (zoneOrder.length && zonePolys.length) {
-          zoneOrder.forEach((zidRaw, idx) => {
-            const poly = zonePolys[idx];
+        const snappedCells = scene?.voronoi?.snapped_cells || [];
+        snappedCells.forEach((poly) => {
+          if (!poly?.length) return;
+          const d = `M ${poly.map((p) => `${p[0]} ${p[1]}`).join(" L ")} Z`;
+          parts.push(`<path d="${d}" fill="none" stroke="#000000" stroke-width="1"/>`);
+        });
+        const snapMap = scene?.snap_region_map || {};
+        const regions = scene?.regions || [];
+        Object.entries(snapMap).forEach(([zid, regionIds]) => {
+          let sumArea = 0;
+          let sumX = 0;
+          let sumY = 0;
+          (regionIds || []).forEach((ridRaw) => {
+            const rid = parseInt(ridRaw, 10);
+            const poly = regions[rid];
             if (!poly?.length) return;
-            const zid = String(zidRaw);
-            const d = `M ${poly.map((p) => `${p[0]} ${p[1]}`).join(" L ")} Z`;
-            parts.push(
-              `<path d="${d}" fill="none" stroke="#000000" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>`
-            );
-            const lbl =
-              source?.zone_labels?.[zid] ||
-              source?.zone_labels?.[parseInt(zid, 10)];
-            if (!lbl) return;
-            const label =
-              source?.zone_label_map?.[zid] ??
-              source?.zone_label_map?.[parseInt(zid, 10)] ??
-              lbl.label ??
-              zid;
-            parts.push(
-              `<text x="${lbl.x}" y="${lbl.y}" fill="#000000" font-family="${escapeXml(
-                labelFontFamily
-              )}" font-size="${labelFontSize}" text-anchor="middle" dominant-baseline="middle">${escapeXml(
-                label
-              )}</text>`
-            );
+            const { area, cx, cy } = polyCentroid(poly);
+            const w = Math.abs(area) || 1;
+            sumArea += w;
+            sumX += cx * w;
+            sumY += cy * w;
           });
-        } else {
-          Object.entries(source?.zone_boundaries || {}).forEach(([zid, paths]) => {
-            (paths || []).forEach((poly) => {
-              if (!poly?.length) return;
-              const d = `M ${poly.map((p) => `${p[0]} ${p[1]}`).join(" L ")} Z`;
-              parts.push(
-                `<path d="${d}" fill="none" stroke="#000000" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>`
-              );
-            });
-            const lbl =
-              source?.zone_labels?.[zid] ||
-              source?.zone_labels?.[parseInt(zid, 10)];
-            if (!lbl) return;
-            const label =
-              source?.zone_label_map?.[zid] ??
-              source?.zone_label_map?.[parseInt(zid, 10)] ??
-              lbl.label ??
-              zid;
-            parts.push(
-              `<text x="${lbl.x}" y="${lbl.y}" fill="#000000" font-family="${escapeXml(
-                labelFontFamily
-              )}" font-size="${labelFontSize}" text-anchor="middle" dominant-baseline="middle">${escapeXml(
-                label
-              )}</text>`
-            );
-          });
-        }
+          if (sumArea <= 0) return;
+          const label = `${parseInt(zid, 10) + 1}`;
+          parts.push(
+            `<text x="${sumX / sumArea}" y="${sumY / sumArea}" fill="#000000" font-family="${escapeXml(
+              labelFontFamily
+            )}" font-size="${labelFontSize * 0.5}" text-anchor="middle" dominant-baseline="middle">${escapeXml(
+              label
+            )}</text>`
+          );
+        });
         parts.push("</svg>");
         return parts.join("");
       };
+      const packedImageNoStrokeSvg = captureStageSvg(regionRef, size, {
+        "packed-image": true,
+        "packed-overlay": true,
+        "packed-stroke": false,
+        "packed-label": true,
+        "packed-hit": false,
+      });
+      const packedNoImageStrokeNoLabelSvg = captureStageSvg(regionRef, size, {
+        "packed-image": false,
+        "packed-overlay": false,
+        "packed-stroke": true,
+        "packed-label": false,
+        "packed-hit": false,
+        "packed-warning": false,
+      });
       const pages = [
-          {
-            name: "region_fill_only",
-            svg: buildRegionFillSvg(),
-          },
-          {
-            name: "zone_index_only",
-            svg: buildZoneOnlySvg(),
-          },
-          {
-            name: "packed_image_nostroke",
-            svg: captureStageSvg(regionRef, size, {
-              "packed-image": true,
-              "packed-overlay": true,
-              "packed-stroke": false,
-              "packed-label": true,
-              "packed-hit": false,
-            }),
-          },
-          {
-            name: "packed_noimage_stroke_nolabel",
-            svg: captureStageSvg(regionRef, size, {
-              "packed-image": false,
-              "packed-overlay": true,
-              "packed-stroke": true,
-              "packed-label": false,
-              "packed-hit": false,
-            }),
-          },
-      ];
+        { name: "region_fill_only", svg: buildRegionFillOnlySvg() },
+        { name: "voronoi_stroke_only", svg: buildVoronoiStrokeOnlySvg() },
+        {
+          name: "packed_image_nostroke",
+          svg: rewriteSvgForPdf(packedImageNoStrokeSvg, {
+            whiteBg: true,
+            textColor: "#000000",
+            textScale: 0.5,
+            removeCanvasBackdrop: true,
+          }),
+        },
+        {
+          name: "packed_noimage_stroke_nolabel",
+          svg: rewriteSvgForPdf(packedNoImageStrokeNoLabelSvg, {
+            whiteBg: true,
+            textColor: "#000000",
+            textScale: 0.5,
+            strokeColor: "#000000",
+            removeCanvasBackdrop: true,
+          }),
+        },
+      ].filter((it) => it.svg);
       const res = await fetch(`/api/export_pdf?${sourceQuery(selectedSource)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           source: selectedSource,
           pages,
+          preserveStyles: true,
           fontName: labelFontFamily,
           fontSize: labelFontSize,
         }),
@@ -5077,52 +5896,83 @@ export default function App() {
         x={v.x}
         y={v.y}
         radius={3.5 / mainViewScale}
-        fill="#00d26a"
+        fill={edgeMode && edgeStartVertex === v.id ? "#ffd400" : "#00d26a"}
         stroke="#ffffff"
         strokeWidth={1 / mainViewScale}
         strokeScaleEnabled={false}
         draggable={!edgeMode && !deleteEdgeMode && !addNodeMode}
+        onMouseDown={(e) => {
+          if (!edgeMode) return;
+          e.cancelBubble = true;
+          if (edgeStartVertex == null) {
+            setEdgeStartVertex(v.id);
+            setEdgeCandidate(null);
+            return;
+          }
+          if (edgeStartVertex === v.id) {
+            setEdgeStartVertex(null);
+            setEdgeCandidate(null);
+            return;
+          }
+          const cand = buildEdgeCandidateFromVertices(edgeStartVertex, v.id);
+          if (!cand) {
+            setEdgeStartVertex(v.id);
+            setEdgeCandidate(null);
+            return;
+          }
+          pushSourceUndoSnapshot(createSourceEditSnapshot());
+          const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
+          const graph = buildVoronoiEditGraph(currentVoronoi);
+          const nextSegments = [...(graph.segments || []), [cand.a, cand.b]];
+          const nextCells = rebuildVoronoiCellsFromSegments(graph.vertices, nextSegments, currentVoronoi?.mask || []);
+          if (!nextCells.length) {
+            setEdgeStartVertex(v.id);
+            setEdgeCandidate(null);
+            return;
+          }
+          const nextVoronoi = {
+            ...currentVoronoi,
+            cells: nextCells,
+            graphVertices: graph.vertices.map((item) => [item.x, item.y]),
+            graphSegments: nextSegments.map(([a, b]) => [a, b]),
+            snappedCells: nextCells,
+          };
+          setSourceVoronoi(nextVoronoi);
+          commitSourceDragHistory(nodes, segs, nextVoronoi);
+          void persistSourceCacheNow(nodes, segs, nextVoronoi, selectedSource);
+          setEdgeStartVertex(null);
+          setEdgeCandidate(null);
+        }}
         onDragStart={() => {
           sourceDragSnapshotRef.current = createSourceEditSnapshot();
         }}
         onDragMove={(e) => {
-          const target = resolveSafeVoronoiNodeSnapTarget(e.target.x(), e.target.y(), v.id, greenToRedSnapRadius);
-          const nextTarget =
-            target?.kind === "node"
-              ? target
-              : { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
           const applied = updateSourceVoronoiVertex(v.id, e.target.x(), e.target.y(), {
-            snapTarget: nextTarget,
+            // Drag freely; snap only once at release.
+            snapTarget: { x: e.target.x(), y: e.target.y(), kind: "none", id: null },
           });
           e.target.x(applied.x);
           e.target.y(applied.y);
         }}
         onDragEnd={(e) => {
-          const target = resolveSafeVoronoiNodeSnapTarget(e.target.x(), e.target.y(), v.id, greenToRedSnapRadius);
-          const finalTarget =
-            target?.kind === "node"
-              ? target
-              : { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
-          const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
-          const graph = buildVoronoiVertexGraph(currentVoronoi?.snappedCells || []);
-          const safeTarget = canMoveVoronoiVertexSafely(graph, v.id, [finalTarget.x, finalTarget.y])
-            ? finalTarget
-            : { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
-          let nextVoronoi = currentVoronoi;
-          if (graph.vertices[v.id]) {
-            const nextVertices = graph.vertices.map((item) =>
-              item.id === v.id ? { ...item, x: safeTarget.x, y: safeTarget.y } : { ...item }
-            );
-            nextVoronoi = {
-              ...currentVoronoi,
-              snappedCells: rebuildVoronoiCellsFromGraph(nextVertices, graph.refs),
-            };
+          let finalTarget = { x: e.target.x(), y: e.target.y(), kind: "none", id: null };
+          const target = resolveSafeVoronoiNodeSnapTarget(
+            e.target.x(),
+            e.target.y(),
+            v.id,
+            greenToRedSnapRadius
+          );
+          if (target?.kind === "voronoi") {
+            finalTarget = target;
           }
-          updateSourceVoronoiVertex(v.id, e.target.x(), e.target.y(), { snapTarget: safeTarget });
-          e.target.x(safeTarget.x);
-          e.target.y(safeTarget.y);
+          const applied = updateSourceVoronoiVertex(v.id, e.target.x(), e.target.y(), {
+            snapTarget: finalTarget,
+          });
+          const nextVoronoi = applied?.nextVoronoi || sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
+          e.target.x(applied.x);
+          e.target.y(applied.y);
           commitSourceDragHistory(nodes, segs, nextVoronoi);
-          void persistSourceCacheNow(nodes, segs, nextVoronoi, selectedSource);
+          void saveSourceEditsAndRefreshRegion(selectedSource, nodes, segs, nextVoronoi);
         }}
       />
     ));
@@ -5130,14 +5980,17 @@ export default function App() {
     sourceVoronoiGraph,
     mainViewScale,
     edgeMode,
+    edgeStartVertex,
     deleteEdgeMode,
     addNodeMode,
+    buildEdgeCandidateFromVertices,
     commitSourceDragHistory,
     greenToRedSnapRadius,
     createSourceEditSnapshot,
     nodes,
     persistSourceCacheNow,
     resolveSafeVoronoiNodeSnapTarget,
+    saveSourceEditsAndRefreshRegion,
     segs,
     selectedSource,
     sourceVoronoi,
@@ -5397,6 +6250,12 @@ export default function App() {
                   </button>
                   <button
                     className="btn"
+                    onClick={() => reboundSourceVoronoi(selectedSource)}
+                  >
+                    Rebound
+                  </button>
+                  <button
+                    className="btn"
                     onClick={() => resetSourceCacheAndReload(selectedSource)}
                   >
                     Reset
@@ -5458,6 +6317,7 @@ export default function App() {
                       setEdgeMode((v) => !v);
                       setAddNodeMode(false);
                       setDeleteEdgeMode(false);
+                      setEdgeStartVertex(null);
                       setEdgeCandidate(null);
                       setDeleteEdgeCandidate(null);
                     }}
@@ -5475,6 +6335,7 @@ export default function App() {
                       setAddNodeMode((v) => !v);
                       setEdgeMode(false);
                       setDeleteEdgeMode(false);
+                      setEdgeStartVertex(null);
                       setEdgeCandidate(null);
                       setDeleteEdgeCandidate(null);
                     }}
@@ -5492,6 +6353,7 @@ export default function App() {
                       setDeleteEdgeMode((v) => !v);
                       setEdgeMode(false);
                       setAddNodeMode(false);
+                      setEdgeStartVertex(null);
                       setEdgeCandidate(null);
                       setDeleteEdgeCandidate(null);
                     }}
@@ -5557,8 +6419,7 @@ export default function App() {
                       y: (pointer.y - mainViewPos.y) / mainViewScale,
                     };
                     if (edgeMode) {
-                      const cand = findEdgeCandidate(world);
-                      setEdgeCandidate(cand);
+                      setEdgeCandidate(null);
                       setDeleteEdgeCandidate(null);
                     } else if (deleteEdgeMode) {
                       const cand = findExistingEdgeCandidate(world);
@@ -5582,34 +6443,40 @@ export default function App() {
                       y: (pointer.y - mainViewPos.y) / mainViewScale,
                     };
                     if (edgeMode) {
-                      if (!edgeCandidate) return;
-                      pushSourceUndoSnapshot(createSourceEditSnapshot());
-                      const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
-                      const graph = buildVoronoiVertexGraph(currentVoronoi?.snappedCells || []);
-                      const nextRefs = [...(graph.refs || [])];
-                      const split = splitVoronoiPolyByChord(
-                        nextRefs[edgeCandidate.polyIdx],
-                        edgeCandidate.refA,
-                        edgeCandidate.refB
-                      );
-                      if (!split) return;
-                      nextRefs.splice(edgeCandidate.polyIdx, 1, split[0], split[1]);
-                      const nextVoronoi = {
-                        ...currentVoronoi,
-                        snappedCells: rebuildVoronoiCellsFromGraph(graph.vertices, nextRefs),
-                      };
-                      setSourceVoronoi(nextVoronoi);
-                      commitSourceDragHistory(nodes, segs, nextVoronoi);
-                      void persistSourceCacheNow(nodes, segs, nextVoronoi, selectedSource);
+                      setEdgeStartVertex(null);
                       return;
                     }
                     if (deleteEdgeMode) {
                       if (!deleteEdgeCandidate) return;
                       pushSourceUndoSnapshot(createSourceEditSnapshot());
-                      const nextSegs = segs.filter((_, idx) => idx !== deleteEdgeCandidate.idx);
-                      const pruned = pruneIsolatedNodes(nodes, nextSegs);
-                      setNodes(pruned.nodes);
-                      setSegs(pruned.segs);
+                      const currentVoronoi = sourceVoronoi || { mask: [], cells: [], snappedCells: [] };
+                      const graph = buildVoronoiEditGraph(currentVoronoi);
+                      const refs = [...(graph.refs || [])];
+                      const polyA = refs[deleteEdgeCandidate.polyA];
+                      const polyB = refs[deleteEdgeCandidate.polyB];
+                      const merged = mergeVoronoiPolysBySharedEdge(
+                        polyA,
+                        polyB,
+                        deleteEdgeCandidate.a,
+                        deleteEdgeCandidate.b
+                      );
+                      if (!merged) return;
+                      const keepRefs = refs.filter(
+                        (_, idx) => idx !== deleteEdgeCandidate.polyA && idx !== deleteEdgeCandidate.polyB
+                      );
+                      keepRefs.push(merged);
+                      const rebuiltCells = rebuildVoronoiCellsFromGraph(graph.vertices, keepRefs);
+                      const rebuiltGraph = buildVoronoiVertexGraph(rebuiltCells);
+                      const nextVoronoi = {
+                        ...currentVoronoi,
+                        cells: rebuiltCells,
+                        snappedCells: rebuiltCells,
+                        graphVertices: (rebuiltGraph.vertices || []).map((v) => [v.x, v.y]),
+                        graphSegments: (rebuiltGraph.segments || []).map(([a, b]) => [a, b]),
+                      };
+                      setSourceVoronoi(nextVoronoi);
+                      commitSourceDragHistory(nodes, segs, nextVoronoi);
+                      void persistSourceCacheNow(nodes, segs, nextVoronoi, selectedSource);
                       return;
                     }
                     if (addNodeMode) {
@@ -5659,10 +6526,10 @@ export default function App() {
               ) : null}{deleteEdgeCandidate ? (
                 <Layer><Line
                     points={[
-                      nodes[deleteEdgeCandidate.a].x,
-                      nodes[deleteEdgeCandidate.a].y,
-                      nodes[deleteEdgeCandidate.b].x,
-                      nodes[deleteEdgeCandidate.b].y,
+                      sourceVoronoiGraph.vertices[deleteEdgeCandidate.a].x,
+                      sourceVoronoiGraph.vertices[deleteEdgeCandidate.a].y,
+                      sourceVoronoiGraph.vertices[deleteEdgeCandidate.b].x,
+                      sourceVoronoiGraph.vertices[deleteEdgeCandidate.b].y,
                     ]}
                     stroke="#ff3b30"
                     opacity={0.6}
@@ -5777,7 +6644,7 @@ export default function App() {
                       );
                       setNodes(next);
                       commitSourceDragHistory(next, segs, sourceVoronoi);
-                      void persistSourceCacheNow(next, segs, sourceVoronoi, selectedSource);
+                      void saveSourceEditsAndRefreshRegion(selectedSource, next, segs, sourceVoronoi);
                     }}
                   />
               ))}</Layer><Layer name="source-mask-fill-top">{sourceMaskFillLayer}</Layer><Layer name="source-voronoi-top">{sourceVoronoiLayer}</Layer><Layer name="source-snap-top">{sourceSnapLayer}</Layer><Layer name="source-mask-border-top">{sourceMaskBorderLayer}</Layer><Layer name="source-voronoi-debug">{sourceVoronoiDebugLayer}</Layer><Layer name="source-voronoi-vertices">{sourceVoronoiVertexLayer}</Layer></Stage>

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 from shapely.affinity import rotate as _srotate, translate as _stranslate
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon, Point, LineString
 from shapely.geometry.base import BaseGeometry
 from PIL import Image, ImageDraw
 
@@ -128,13 +128,56 @@ def _build_zone_pack_polys(zone_polys, bleed) -> List[List[Tuple[float, float]]]
             out.append(pts)
     return out
 
-def _resolve_pack_overlaps(zone_polys, placements, rot_info, step, padding=0.0, max_iter=50):
+def sanitize_polygon_points(
+    pts: List[Tuple[float, float]],
+    *,
+    min_seg_len: float = 0.0,
+    min_area: float = 0.0,
+) -> List[Tuple[float, float]]:
+    if not pts:
+        return []
+    src = list(pts)
+    if len(src) > 1 and abs(src[0][0] - src[-1][0]) < 1e-9 and abs(src[0][1] - src[-1][1]) < 1e-9:
+        src = src[:-1]
+    if len(src) < 3:
+        return []
+    min_seg2 = float(min_seg_len) * float(min_seg_len)
+    out: List[Tuple[float, float]] = []
+    for p in src:
+        x = float(p[0])
+        y = float(p[1])
+        if not out:
+            out.append((x, y))
+            continue
+        dx = x - out[-1][0]
+        dy = y - out[-1][1]
+        if (dx * dx + dy * dy) >= min_seg2:
+            out.append((x, y))
+    if len(out) >= 2:
+        dx = out[0][0] - out[-1][0]
+        dy = out[0][1] - out[-1][1]
+        if (dx * dx + dy * dy) < min_seg2:
+            out.pop()
+    if len(out) < 3:
+        return []
+    area2 = 0.0
+    for i in range(len(out)):
+        x1, y1 = out[i]
+        x2, y2 = out[(i + 1) % len(out)]
+        area2 += (x1 * y2 - x2 * y1)
+    if abs(area2) < (2.0 * float(min_area)):
+        return []
+    return out
+
+def _resolve_pack_overlaps(zone_polys, placements, rot_info, step, padding=0.0, max_iter=100):
     if not zone_polys or not placements: return placements
     n, out = min(len(zone_polys), len(placements)), list(placements)
     for _ in range(max_iter):
         moved, tpolys, centroids = False, [], []
         for i in range(n):
             dx, dy = out[i][0], out[i][1]
+            if dx < 0 or dy < 0: # Not placed
+                tpolys.append(None); centroids.append((0,0)); continue
             info = rot_info[i] if i < len(rot_info) else {"angle": 0.0, "cx": 0.0, "cy": 0.0}
             rpts = _rotate_pts(zone_polys[i], info.get("angle", 0.0), info.get("cx", 0.0), info.get("cy", 0.0))
             poly = Polygon([(p[0] + dx, p[1] + dy) for p in rpts])
@@ -142,15 +185,19 @@ def _resolve_pack_overlaps(zone_polys, placements, rot_info, step, padding=0.0, 
             tpolys.append(poly)
             centroids.append((poly.centroid.x, poly.centroid.y) if not poly.is_empty else (0,0))
         for i in range(n):
-            if tpolys[i].is_empty: continue
+            if tpolys[i] is None or tpolys[i].is_empty: continue
             for j in range(i + 1, n):
-                if tpolys[j].is_empty or not tpolys[i].intersects(tpolys[j]): continue
+                if tpolys[j] is None or tpolys[j].is_empty or not tpolys[i].intersects(tpolys[j]): continue
                 moved = True
                 vx, vy = centroids[j][0]-centroids[i][0], centroids[j][1]-centroids[i][1]
                 ln = float(np.hypot(vx, vy))
                 ux, uy = (vx/ln, vy/ln) if ln>1e-6 else (1.0, 0.0)
+                
+                # Move both shapes in opposite directions
+                dxi, dyi, wi, hi, rfi = out[i]
                 dxj, dyj, wj, hj, rfj = out[j]
-                out[j] = (dxj + ux * step, dyj + uy * step, wj, hj, rfj)
+                out[i] = (dxi - ux * step * 0.5, dyi - uy * step * 0.5, wi, hi, rfi)
+                out[j] = (dxj + ux * step * 0.5, dyj + uy * step * 0.5, wj, hj, rfj)
         if not moved: break
     return out
 
@@ -164,13 +211,20 @@ def _fit_placements_into_canvas(placements, rot_info, canvas):
     for idxs in bins.values():
         minx = miny = maxx = maxy = None
         for i in idxs:
-            x0, y0 = float(rot_info[i].get("minx", 0.0)) + out[i][0], float(rot_info[i].get("miny", 0.0)) + out[i][1]
+            # Calculate actual bounds of rotated + translated shape
+            x0 = out[i][0] + rot_info[i]["minx"]
+            y0 = out[i][1] + rot_info[i]["miny"]
+            ww = out[i][2]
+            hh = out[i][3]
             minx = x0 if minx is None else min(minx, x0)
             miny = y0 if miny is None else min(miny, y0)
-            maxx = x0 + out[i][2] if maxx is None else max(maxx, x0 + out[i][2])
-            maxy = y0 + out[i][3] if maxy is None else max(maxy, y0 + out[i][3])
+            maxx = x0 + ww if maxx is None else max(maxx, x0 + ww)
+            maxy = y0 + hh if maxy is None else max(maxy, y0 + hh)
         if minx is None: continue
-        tx, ty = max(0.0, -minx) + min(0.0, w - maxx), max(0.0, -miny) + min(0.0, h - maxy)
+        # Shift everything to be >= 0 and within canvas if possible
+        tx, ty = -minx, -miny
+        if maxx + tx > w: tx = max(tx - (maxx + tx - w), -minx)
+        if maxy + ty > h: ty = max(ty - (maxy + ty - h), -miny)
         for i in idxs: out[i] = (out[i][0] + tx, out[i][1] + ty, out[i][2], out[i][3], out[i][4])
     return out
 
@@ -186,7 +240,7 @@ def pack_regions_raster_fast(polys, canvas, fixed_centers=None, grid_step=4.0, r
     bw, bh = max(1, int((w-2*config.PACK_MARGIN_X-2*safety)/cell)), max(1, int((h-2*config.PACK_MARGIN_Y-2*safety)/cell))
     grid = np.zeros((bh, bw), dtype=np.uint8)
     rotations = rotations or [0.0, 90.0, 180.0, 270.0]
-    placements, rot_info, order, masks, centers, areas = (
+    placements, rot_info, order, masks, centers, items_to_sort = (
         [(-1, -1, 0, 0, False)] * len(polys),
         [{"bin": -1} for _ in range(len(polys))],
         [],
@@ -194,18 +248,37 @@ def pack_regions_raster_fast(polys, canvas, fixed_centers=None, grid_step=4.0, r
         {},
         [],
     )
+    integral = np.zeros((bh + 1, bw + 1), dtype=np.int32)
+
+    def _rebuild_integral() -> None:
+        nonlocal integral
+        integral[1:, 1:] = grid.cumsum(axis=0).cumsum(axis=1)
+
+    def _rect_has_occupancy(x: int, y: int, ww: int, hh: int) -> bool:
+        x2 = x + ww
+        y2 = y + hh
+        occ = (
+            integral[y2, x2]
+            - integral[y, x2]
+            - integral[y2, x]
+            + integral[y, x]
+        )
+        return occ != 0
     for rid in (place_ids or range(len(polys))):
         if rid>=len(polys) or len(polys[rid])<3: continue
         pg = Polygon(polys[rid])
-        areas.append((rid, pg.area))
         cx, cy = (fixed_centers[rid] if fixed_centers and rid<len(fixed_centers) else pg.centroid.coords[0])
         centers[rid] = (cx, cy)
+        
+        best_mask = None
         for ang in rotations:
             rpts = _rotate_pts(polys[rid], ang, cx, cy)
             xs, ys = [p[0] for p in rpts], [p[1] for p in rpts]
             minx, miny, maxx, maxy = min(xs), min(ys), max(xs), max(ys)
-            mw, mh = int(ceil((maxx-minx)/cell)), int(ceil((maxy-miny)/cell))
+            ww, hh = maxx - minx, maxy - miny
+            mw, mh = int(ceil(ww/cell)), int(ceil(hh/cell))
             if mw>bw or mh>bh: continue
+            
             img = Image.new("1", (mw, mh), 0); ImageDraw.Draw(img).polygon([((p[0]-minx)/cell, (p[1]-miny)/cell) for p in rpts], fill=1, outline=1)
             m = np.array(img, dtype=np.uint8)
             sc = int(ceil(safety/cell))
@@ -213,20 +286,39 @@ def pack_regions_raster_fast(polys, canvas, fixed_centers=None, grid_step=4.0, r
                 for _ in range(sc):
                     p = np.pad(m, ((1,1),(1,1)), mode="constant")
                     m = (p[1:-1,1:-1]|p[:-2,1:-1]|p[2:,1:-1]|p[1:-1,:-2]|p[1:-1,2:]).astype(np.uint8)
-            masks[(rid, ang)] = (m, minx, miny, mw, mh, maxx-minx, maxy-miny)
-    for rid in [r for r, _ in sorted(areas, key=lambda t: t[1], reverse=True)]:
+            masks[(rid, ang)] = (m, minx, miny, mw, mh, ww, hh)
+            if best_mask is None or ww * hh > best_mask[5] * best_mask[6]:
+                best_mask = (m, minx, miny, mw, mh, ww, hh)
+        
+        if best_mask:
+            # Sort by Max(Width, Height) then Area for better bin packing results
+            items_to_sort.append((rid, max(best_mask[5], best_mask[6]), pg.area))
+
+    # Sort items: largest first
+    for rid in [r for r, _, _ in sorted(items_to_sort, key=lambda t: (t[1], t[2]), reverse=True)]:
         best = None
-        for ang in sorted([a for a in rotations if (rid, a) in masks], key=lambda a: (masks[(rid,a)][4], -masks[(rid,a)][3])):
+        # Try rotations
+        for ang in sorted([a for a in rotations if (rid, a) in masks], key=lambda a: (masks[(rid,a)][4], masks[(rid,a)][3])):
             m, minx, miny, mw, mh, ww, hh = masks[(rid, ang)]
-            for y in range(0, bh-mh+1, search_stride):
-                for x in range(0, bw-mw+1, search_stride):
-                    if not np.any(grid[y:y+mh, x:x+mw] & m):
-                        if best is None or (y,x) < (best[2], best[1]): best = (ang, x, y, minx, miny, mw, mh, ww, hh, m)
+            max_x = bw - mw
+            max_y = bh - mh
+            
+            # SEARCH SYSTEMATICALLY FROM TOP-LEFT (0,0) instead of original position
+            found_ang = False
+            for y in range(0, max_y + 1, search_stride):
+                for x in range(0, max_x + 1, search_stride):
+                    if not _rect_has_occupancy(x, y, mw, mh) or not np.any(grid[y:y+mh, x:x+mw] & m):
+                        if best is None or (y, x) < (best[2], best[1]):
+                            best = (ang, x, y, minx, miny, mw, mh, ww, hh, m)
+                        found_ang = True
                         break
-                if best and best[0] == ang: break
+                if found_ang: break
+            if found_ang: break
+            
         if best:
             ang, x, y, minx, miny, mw, mh, ww, hh, m = best
             grid[y:y+mh, x:x+mw] |= m
+            _rebuild_integral()
             placements[rid] = (int(round(x_min+x*cell-minx)), int(round(y_min+y*cell-miny)), int(ceil(ww)), int(ceil(hh)), False)
             rot_info[rid] = {"angle": ang, "cx": centers[rid][0], "cy": centers[rid][1], "minx": minx, "miny": miny, "bin": 0}
             order.append(rid)
@@ -305,6 +397,8 @@ def write_pack_svg(
         if idx < len(zone_polys): zone_poly_by_zid[int(zid)] = list(zone_polys[idx])
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">', f'<rect width="{w}" height="{h}" fill="#1a1a1a" stroke="none"/>', '<g id="fill">']
     for rid, pts in enumerate(polys):
+        if len(pts) < 3:
+            continue
         zid = zone_id[rid] if rid<len(zone_id) else -1
         if zid in zone_shift:
             moved = [(p[0]+zone_shift[zid][0], p[1]+zone_shift[zid][1]) for p in _rotate_pts(pts, zone_rot[zid], zone_center[zid][0], zone_center[zid][1])]
@@ -366,13 +460,31 @@ def write_pack_svg(
                 a, b = merged[i], merged[(i+1)%len(merged)]
                 aox, aoy = _pt_at(a["edge"], a["t"], boundary_off); box, boy = _pt_at(b["edge"], b["t"], boundary_off)
                 bleed_poly = [(a["x"], a["y"]), (aox, aoy), (box, boy), (b["x"], b["y"])]
-                mid = Point(0.5*(a["x"]+b["x"]), 0.5*(a["y"]+b["y"]))
-                best_rid, best_d = None, 1e18
+                edge_seg = LineString([(a["x"], a["y"]), (b["x"], b["y"])])
+                pa = Point(a["x"], a["y"])
+                pb = Point(b["x"], b["y"])
+                best_rid, best_score = None, -1.0
                 for rid, rp, _ in region_items:
                     try:
-                        d = rp.boundary.distance(mid)
-                        if d<best_d: best_d, best_rid = d, rid
+                        da = float(rp.boundary.distance(pa))
+                        db = float(rp.boundary.distance(pb))
+                        # Endpoint-on-boundary rule: both bleed endpoints must lie on this region boundary.
+                        if da > 1e-4 or db > 1e-4:
+                            continue
+                        shared = float(rp.boundary.intersection(edge_seg).length)
+                        score = shared - (da + db)
+                        if score > best_score:
+                            best_score, best_rid = score, rid
                     except Exception: pass
+                if best_rid is None:
+                    best_d = 1e18
+                    for rid, rp, _ in region_items:
+                        try:
+                            d = rp.distance(edge_seg)
+                            if d < best_d:
+                                best_d, best_rid = d, rid
+                        except Exception:
+                            pass
                 bb, bg, br = colors[best_rid] if best_rid is not None else (200,200,200)
                 parts.append(f'<path d="M {" L ".join(f"{p[0]:.3f} {p[1]:.3f}" for p in bleed_poly)} Z" fill="rgb({br},{bg},{bb})" stroke="none"/>')
     parts.append("</g></svg>")
@@ -382,11 +494,19 @@ def write_pack_svg(
     return svg_text
 
 
+import source_voronoi
+
 def compute_scene(svg_path, snap: float, include_packed: bool = False) -> Dict:
     config._apply_pack_env()
-    regions, polys, canvas, debug = geometry.build_regions_from_svg(svg_path, snap_override=snap)
+    
+    # Use the new Voronoi-based scene builder
+    scene_data = source_voronoi.build_source_region_scene(svg_path, count=int(config.TARGET_ZONES))
+    polys = [list(map(tuple, p)) for p in scene_data["regions"]]
+    canvas = (scene_data["canvas"]["w"], scene_data["canvas"]["h"])
+    debug = {"source": "voronoi"}
+    
     zone_id = zones.build_zones(polys, config.TARGET_ZONES)
-    zone_id, zone_members = zones._remap_zones_by_area(polys, zone_id)
+    zone_members = zones.build_zone_members(zone_id)
     zone_boundaries = zones.build_zone_boundaries(polys, zone_id)
     zone_geoms = zones.build_zone_geoms(polys, zone_id)
     zone_polys, zone_order, zone_poly_debug = zones.build_zone_polys(polys, zone_id)
@@ -403,9 +523,10 @@ def compute_scene(svg_path, snap: float, include_packed: bool = False) -> Dict:
         )
         placements = compact_nesting_polygons(zone_pack_polys, placements, rot_info, canvas)
         placements = _fit_placements_into_canvas(placements, rot_info, canvas)
-    zone_labels, zone_label_map = {}, {z: idx+1 for idx, z in enumerate(zone_order)}
+    zone_index_by_id = {z: i for i, z in enumerate(zone_order)}
+    zone_labels, zone_label_map = {}, {z: idx + 1 for idx, z in enumerate(zone_order)}
     for zid, geom in zone_geoms.items():
-        lx, ly, idx = None, None, {z: i for i, z in enumerate(zone_order)}.get(zid)
+        lx, ly, idx = None, None, zone_index_by_id.get(zid)
         if idx is not None and idx<len(zone_polys) and zone_polys[idx]:
             try:
                 c = Polygon(zone_polys[idx]).centroid
@@ -416,7 +537,13 @@ def compute_scene(svg_path, snap: float, include_packed: bool = False) -> Dict:
             lx, ly = (Polygon(polys[m[0]]).centroid.coords[0] if m else zones._label_pos_for_zone(geom))
         zone_labels[str(zid)] = {"x": lx, "y": ly, "label": zone_label_map.get(zid, zid)}
     region_labels = {str(rid): {"x": float(Polygon(p).centroid.x), "y": float(Polygon(p).centroid.y), "label": rid, "zone": zone_id[rid] if rid<len(zone_id) else -1} for rid, p in enumerate(polys) if len(p)>=3}
-    colors, _ = geometry.compute_region_colors(polys, canvas)
+    
+    # Colors are already computed in build_source_region_scene, but we might need to re-verify or just use them
+    # For consistency with current pipeline, we can re-compute or use passed ones.
+    # source_voronoi returns hex strings in 'region_colors', geometry.compute_region_colors returns BGR tuples.
+    # Let's re-compute to match the return type expected here (BGR tuples) and ensure image is loaded correctly.
+    colors, _ = geometry.compute_region_colors(polys, canvas, svg_path=svg_path)
+    
     if include_packed:
         write_pack_svg(
             polys,
@@ -431,7 +558,7 @@ def compute_scene(svg_path, snap: float, include_packed: bool = False) -> Dict:
             out_path=config.OUT_PACK_SVG,
         )
     return {
-        "canvas": {"w": canvas[0], "h": canvas[1]}, "draw_scale": config.DRAW_SCALE, "regions": polys, "zone_boundaries": zone_boundaries, "zone_id": zone_id, "zone_labels": zone_labels, "region_labels": region_labels, "zone_order": zone_order, "zone_pack_polys": zone_pack_polys,
+        "canvas": {"w": canvas[0], "h": canvas[1]}, "draw_scale": config.DRAW_SCALE, "regions": polys, "zone_boundaries": zone_boundaries, "zone_id": zone_id, "zone_labels": zone_labels, "zone_label_map": zone_label_map, "region_labels": region_labels, "zone_order": zone_order, "zone_pack_polys": zone_pack_polys,
         "zone_rot": {zid: rot_info[idx]["angle"] for idx, zid in enumerate(zone_order) if idx < len(rot_info)},
         "zone_center": {zid: (rot_info[idx]["cx"], rot_info[idx]["cy"]) for idx, zid in enumerate(zone_order) if idx < len(rot_info)},
         "zone_shift": {zid: (placements[idx][0], placements[idx][1]) for idx, zid in enumerate(zone_order) if idx < len(placements)},

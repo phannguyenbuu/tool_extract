@@ -78,6 +78,10 @@ def _zone_debug_path(source_name: str) -> Path:
     return _cache_file("zone_debug", source_name)
 
 
+def _pack_cells_debug_svg_path(source_name: str) -> Path:
+    return _cache_file("tmp_pack_cells", source_name, ext=".svg")
+
+
 def _source_edit_cache_path(source_name: str) -> Path:
     return _cache_file("source_edit_cache", source_name)
 
@@ -272,9 +276,7 @@ def api_source_voronoi():
     source_path = _activate_source(source_name)
     cached = _load_source_edit_cache(source_name).get("source_voronoi")
     if isinstance(cached, dict):
-        data = dict(cached)
-        if "snappedCells" in data and "snapped_cells" not in data:
-            data["snapped_cells"] = data.get("snappedCells") or []
+        data = source_voronoi.normalize_source_voronoi_payload(source_path, cached)
         data["source_name"] = source_name
         return jsonify(data)
     count = request.args.get("count", type=int) or config.TARGET_ZONES
@@ -405,9 +407,48 @@ def api_state():
 @app.post("/api/reset_source_cache")
 def api_reset_source_cache():
     source_name = _get_active_source_name(request.args.get("source"))
-    edit_cache = _source_edit_cache_path(source_name)
-    snap_map = _source_snap_region_map_path(source_name)
-    for path in (edit_cache, snap_map):
+    paths_to_delete = (
+        _source_edit_cache_path(source_name),
+        _source_snap_region_map_path(source_name),
+        _scene_cache_path(source_name),
+        _packed_labels_path(source_name),
+        _zone_labels_path(source_name),
+        _zone_debug_path(source_name),
+        _state_json_path(source_name),
+        _state_svg_path(source_name),
+    )
+    for path in paths_to_delete:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    if source_name == DEFAULT_SOURCE_NAME:
+        for legacy_path in (
+            LEGACY_STATE_JSON,
+            LEGACY_STATE_SVG,
+            LEGACY_PACKED_LABELS_JSON,
+            LEGACY_ZONE_LABELS_JSON,
+            LEGACY_SCENE_JSON,
+            LEGACY_SOURCE_ZONE_CLICK_JSON,
+            LEGACY_SOURCE_ZONE_CLICK_JSON_OLD,
+        ):
+            try:
+                if legacy_path.exists():
+                    legacy_path.unlink()
+            except Exception:
+                pass
+    return jsonify({"ok": True})
+
+
+@app.post("/api/reset_packed_cache")
+def api_reset_packed_cache():
+    source_name = _get_active_source_name(request.args.get("source"))
+    for path in (
+        _packed_labels_path(source_name),
+        _zone_debug_path(source_name),
+    ):
         try:
             if path.exists():
                 path.unlink()
@@ -417,32 +458,48 @@ def api_reset_source_cache():
     state_json = _state_json_path(source_name)
     if state_json.exists():
         try:
-            data = json.loads(state_json.read_text(encoding="utf-8"))
-            data.pop("source_region_scene_cache", None)
-            state_json.write_text(
-                json.dumps(_strip_source_edit_keys(data), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            data = json.loads(state_json.read_text(encoding="utf-8")) or {}
+            if isinstance(data, dict):
+                data.pop("manual_packed", None)
+                state_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
-    if source_name == DEFAULT_SOURCE_NAME and LEGACY_STATE_JSON.exists():
+
+    if source_name == DEFAULT_SOURCE_NAME:
         try:
-            data = json.loads(LEGACY_STATE_JSON.read_text(encoding="utf-8"))
-            data.pop("source_region_scene_cache", None)
-            LEGACY_STATE_JSON.write_text(
-                json.dumps(_strip_source_edit_keys(data), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            if LEGACY_PACKED_LABELS_JSON.exists():
+                LEGACY_PACKED_LABELS_JSON.unlink()
         except Exception:
             pass
+        if LEGACY_STATE_JSON.exists():
+            try:
+                data = json.loads(LEGACY_STATE_JSON.read_text(encoding="utf-8")) or {}
+                if isinstance(data, dict):
+                    data.pop("manual_packed", None)
+                    LEGACY_STATE_JSON.write_text(
+                        json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+            except Exception:
+                pass
+
     return jsonify({"ok": True})
 
 
 @app.get("/api/state")
 def api_get_state():
     source_name = _get_active_source_name(request.args.get("source"))
+    source_path = _activate_source(source_name)
     data = _load_state_json(source_name)
-    data.update(_load_source_edit_cache(source_name))
+    source_edit = _load_source_edit_cache(source_name)
+    cached_voronoi = source_edit.get("source_voronoi")
+    if isinstance(cached_voronoi, dict):
+        source_edit = dict(source_edit)
+        source_edit["source_voronoi"] = source_voronoi.normalize_source_voronoi_payload(
+            source_path,
+            cached_voronoi,
+        )
+    data.update(source_edit)
     return jsonify(data)
 
 
@@ -571,7 +628,14 @@ def api_pack_from_scene():
                 pts.append((float(p[0]), float(p[1])))
             except Exception:
                 continue
-        polys.append(pts if pts else [])
+        polys.append(packing.sanitize_polygon_points(pts))
+    zone_id_norm: list[int] = []
+    for idx in range(len(polys)):
+        try:
+            zone_id_norm.append(int(zone_id[idx]))
+        except Exception:
+            zone_id_norm.append(-1)
+    zone_id = zone_id_norm
     _mark("normalize_regions")
     zone_polys_payload = payload.get("zone_polys") or []
     zone_order_payload = payload.get("zone_order") or []
@@ -585,8 +649,9 @@ def api_pack_from_scene():
                 pts.append((float(p[0]), float(p[1])))
             except Exception:
                 continue
-        if len(pts) >= 3:
-            zone_polys.append(pts)
+        cleaned = packing.sanitize_polygon_points(pts)
+        if len(cleaned) >= 3:
+            zone_polys.append(cleaned)
     explicit_zone_polys = bool(zone_polys)
     if explicit_zone_polys:
         zone_order = []
@@ -596,9 +661,25 @@ def api_pack_from_scene():
             except Exception:
                 zone_order.append(idx)
         if len(zone_order) != len(zone_polys):
-            zone_order = list(range(len(zone_polys)))
+            return jsonify({"ok": False, "error": "zone_polys/zone_order mismatch"}), 400
     else:
         zone_polys, zone_order, _zone_poly_debug = zones.build_zone_polys(polys, zone_id)
+
+    def _poly_area_abs(pts: list[tuple[float, float]]) -> float:
+        if not pts or len(pts) < 3:
+            return 0.0
+        s = 0.0
+        for i in range(len(pts)):
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % len(pts)]
+            s += (x1 * y2) - (x2 * y1)
+        return abs(0.5 * s)
+
+    zone_areas = [_poly_area_abs(p) for p in zone_polys]
+    valid_zone_areas = [a for a in zone_areas if a > 1e-6]
+    avg_zone_area = (sum(valid_zone_areas) / len(valid_zone_areas)) if valid_zone_areas else 0.0
+    min_zone_area = max(40.0, avg_zone_area * 0.015) if avg_zone_area > 0 else 40.0
+    removed_tiny_zones = 0
     _mark("build_zone_polys")
     # Bleed is applied before raster nest via inflated zone polygons.
     zone_pack_polys = packing._build_zone_pack_polys(
@@ -709,6 +790,21 @@ def api_pack_from_scene():
 
     unplaced_count = len(queue)
 
+    pack_cells_svg_path = _pack_cells_debug_svg_path(source_name)
+    pack_cells_svg_url = ""
+    try:
+        _write_pack_cells_debug_svg(
+            pack_cells_svg_path,
+            canvas=(w, h),
+            zone_pack_polys=zone_pack_polys,
+            zone_order=zone_order,
+            placements=placements,
+            rot_info=rot_info,
+        )
+        pack_cells_svg_url = f"/out/{pack_cells_svg_path.name}"
+    except Exception:
+        pack_cells_svg_url = ""
+
     raster_report = packing.raster_overlap_report(
         zone_pack_polys, placements, rot_info, (w, h), cell=raster_cell
     )
@@ -798,10 +894,14 @@ def api_pack_from_scene():
                 "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG),
                 "raster_tmp_png_url": "/out/tmp_raster_pack.png",
                 "raster_tmp_json_path": "",
+                "pack_cells_svg_path": str(pack_cells_svg_path) if pack_cells_svg_url else "",
+                "pack_cells_svg_url": pack_cells_svg_url,
                 "raster_overlap_count": int(raster_report.get("count", 0)),
                 "raster_pages": 1,
                 "one_page_ok": unplaced_count == 0,
                 "unplaced_count": unplaced_count,
+                "removed_tiny_zones": removed_tiny_zones,
+                "min_zone_area": float(min_zone_area),
                 "timings_ms": timings_ms,
             }
         )
@@ -844,10 +944,14 @@ def api_pack_from_scene():
         "raster_tmp_png_path": str(RASTER_PACK_TMP_PNG) if wrote_tmp_png else "",
         "raster_tmp_png_url": "/out/tmp_raster_pack.png" if wrote_tmp_png else "",
         "raster_tmp_json_path": "",
+        "pack_cells_svg_path": str(pack_cells_svg_path) if pack_cells_svg_url else "",
+        "pack_cells_svg_url": pack_cells_svg_url,
         "raster_overlap_count": int(raster_report.get("count", 0)),
         "raster_pages": 1,
         "one_page_ok": unplaced_count == 0,
         "unplaced_count": unplaced_count,
+        "removed_tiny_zones": removed_tiny_zones,
+        "min_zone_area": float(min_zone_area),
         "timings_ms": timings_ms,
     }
     return jsonify(result)
@@ -1296,12 +1400,14 @@ def api_export_pdf():
     pages = payload.get("pages") or []
     if not isinstance(pages, list) or not pages:
         return jsonify({"ok": False, "error": "no pages"}), 400
+    preserve_styles = bool(payload.get("preserveStyles", True))
+    force_white_bg = bool(payload.get("forceWhiteBg", True))
     font_name = str(payload.get("fontName") or "Arial")
     font_size = payload.get("fontSize")
     try:
-        font_size = float(font_size) / 2.0
+        font_size = float(font_size)
     except Exception:
-        font_size = 6.0
+        font_size = 12.0
     try:
         from reportlab.pdfgen import canvas as pdf_canvas
         from reportlab.graphics import renderPDF
@@ -1346,38 +1452,63 @@ def api_export_pdf():
             svg = page.get("svg", "")
             if not svg:
                 continue
-            try:
-                root = ET.fromstring(svg)
-                ns = {"svg": "http://www.w3.org/2000/svg"}
-                for rect in root.findall(".//svg:rect", ns):
-                    rect.set("fill", "none")
-                    rect.set("stroke", "#000000")
-                    rect.set("stroke-width", "1")
-                for elem in root.iter():
-                    if "stroke" in elem.attrib and not elem.tag.endswith("text"):
-                        elem.set("stroke", "#000000")
-                        elem.set("stroke-width", "1")
-                for text in root.findall(".//svg:text", ns):
-                    text.set("fill", "#000000")
-                    text.set("stroke", "none")
-                    text.set("stroke-width", "0")
-                    text.set("font-family", font_name)
-                    text.set("font-weight", "100")
-                    text.set("font-size", str(font_size))
-                    text.set("text-anchor", "middle")
-                    text.set("dominant-baseline", "middle")
-                    text.set("alignment-baseline", "middle")
-                    for key in ("x", "y"):
-                        try:
-                            val = float(text.get(key, "0"))
-                            if not math.isfinite(val):
-                                raise ValueError()
-                            text.set(key, str(val))
-                        except Exception:
-                            text.set(key, "0")
-                svg = ET.tostring(root, encoding="unicode")
-            except Exception:
-                pass
+            if force_white_bg:
+                try:
+                    root = ET.fromstring(svg)
+                    svg_ns = "http://www.w3.org/2000/svg"
+                    width = root.get("width")
+                    height = root.get("height")
+                    if not width or not height:
+                        view_box = (root.get("viewBox") or "").strip().split()
+                        if len(view_box) == 4:
+                            width = width or view_box[2]
+                            height = height or view_box[3]
+                    width = width or "100%"
+                    height = height or "100%"
+                    bg = ET.Element(f"{{{svg_ns}}}rect")
+                    bg.set("x", "0")
+                    bg.set("y", "0")
+                    bg.set("width", str(width))
+                    bg.set("height", str(height))
+                    bg.set("fill", "#ffffff")
+                    bg.set("stroke", "none")
+                    root.insert(0, bg)
+                    svg = ET.tostring(root, encoding="unicode")
+                except Exception:
+                    pass
+            if not preserve_styles:
+                try:
+                    root = ET.fromstring(svg)
+                    ns = {"svg": "http://www.w3.org/2000/svg"}
+                    for rect in root.findall(".//svg:rect", ns):
+                        rect.set("fill", "none")
+                        rect.set("stroke", "#000000")
+                        rect.set("stroke-width", "1")
+                    for elem in root.iter():
+                        if "stroke" in elem.attrib and not elem.tag.endswith("text"):
+                            elem.set("stroke", "#000000")
+                            elem.set("stroke-width", "1")
+                    for text in root.findall(".//svg:text", ns):
+                        text.set("fill", "#000000")
+                        text.set("stroke", "none")
+                        text.set("stroke-width", "0")
+                        text.set("font-family", font_name)
+                        text.set("font-weight", "100")
+                        text.set("font-size", str(font_size))
+                        text.set("text-anchor", "middle")
+                        text.set("dominant-baseline", "middle")
+                        text.set("alignment-baseline", "middle")
+                        for key in ("x", "y"):
+                            try:
+                                val = float(text.get(key, "0"))
+                                if not math.isfinite(val):
+                                    raise ValueError()
+                                text.set(key, str(val))
+                            except Exception:
+                                text.set(key, "0")
+                    svg = ET.tostring(root, encoding="unicode")
+                except Exception:
+                    pass
             tmp_path = EXPORT_DIR / f"__konva_page_{idx}.svg"
             tmp_path.write_text(svg, encoding="utf-8")
             tmp_paths.append(tmp_path)
@@ -1456,6 +1587,69 @@ def _rotate_pt(pt: list[float], angle_deg: float, cx: float, cy: float) -> list[
     x = pt[0] - cx
     y = pt[1] - cy
     return [cx + x * c - y * s, cy + x * s + y * c]
+
+
+def _write_pack_cells_debug_svg(
+    out_path: Path,
+    *,
+    canvas: tuple[int, int],
+    zone_pack_polys: list[list[tuple[float, float]]],
+    zone_order: list[int],
+    placements: list[tuple[float, float, int, int, bool]],
+    rot_info: list[dict[str, float]],
+) -> None:
+    w, h = int(canvas[0]), int(canvas[1])
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
+        f'<rect x="0" y="0" width="{w}" height="{h}" fill="#061033" stroke="#ffffff" stroke-width="1"/>',
+        '<g id="pack-cells" fill="none">',
+    ]
+    placed_count = 0
+    for idx, poly in enumerate(zone_pack_polys or []):
+        if idx >= len(zone_order):
+            continue
+        if not poly or len(poly) < 3:
+            continue
+        zid = int(zone_order[idx])
+        dx = dy = 0.0
+        bw = bh = 0
+        angle = cx = cy = 0.0
+        if idx < len(placements):
+            dx, dy, bw, bh, _rf = placements[idx]
+        if idx < len(rot_info):
+            angle = float(rot_info[idx].get("angle", 0.0))
+            cx = float(rot_info[idx].get("cx", 0.0))
+            cy = float(rot_info[idx].get("cy", 0.0))
+        placed = bw > 0 and bh > 0
+        if placed:
+            placed_count += 1
+        tpts: list[tuple[float, float]] = []
+        for p in packing._rotate_pts(poly, angle, cx, cy):
+            x = float(p[0]) + (float(dx) if placed else 0.0)
+            y = float(p[1]) + (float(dy) if placed else 0.0)
+            if math.isfinite(x) and math.isfinite(y):
+                tpts.append((x, y))
+        if len(tpts) < 3:
+            continue
+        stroke = "#7CFFB2" if placed else "#ff4d4f"
+        fill = "rgba(124,255,178,0.12)" if placed else "rgba(255,77,79,0.10)"
+        d = "M " + " L ".join(f"{x:.3f} {y:.3f}" for x, y in tpts) + " Z"
+        parts.append(f'<path d="{d}" stroke="{stroke}" stroke-width="1.2" fill="{fill}"/>')
+        try:
+            sx = sum(p[0] for p in tpts) / len(tpts)
+            sy = sum(p[1] for p in tpts) / len(tpts)
+            parts.append(
+                f'<text x="{sx:.2f}" y="{sy:.2f}" font-size="8" text-anchor="middle" '
+                f'fill="{stroke}" stroke="#00112b" stroke-width="0.6">{zid}</text>'
+            )
+        except Exception:
+            pass
+    parts.append("</g>")
+    parts.append(
+        f'<text x="10" y="16" font-size="11" fill="#ffffff">pack cells: {placed_count}/{len(zone_pack_polys or [])}</text>'
+    )
+    parts.append("</svg>")
+    out_path.write_text("".join(parts), encoding="utf-8")
 
 
 @app.post("/api/export_sim_video")

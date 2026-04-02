@@ -87,7 +87,6 @@ def main() -> None:
     src = source_path()
     regions, polys, _canvas, _debug = geometry.build_regions_from_svg(src)
     zone_id = zones.build_zones(polys, config.TARGET_ZONES)
-    zone_id, _members = zones._remap_zones_by_area(polys, zone_id)
     zone_boundaries = zones.build_zone_boundaries(polys, zone_id)
     zone_polys, zone_order, zone_debug = zones.build_zone_polys(polys, zone_id)
     zone_index = {zid: idx for idx, zid in enumerate(zone_order)}
@@ -111,7 +110,7 @@ def main() -> None:
         boundary_open = boundary[:-1] if len(boundary) > 1 and boundary[0] == boundary[-1] else boundary
         offset = packing._offset_outline_same_vertices(boundary_open, bleed) if len(boundary_open) >= 3 else []
         bevel, _dbg = packing._bevel_outline_by_angle(offset, bleed, angle_thresh=60.0) if offset else ([], [])
-                pack_poly = packing._build_zone_pack_polys([zone_poly], bleed)[0]
+        pack_poly = packing._build_zone_pack_polys([zone_poly], bleed)[0]
 
         minx, miny, maxx, maxy = bbox_of([p for p in [boundary_open, offset, bevel, zone_poly, pack_poly] if p])
         pad = 20.0

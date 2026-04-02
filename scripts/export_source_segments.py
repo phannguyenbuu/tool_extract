@@ -5,8 +5,16 @@ import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from . import source_voronoi
-from . import svg_utils
+try:
+    from . import source_voronoi
+    from . import svg_utils
+except Exception:
+    import sys
+    ROOT = Path(__file__).resolve().parents[1]
+    if str(ROOT / "backend") not in sys.path:
+        sys.path.insert(0, str(ROOT / "backend"))
+    import source_voronoi  # type: ignore
+    import svg_utils  # type: ignore
 
 
 VERTEX_SNAP = 1e-4

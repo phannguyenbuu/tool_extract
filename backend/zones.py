@@ -371,6 +371,15 @@ def _remap_zones_by_area(
     return new_zone_id, new_zones
 
 
+def build_zone_members(zone_id: List[int]) -> Dict[int, List[int]]:
+    zone_members: Dict[int, List[int]] = {}
+    for rid, zid in enumerate(zone_id):
+        if zid < 0:
+            continue
+        zone_members.setdefault(zid, []).append(rid)
+    return zone_members
+
+
 def save_zones_cache(zone_id: List[int], polys: List[List[Tuple[float, float]]], out_path) -> None:
     zones: Dict[int, List[int]] = {}
     for rid, zid in enumerate(zone_id):
@@ -406,13 +415,13 @@ def write_zones_log(zone_id: List[int], out_path, zone_labels: Dict[int, int] | 
     lines = [f"total_zones={n_zones}"]
     if zone_labels:
         inv = {v: k for k, v in zone_labels.items()}
-        for shuffle_idx in range(1, n_zones + 1):
-            zid = inv.get(shuffle_idx)
+        for zone_index in range(1, n_zones + 1):
+            zid = inv.get(zone_index)
             if zid is None:
                 continue
             members = zones[zid]
             lines.append(
-                f"zone_shuffle_index={shuffle_idx} zone_id={zid} size={len(members)} regions={members}"
+                f"zone_index={zone_index} zone_id={zid} size={len(members)} regions={members}"
             )
     else:
         for zid, members in enumerate(zones):
@@ -435,9 +444,15 @@ def build_zone_polys(
             zone_polys.append([(0.0, 0.0), (0.1, 0.0), (0.1, 0.1), (0.0, 0.1)])
             debug["empty"].append(zid)
             continue
+        
+        # Keep pure geometry. If it's a MultiPolygon, take the largest shell to avoid 'twisting' or hulling
         if merged.geom_type != "Polygon":
-            merged = merged.convex_hull
+            if hasattr(merged, "geoms"):
+                merged = max(merged.geoms, key=lambda g: g.area)
+            else:
+                merged = merged.convex_hull # Fallback for edge cases
             debug["convex_hull"].append(zid)
+        
         zone_polys.append(list(merged.exterior.coords))
     return zone_polys, zone_order, debug
 
